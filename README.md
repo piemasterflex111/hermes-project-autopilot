@@ -9,6 +9,12 @@ Project Autopilot converts a repository objective into a durable mission with an
 
 This repository preserves the complete five-commit implementation delivered on top of [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent), plus exact source snapshots, apply-ready patches, architecture documentation, and fresh release evidence.
 
+## Mission Center
+
+![Hermes Project Autopilot Mission Center showing an L3 mission, dependency graph, lifecycle controls, and evidence ledger](assets/project-autopilot-kanban.webp)
+
+*Live browser Mission Center during an L3 repository mission. The operator can create a bounded mission, inspect the dependency graph, monitor evidence-producing mutations, and pause, verify, cancel, reconcile, or roll back without allowing the UI to bypass mission policy.*
+
 ## The problem
 
 A normal chat agent can lose context, declare success without proof, modify the wrong checkout, or resume incorrectly after a restart. Project Autopilot replaces conversational intent with durable state and fail-closed gates.
