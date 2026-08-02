@@ -1,0 +1,114 @@
+From a70c859e4aae7e4159522b1c2bc50ced165193e3 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 22:12:57 -0700
+Subject: [PATCH 5/5] fix: requeue blocked executors on mission retry
+
+---
+ hermes_cli/mission_service.py     | 35 +++++++++++++++++++++++++++++++
+ tests/hermes_cli/test_missions.py | 33 +++++++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index 65ef4fd12..7a10691cb 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -2145,6 +2145,37 @@ def deny_mission(conn, mission_id: str) -> mdb.Mission:
+         )
+ 
+ 
++def _requeue_blocked_execution_tasks(conn, mission_id: str) -> list[str]:
++    """Requeue executor cards as part of an explicit mission retry.
++
++    Generic Kanban clients cannot unblock mission-linked cards because those
++    cards materialize the accepted execution contract. The mission controller
++    owns this narrow recovery path. ``kanban_db.unblock_task`` preserves the
++    block recurrence counter, so an unchanged failure still escalates to
++    triage instead of creating an infinite retry loop.
++    """
++    rows = conn.execute(
++        """SELECT id,status FROM tasks
++             WHERE mission_id=? AND mission_role='executor'
++               AND status IN ('blocked','triage')
++             ORDER BY id""",
++        (mission_id,),
++    ).fetchall()
++    triage = [str(row["id"]) for row in rows if row["status"] == "triage"]
++    if triage:
++        raise MissionError(
++            "executor task requires explicit triage before retry: " + ", ".join(triage)
++        )
++    blocked = [str(row["id"]) for row in rows if row["status"] == "blocked"]
++    if not blocked:
++        return []
++    with kb._trusted_mission_controller_mutation():
++        for task_id in blocked:
++            if not kb.unblock_task(conn, task_id):
++                raise MissionError(f"could not requeue blocked executor task {task_id}")
++    return blocked
++
++
+ def retry_mission(conn, mission_id: str) -> mdb.Mission:
+     """Restart a safely blocked mission from its last bounded phase."""
+     with _board_and_mission_action_lock(conn, mission_id) as held:
+@@ -2163,13 +2194,17 @@ def retry_mission(conn, mission_id: str) -> mdb.Mission:
+         if mission.worktree_path:
+             _validate_worktree_identity(mission)
+         target = "planning" if mission.phase == "planning" else "running"
++        retried_tasks: list[str] = []
+         if target == "running":
+             validate_mission_task_graph(conn, mission_id, boundary="retry")
++            if mission.phase == "execution":
++                retried_tasks = _requeue_blocked_execution_tasks(conn, mission_id)
+         mdb.record_evidence(
+             conn, mission_id, kind="lifecycle", status="passed",
+             metadata={
+                 "action": "retry", "previous_phase": mission.phase,
+                 "previous_blocker": mission.blocked_reason, "target": target,
++                "retried_tasks": retried_tasks,
+             },
+             cwd=mission.worktree_path,
+         )
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index f12008a1e..162d32c55 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -1306,6 +1306,39 @@ def test_operator_deny_and_safe_retry(mission_env):
+     assert "retry" in actions
+ 
+ 
++def test_execution_retry_requeues_blocked_executor_via_controller(mission_env):
++    conn, repo = mission_env
++    mid = _created(conn, repo, autonomy=3)
++    service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Needs correction", body="Edit app.py", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    assert kb.block_task(
++        conn, executor, reason="path correction required", kind="needs_input",
++    )
++    actions = service.controller_tick(conn)
++    assert {item["action"] for item in actions} == {"executor_blocked"}
++    assert mdb.get_mission(conn, mid).status == "blocked"
++
++    retried = service.retry_mission(conn, mid)
++
++    assert retried.status == "running"
++    task = kb.get_task(conn, executor)
++    assert task is not None
++    assert task.status == "ready"
++    assert task.block_kind == "needs_input"
++    assert task.block_recurrences == 1
++    evidence = mdb.list_evidence(conn, mid)
++    retry = next(row for row in reversed(evidence) if row["metadata"].get("action") == "retry")
++    assert retry["metadata"]["retried_tasks"] == [executor]
++    events = conn.execute(
++        "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (executor,),
++    ).fetchall()
++    assert any(row["kind"] == "unblocked" for row in events)
++
++
+ def test_mission_report_exposes_durable_task_graph(mission_env):
+     conn, repo = mission_env
+     mid = _created(conn, repo)

@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "patches": [
+    {
+      "role": "prerequisite",
+      "path": "prerequisites/0001-fix-reject-incomplete-local-Qwen-stop-responses.patch",
+      "bytes": 50173,
+      "sha256": "d74f96723dfc340c15f8ab32e48bc0c45bfdf6f2d2f45e9ad3c196962134fa32"
+    },
+    {
+      "role": "feature",
+      "path": "patches/0001-feat-add-restart-safe-project-autopilot-missions.patch",
+      "bytes": 376144,
+      "sha256": "f781c8ae0f0b2c279503003183a4248459dae5798809830f88ec60b1fd4b1157"
+    },
+    {
+      "role": "feature",
+      "path": "patches/0002-feat-complete-project-autopilot-v1-safety-gates.patch",
+      "bytes": 163465,
+      "sha256": "a22ad34697aa0dd7bb43380290b0abf892e09a8f430c540a7f7798521912408d"
+    },
+    {
+      "role": "feature",
+      "path": "patches/0003-feat-add-native-project-autopilot-mission-center.patch",
+      "bytes": 32389,
+      "sha256": "94ad202b69b8ad44fab433eae0cf15d5702dd69ae4a4e8021cc4108d945aa624"
+    },
+    {
+      "role": "feature",
+      "path": "patches/0004-feat-deliver-authenticated-mission-controls-and-deta.patch",
+      "bytes": 131413,
+      "sha256": "46c76aad56b513fd5908f499ca17d06c30ca5fffa6d4df896922f5bec1d092a4"
+    },
+    {
+      "role": "feature",
+      "path": "patches/0005-fix-requeue-blocked-executors-on-mission-retry.patch",
+      "bytes": 5009,
+      "sha256": "c70dd15f75f2d3f4f821c74513c15738ce0922aebf7abe119ecc569605e7b79e"
+    }
+  ]
+}

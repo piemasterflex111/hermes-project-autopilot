@@ -1,0 +1,19 @@
+name: Integration replay
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Apply the five-commit series to exact upstream base
+        run: ./scripts/replay_integration.sh /tmp/hermes-autopilot-replay

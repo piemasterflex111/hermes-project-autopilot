@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "source_commit": "a70c859e4aae7e4159522b1c2bc50ced165193e3",
+  "source_tree": "7ba19cb3ce7b36f9b856b6290e247c050dc03ab3",
+  "file_count": 74,
+  "files": [
+    {
+      "path": "agent/mission_scope.py",
+      "bytes": 10656,
+      "sha256": "41e8076e624393586cbb23efba4f573d7b29083ca5dd883ed54e5613ecd6707b",
+      "git_blob": "bf965f84087c1221a234c13395b971a05be0cd5f"
+    },
+    {
+      "path": "agent/prompt_builder.py",
+      "bytes": 108276,
+      "sha256": "0c48a9d5eac39daecb25e298a1805296eb4f2d136821a7a8afa7ae2188daac61",
+      "git_blob": "fd48b4b753491ff54d136f5652dbfca0e99ce40b"
+    },
+    {
+      "path": "agent/shell_hooks.py",
+      "bytes": 34204,
+      "sha256": "04ecd29eedcdc04ce4100f0852a03300a0ed6563defda6ff21bcb9e91ae6ea55",
+      "git_blob": "acbccb350da18f7bcc57d3caf5318adc743fb0a3"
+    },
+    {
+      "path": "apps/desktop/src/plugins/kanban/api.ts",
+      "bytes": 11791,
+      "sha256": "57109767cdb938fe63eccf78d923f84fe2249a7f63a805ee4785786ee9ba7017",
+      "git_blob": "7b66fc77793668c18d9d164d0b82031b2cf65f1e"
+    },
+    {
+      "path": "apps/desktop/src/plugins/kanban/board.tsx",
+      "bytes": 70090,
+      "sha256": "499a50cd04d11097e49306f2690bac4637245b6a84c01b9b57c893efd5d61d6b",
+      "git_blob": "d087a79b44746bc4f0fe4e06d262e5022bf3cae0"
+    },
+    {
+      "path": "apps/desktop/src/plugins/kanban/types.ts",
+      "bytes": 8129,
+      "sha256": "f16a943c052b6dfb4f506963476875670f5e4615446599ee2c47129673d1cf01",
+      "git_blob": "eba8845c1da1389f821621a352a4d7839a1b49fc"
+    },
+    {
+      "path": "cli.py",
+      "bytes": 836664,
+      "sha256": "ea9dd3e34c5d1e4e839d8cd41660e18e27fb6f73e58e0987d98ab00234d76ba2",
+      "git_blob": "0f8b6e3132f874e40fd3de3d3be627d1b4237908"
+    },
+    {
+      "path": "gateway/kanban_watchers.py",
+      "bytes": 87754,
+      "sha256": "bbcbc909d56e22c29ed112e77d2f1b418fbdbd695d08cf5c7352f4ed1795a59e",
+      "git_blob": "ae3c8ccdd9d6c9836950fed1c25746f0e0b7c017"
+    },
+    {
+      "path": "gateway/platforms/base.py",
+      "bytes": 304771,
+      "sha256": "4038412fb60fcd784ea4880945dc556382f4b1e8d870fde5f99b3cee71e17a00",
+      "git_blob": "c3577db3c376ddbf3b142d9f05cfe184e1f6a48b"
+    },
+    {
+      "path": "gateway/platforms/qqbot/__init__.py",
+      "bytes": 2715,
+      "sha256": "ee78f4e9ad303f7ca06b7af3fc2d8675dd171a59b1e039329c0cd1367d4cf0bb",
+      "git_blob": "65ee117e68b710d3da21d8bfc5a79bf89b0cb52e"
+    },
+    {
+      "path": "gateway/platforms/qqbot/adapter.py",
+      "bytes": 128851,
+      "sha256": "141ae4aa10d53e5f1d02a520c1b1a83f0ab1ea66a7d459623b690fb70f3722c3",
+      "git_blob": "e4dce1dc4d6e17d80c02407160a9b8f4dfa3bb30"
+    },
+    {
+      "path": "gateway/platforms/qqbot/keyboards.py",
+      "bytes": 16730,
+      "sha256": "037c1252a37ca6b77fe06e90f00ee9edb1fcb4559b44d4c941a34d1bdbd4542c",
+      "git_blob": "340a39ae0e26f30cac6d6651fd15c9a0398d72c3"
+    },
+    {
+      "path": "gateway/platforms/whatsapp_cloud.py",
+      "bytes": 92972,
+      "sha256": "cd03ec201b714359d4faeeb143048bb8a8ae99d5d1c3a8390759d9f2bd2bc454",
+      "git_blob": "559d2309796e05369dd13e698bbc57a361f3ea65"
+    },
+    {
+      "path": "gateway/relay/adapter.py",
+      "bytes": 101634,
+      "sha256": "01b57abef7795ceb9a9a02321d94ae27f1ecdf42b3fc91430941b41f88c760db",
+      "git_blob": "dd9d8cf2c6186a7d7ec3045cad0158d082419340"
+    },
+    {
+      "path": "gateway/run.py",
+      "bytes": 1251318,
+      "sha256": "03277cf94eaa47752f46af1fa8bdd27a241de23542bb2c1b2413f23b12cf7436",
+      "git_blob": "1c1c2f26eedbe08f26884956a8709434ffcb9ae5"
+    },
+    {
+      "path": "gateway/slash_commands.py",
+      "bytes": 268733,
+      "sha256": "1788fccf573d058761a5a4c408a96c01d6f721434ad57169f4f565871163e746",
+      "git_blob": "e5ce03ed87f1929202d014cad71f7abb2770c3db"
+    },
+    {
+      "path": "hermes_cli/cli_commands_mixin.py",
+      "bytes": 143443,
+      "sha256": "deab62edc44c3e3f7176e85af732e0a8a6b52f21bef2e4f6c4f380254cbba20e",
+      "git_blob": "793a3bb4f8b85f2f676843063bb6bacc4dffebf0"
+    },
+    {
+      "path": "hermes_cli/commands.py",
+      "bytes": 99770,
+      "sha256": "5175cf0accc6dbb293ae2c1ab383b263720346456e09d5c9e80f52841f03766a",
+      "git_blob": "6dcf96d36be1ac560b5b553a9507b6193bae7f11"
+    },
+    {
+      "path": "hermes_cli/doctor.py",
+      "bytes": 124051,
+      "sha256": "7abfee7a5ae1bfd6d147c88e38807dcc82a89b8e254ddfd0b448742eb1e708fc",
+      "git_blob": "02bc0d3e85d6ad42127c65bede36d04328b4f69b"
+    },
+    {
+      "path": "hermes_cli/kanban.py",
+      "bytes": 128479,
+      "sha256": "025a26475576321a788d8a40ad75337bbd765a3815817679ba6754b7f7ffb33b",
+      "git_blob": "3501129b258cd0817ed0710f7e8a11474fd08346"
+    },
+    {
+      "path": "hermes_cli/kanban_db.py",
+      "bytes": 434541,
+      "sha256": "c1194cbf2b27a940812c709d334e4c6531cfc2d953c8d1ce00c3ef575a55e194",
+      "git_blob": "ebf24cb9c6108576f8acb1f2c10dee65fcbf2e6f"
+    },
+    {
+      "path": "hermes_cli/main.py",
+      "bytes": 502484,
+      "sha256": "30844da8ba408c170e62c2774bb479c812a1f0cb5811b04319ef1b523abf6ae4",
+      "git_blob": "e8e6f953335152e68d5dfa5f592e6977285a7b93"
+    },
+    {
+      "path": "hermes_cli/mission_gateway.py",
+      "bytes": 23016,
+      "sha256": "b2a225cf5d47fd829c7c30ec8e8ba5d063cc13039a4eaa08d79702edb5ba9440",
+      "git_blob": "bdab3d81b51622b856a7a899a8e09e0a6f22f058"
+    },
+    {
+      "path": "hermes_cli/mission_service.py",
+      "bytes": 123739,
+      "sha256": "97f310338a75c6c71a5e5b5c3eb0ec51bfc9e779a0f169e51413403d8686f8c0",
+      "git_blob": "7a10691cb8fd02200e1848cbfdc6bd7696187470"
+    },
+    {
+      "path": "hermes_cli/missions.py",
+      "bytes": 12274,
+      "sha256": "794d83e7cb760f58540bb246c6ea1c3121942af9a52462b41a8ce3bd5f1cf30a",
+      "git_blob": "df590ab40c1a332c32e65966cd78a347ca235602"
+    },
+    {
+      "path": "hermes_cli/missions_db.py",
+      "bytes": 30310,
+      "sha256": "23d33b1a1c14112b81ea83e2694222387100bb8bae4156215375bd7a048f403e",
+      "git_blob": "9272a64b3c6a2f2014913ca74330a46ac451938c"
+    },
+    {
+      "path": "hermes_cli/plugins.py",
+      "bytes": 103784,
+      "sha256": "501c34058e90bb3e221b037d582275ca16366c14453f2914f9f579de31ef3151",
+      "git_blob": "240e34924d144f7142fc49b30843422e3e47843c"
+    },
+    {
+      "path": "hermes_constants.py",
+      "bytes": 48485,
+      "sha256": "76bd7f16b573e69bbe3a4bd16432af1b19e88419bbda2d37fa135b2b3a5abf37",
+      "git_blob": "6babd1a8be5db4e72b14107ca6528a562061c5f4"
+    },
+    {
+      "path": "model_tools.py",
+      "bytes": 67750,
+      "sha256": "751fc32bd50f36c5d83e5f748221690bd98f0324957bf9cc61d0ad7e0a55a07d",
+      "git_blob": "276bbf380c000deae951ce7c71a99a1a7d98aad6"
+    },
+    {
+      "path": "plugins/context_engine/__init__.py",
+      "bytes": 10629,
+      "sha256": "1c0252b0b7e403b35236aed85328a5487d1c75f74212b110add2508bb61370cd",
+      "git_blob": "5522880152d40ae9b75f0f2c3d2d813c8dfa87ba"
+    },
+    {
+      "path": "plugins/kanban/dashboard/dist/index.js",
+      "bytes": 204437,
+      "sha256": "a2b1613e801f74bf6eddece72e0046f332a4f18485de87dfe56ff2a5102aef3c",
+      "git_blob": "701485a76a7ed4b1d6f72b742ea2e8be6001ef55"
+    },
+    {
+      "path": "plugins/kanban/dashboard/dist/style.css",
+      "bytes": 49869,
+      "sha256": "f7acd783bd6a596ac7ef6c776ab635270a336edfa00d1d916c179bbe7b3d6417",
+      "git_blob": "f388e0331c00478b7672b4720f9343cd5e1e7327"
+    },
+    {
+      "path": "plugins/kanban/dashboard/plugin_api.py",
+      "bytes": 116358,
+      "sha256": "2b1c6bc3fe19ba14e04ca71422b67781989c3a844f3cc1033e2d3e6cead26086",
+      "git_blob": "dc460270412b34fe8e87f26dd30373b53246f5ed"
+    },
+    {
+      "path": "plugins/memory/__init__.py",
+      "bytes": 17480,
+      "sha256": "7acc429cb6cee0b0ac3d7262a1136fb7e35454eb829951adbc456b13ea23690d",
+      "git_blob": "1d9d1431e4a031c84a7ff54a2d77bd071da50be0"
+    },
+    {
+      "path": "providers/__init__.py",
+      "bytes": 7314,
+      "sha256": "2000f3a341cc07b11b2e0de8042f3e59a9cbbef6e196fd3df54f27018f025eb9",
+      "git_blob": "f6f4cde37a43b5317ce5ebbf1bce72dac9e4b94c"
+    },
+    {
+      "path": "scripts/evaluate_project_autopilot.py",
+      "bytes": 5788,
+      "sha256": "f02e21352094bd096db65f189d20227bea5e621a0bda4c9009aaf60a4bb26a46",
+      "git_blob": "cc056161f9ffd941ff3fda4968f600a75dc82fda"
+    },
+    {
+      "path": "tests/gateway/test_mission_gateway_actions.py",
+      "bytes": 4952,
+      "sha256": "2eb0a51e83ca9e9c86b4907d56d91be7499fefbb8ab43f170daf30314e06f611",
+      "git_blob": "d6543866329312dc3175908b827a85d1e87ef3a0"
+    },
+    {
+      "path": "tests/gateway/test_qqbot.py",
+      "bytes": 46403,
+      "sha256": "f4353a279091d0df7811d6e2a07fca084f2b513a64baee36cdd129685eed9ecf",
+      "git_blob": "46513e1d02fed5b1e78144d372654f7a598b6dea"
+    },
+    {
+      "path": "tests/gateway/test_whatsapp_cloud.py",
+      "bytes": 55720,
+      "sha256": "e6d5fbbfea2877607acc916bb07f9477767b24eed2422ccfc1d7fe74680dff9f",
+      "git_blob": "a52e1ef0f367a1c91b359241bf43ba86512f4ea9"
+    },
+    {
+      "path": "tests/hermes_cli/test_commands.py",
+      "bytes": 39337,
+      "sha256": "3c8f5b769c11ae68a622bf4e36465ae664a804c404bf3c641c1bbe37f3a106a4",
+      "git_blob": "f17278c2624eb806a3a70d505cf4ddada78a8b13"
+    },
+    {
+      "path": "tests/hermes_cli/test_doctor.py",
+      "bytes": 64066,
+      "sha256": "14c347528ceb480d42e92fb8ab54c0a1c2929c27b311a5e0435e74f52f3e01dc",
+      "git_blob": "da284839278ae8a7da345ca5b13267c6422fbae4"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py",
+      "bytes": 4467,
+      "sha256": "33202b4921d13ea5004c9fcaae450e1f35e20d3828e5eb04aff50e96146d2cb3",
+      "git_blob": "62c0eb045d3fdf42891a2a1b8dafb62282daff75"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_db.py",
+      "bytes": 59446,
+      "sha256": "1eac86e065e89b63ceb0d35d78d72021e562a60ccca8e9610505e1ff2029778c",
+      "git_blob": "49ddecc8dbf92d35ce01ca640a827a4f0e113c6b"
+    },
+    {
+      "path": "tests/hermes_cli/test_mission_gateway.py",
+      "bytes": 8993,
+      "sha256": "a21e087f800f23c4f3fda9e581f686f46d8d41b6f7483727c7a8201e386c6e28",
+      "git_blob": "14295af3431bb7fbc52528af51f39a180e4ed44b"
+    },
+    {
+      "path": "tests/hermes_cli/test_mission_git_integrity.py",
+      "bytes": 13039,
+      "sha256": "9da160ee5edccb8a609b96416ebdaab5eec5a5db842af8d2acf7a29c7324b3f1",
+      "git_blob": "7b556dc8f9761cc4945cd861ee98842e7c6f56a7"
+    },
+    {
+      "path": "tests/hermes_cli/test_mission_graph_integrity.py",
+      "bytes": 6979,
+      "sha256": "2584c01d6a19450dca3b3b6776ea6e9013e51c24652eee3d26f01e43c8feb078",
+      "git_blob": "8617727451134b24e59bf337215c0688bb752f90"
+    },
+    {
+      "path": "tests/hermes_cli/test_mission_host_extensions.py",
+      "bytes": 6202,
+      "sha256": "7f3e328db50971d547f50700be9f22223796147aee0578674dced217dc1b61fe",
+      "git_blob": "a83c068c82e80729b46c5a7923f7901b8dd8ffa3"
+    },
+    {
+      "path": "tests/hermes_cli/test_mission_intent_recovery.py",
+      "bytes": 5735,
+      "sha256": "6f195bca8924d16822608ca8a8940f7001202c4647fc88709666b92cd587ab4d",
+      "git_blob": "15361fd2c1c22053bebdfab51109408e3cae693e"
+    },
+    {
+      "path": "tests/hermes_cli/test_mission_plan_resumption.py",
+      "bytes": 10540,
+      "sha256": "44f3a9a0c841020ae3aa543c95651cd6519d626d88aa7bd5c17a222129552bc0",
+      "git_blob": "e03a21b626fcc7fc71950a6a9cfa9185e26b66d9"
+    },
+    {
+      "path": "tests/hermes_cli/test_missions.py",
+      "bytes": 54841,
+      "sha256": "c23facbce97873c4e550185c4bf1da7b71cb0e53cc9a29cc3759fb28c1b8a3ab",
+      "git_blob": "162d32c55d0c646adee33607833d7d8c2dcdb3e0"
+    },
+    {
+      "path": "tests/plugins/test_kanban_missions.py",
+      "bytes": 5810,
+      "sha256": "483d193f6b994bc469f99adfc534f0223992343a0d4631107be3976e3aa7d3a6",
+      "git_blob": "c4b0de20d1a4e86964003071e91a09f015ebcb2b"
+    },
+    {
+      "path": "tests/test_hermes_constants.py",
+      "bytes": 24155,
+      "sha256": "f77ba0fe2fcfb6d46c0b9d05d0af152ef156918bba08f3301382706e74b6f22f",
+      "git_blob": "420aaa38f2097e2b7ef6f6ee76cb05795c700095"
+    },
+    {
+      "path": "tests/tools/test_execution_flag_detection.py",
+      "bytes": 10812,
+      "sha256": "3babd9ef9b373aed36ee1fab0d7bf5cb69cad5c06586cf74a0219cb3f8057839",
+      "git_blob": "c9a4c525041a6d46a25c1845fd8feaa9bf9a3980"
+    },
+    {
+      "path": "tests/tools/test_mission_docker_scope.py",
+      "bytes": 12771,
+      "sha256": "9be1f037919669c60ee2c15ae8bf4146bff5334795b18f27501acf2fb25c2a8c",
+      "git_blob": "f90099c13bbc5a23a0d2d2f38aafea5c79b920f5"
+    },
+    {
+      "path": "tests/tools/test_mission_kanban_containment.py",
+      "bytes": 4345,
+      "sha256": "c8e2f67326ac6567cd82bbe5acf93293a44192eab04977bec6572dbbdc595443",
+      "git_blob": "25df6b08cd4a55df16099158565eb7f2868267d4"
+    },
+    {
+      "path": "tests/tools/test_shared_container_task_id.py",
+      "bytes": 2734,
+      "sha256": "71380be4237b18c1a16cd52dcee7a7ee9386ae9fb1641f268b513d3bc3052917",
+      "git_blob": "3a9873ab04f62bb0ff098ac0c518acfeb2fde8b2"
+    },
+    {
+      "path": "tests/tui_gateway/test_missions_rpc.py",
+      "bytes": 3173,
+      "sha256": "877217acda80a08c702de5dae05e5a29bca51e8c6388fd438739575ba967bf7f",
+      "git_blob": "e14bef405779e2ed056df4fc2dedb6b02189eaf6"
+    },
+    {
+      "path": "tools/code_execution_tool.py",
+      "bytes": 83586,
+      "sha256": "308d9212ca9ec6d6dd6684d4cf276c0801a74d08a98564d7e00e7a27258c24e7",
+      "git_blob": "c7d46de7b7d5a42dcf13ce8117a523e742d91e27"
+    },
+    {
+      "path": "tools/environments/docker.py",
+      "bytes": 89827,
+      "sha256": "e81fa19dc7bf7cdbf9609a19d3134889ded1061c05d519b33be26fd317c89465",
+      "git_blob": "c5a715923741be9ae560292ca2c33000eedcf13d"
+    },
+    {
+      "path": "tools/file_tools.py",
+      "bytes": 102258,
+      "sha256": "8ff79c328f772ce2b828ccf1379767069b600ed480b5ed413d4fac0cb9718faa",
+      "git_blob": "f00dadd7ca55934686dbbe3ee2cffef0b924c24f"
+    },
+    {
+      "path": "tools/kanban_tools.py",
+      "bytes": 93322,
+      "sha256": "9e2da5ad5048f216d848ea91d9d310124b6b409573fb0a5cd0baa79df622dfc3",
+      "git_blob": "f15bb44ea3700ee712212cbc2a2acc807a7b6abb"
+    },
+    {
+      "path": "tools/terminal_tool.py",
+      "bytes": 150189,
+      "sha256": "772802153745815676b9d2d8e9914aa3630b66b9ddbb3dee6c26e84cf77fc11a",
+      "git_blob": "045498a7d816bdd07064bb1ca81ba22c3e849607"
+    },
+    {
+      "path": "tui_gateway/server.py",
+      "bytes": 554863,
+      "sha256": "ad01f5f14417da40be5a7c7dce03351c5a47cd4e64c1377df77189413dfcbae1",
+      "git_blob": "0c8e373e8f07d873923635c35d9c3a6cfdcf56c8"
+    },
+    {
+      "path": "ui-tui/src/__tests__/missionCenter.test.ts",
+      "bytes": 2821,
+      "sha256": "a03680e70de70b64212ad4dcf5b7a320abf1b07e99f2a3563455b194b746312a",
+      "git_blob": "2bef3a2739a14e4904d86d38f4dc62800718e56c"
+    },
+    {
+      "path": "ui-tui/src/app/interfaces.ts",
+      "bytes": 22434,
+      "sha256": "792b6a07270a71548dfa67361688e135c1e50d35cb2e6e50ea50281496aaa3d2",
+      "git_blob": "0ceaab5f36568423aecb87b1ab9485d23b266427"
+    },
+    {
+      "path": "ui-tui/src/app/overlayStore.ts",
+      "bytes": 2679,
+      "sha256": "076c42f00a69f14bb8e8d355c58fded38517a294e8de75f42108c66873c0c94c",
+      "git_blob": "55188b9dd0aee8dfe3763f90f54046d772e465e0"
+    },
+    {
+      "path": "ui-tui/src/app/slash/commands/ops.ts",
+      "bytes": 23979,
+      "sha256": "15e97b1bc9048d2c6804833f1adf804b0bd06c88a001893e6f60f4379909abef",
+      "git_blob": "f9a7d0bb4776e2f3eb4769605a09e7c765237e8f"
+    },
+    {
+      "path": "ui-tui/src/components/appOverlays.tsx",
+      "bytes": 12760,
+      "sha256": "d07f465a08cf47dea981d8aa573cba223aec12f27a52e0043e4ae89f9ac6b983",
+      "git_blob": "b8243b4c7149343acf985d66bf6b6b3de276f552"
+    },
+    {
+      "path": "ui-tui/src/components/missionCenter.tsx",
+      "bytes": 17466,
+      "sha256": "0d4d48307cf17ddbe51e84150cf069552d4bcfe434cae02375267fe3cfa985cb",
+      "git_blob": "3de834411c1815afdadd8f669ee546ed86bb426f"
+    },
+    {
+      "path": "utils.py",
+      "bytes": 23149,
+      "sha256": "4048f599f62db2c1d3cdb0d6c9a061d0fae0a409f9b86f5e1d0540997d973f59",
+      "git_blob": "72a8f4b6fdb9d3a0cb2938be089557bc0d7e1ccd"
+    },
+    {
+      "path": "website/docs/reference/cli-commands.md",
+      "bytes": 90577,
+      "sha256": "9fb1f5a789135d9fd12a347b78d0ac1969d7f47adbec473b26728062863c1d48",
+      "git_blob": "460b3632d97816f54cc2647da6b9f69d230c93cb"
+    },
+    {
+      "path": "website/docs/reference/environment-variables.md",
+      "bytes": 95486,
+      "sha256": "7db57285b1361a30d98daadb36871bd6c2b1f90a7d871ed2f8d2ce3a5c2d6a15",
+      "git_blob": "14dda31c2141026f7e6d362a132d90015bd4f55d"
+    },
+    {
+      "path": "website/docs/reference/slash-commands.md",
+      "bytes": 36649,
+      "sha256": "4b0e229b587e43b8aecd1a557408e3e2fbc26bd7048abb3547b6724f1a8700fa",
+      "git_blob": "b4dba4269ce71dcba79c25ca40fe7ea0f060279a"
+    },
+    {
+      "path": "website/docs/user-guide/features/project-autopilot.md",
+      "bytes": 7376,
+      "sha256": "5d307a1bb8edda94bf19e40620e9e4072278266172f7ea20c06d048b04d99569",
+      "git_blob": "09d87ca3b9d02732fdf499128767fe88c512ae75"
+    }
+  ]
+}

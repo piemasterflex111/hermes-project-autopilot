@@ -1,0 +1,3618 @@
+From 82060cb9697a086f42c7343dc97783baeeb21ea6 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 19:02:32 -0700
+Subject: [PATCH 2/5] feat: complete project autopilot v1 safety gates
+
+---
+ agent/shell_hooks.py                          |  14 +-
+ apps/desktop/src/plugins/kanban/board.tsx     |  21 +-
+ hermes_cli/commands.py                        |   8 +-
+ hermes_cli/doctor.py                          |  12 +-
+ hermes_cli/kanban_db.py                       | 129 ++-
+ hermes_cli/mission_service.py                 | 865 ++++++++++++++++--
+ hermes_cli/missions.py                        |  17 +-
+ hermes_cli/missions_db.py                     | 103 ++-
+ hermes_cli/plugins.py                         |  20 +-
+ hermes_constants.py                           |  32 +-
+ plugins/context_engine/__init__.py            |  12 +
+ plugins/kanban/dashboard/dist/index.js        |  17 +-
+ plugins/kanban/dashboard/plugin_api.py        |  51 +-
+ plugins/memory/__init__.py                    |  14 +
+ providers/__init__.py                         |  12 +
+ scripts/evaluate_project_autopilot.py         |  94 ++
+ tests/hermes_cli/test_commands.py             |   6 +
+ tests/hermes_cli/test_doctor.py               |   1 +
+ .../hermes_cli/test_mission_git_integrity.py  |   1 +
+ .../test_mission_graph_integrity.py           | 198 ++++
+ .../test_mission_host_extensions.py           | 161 ++++
+ tests/hermes_cli/test_missions.py             | 420 ++++++++-
+ tests/plugins/test_kanban_missions.py         |  13 +-
+ tests/test_hermes_constants.py                |  18 +
+ tests/tools/test_execution_flag_detection.py  |   6 +
+ tests/tools/test_mission_docker_scope.py      |  11 +
+ tests/tui_gateway/test_missions_rpc.py        |   7 +-
+ tools/environments/docker.py                  |  29 +
+ tui_gateway/server.py                         |  10 +-
+ utils.py                                      |  14 +
+ .../user-guide/features/project-autopilot.md  |  18 +-
+ 31 files changed, 2207 insertions(+), 127 deletions(-)
+ create mode 100755 scripts/evaluate_project_autopilot.py
+ create mode 100644 tests/hermes_cli/test_mission_graph_integrity.py
+ create mode 100644 tests/hermes_cli/test_mission_host_extensions.py
+
+diff --git a/agent/shell_hooks.py b/agent/shell_hooks.py
+index 5699e4d9e..acbccb350 100644
+--- a/agent/shell_hooks.py
++++ b/agent/shell_hooks.py
+@@ -131,7 +131,7 @@ except ImportError:  # pragma: no cover
+     fcntl = None  # type: ignore[assignment]
+ 
+ from hermes_constants import get_hermes_home
+-from utils import atomic_replace
++from utils import atomic_replace, host_extension_execution_disabled
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -228,10 +228,8 @@ def register_from_config(
+     # Safe mode (--safe-mode / HERMES_SAFE_MODE=1): shell hooks are user
+     # customizations too — skip registration entirely so a troubleshooting
+     # run fires zero user-configured code (plugins, MCP, AND hooks).
+-    from utils import env_var_enabled
+-
+-    if env_var_enabled("HERMES_SAFE_MODE"):
+-        logger.info("HERMES_SAFE_MODE=1 — shell-hook registration skipped")
++    if host_extension_execution_disabled():
++        logger.info("Host-side extension execution disabled — shell-hook registration skipped")
+         return []
+ 
+     effective_accept = _resolve_effective_accept(cfg, accept_hooks)
+@@ -448,6 +446,12 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
+         "elapsed_seconds": 0.0,
+         "error": None,
+     }
++    # Registration is normally skipped before a mission session starts, but
++    # retain an execution-time gate as defense in depth for callbacks that
++    # were registered before policy activation or direct run_once() callers.
++    if host_extension_execution_disabled():
++        result["error"] = "host-side extension execution is disabled"
++        return result
+     try:
+         argv = shlex.split(os.path.expanduser(spec.command))
+     except ValueError as exc:
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index 3108aad31..5700c5f0a 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -135,34 +135,42 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+   const qc = useQueryClient()
+   const slug = useValue($boardSlug)
+   const queryKey = missionsKey(slug)
++
+   const { data } = useQuery({
+     queryFn: () => fetchMissions(slug),
+     queryKey,
+     enabled: open,
+     refetchInterval: open ? 3_000 : false
+   })
++
+   const [objective, setObjective] = useState('')
+   const [outcome, setOutcome] = useState('')
+   const [verify, setVerify] = useState('')
+   const [repo, setRepo] = useState('')
++  const [project, setProject] = useState('')
+   const [paths, setPaths] = useState('')
+   const [autonomy, setAutonomy] = useState('3')
++  const [allowLocalCommit, setAllowLocalCommit] = useState(false)
+   const [executor, setExecutor] = useState('default')
+   const [verifier, setVerifier] = useState('default')
+   const [busy, setBusy] = useState(false)
+   const [error, setError] = useState<null | string>(null)
+ 
+   const refresh = () => qc.invalidateQueries({ queryKey })
++
+   const create = async () => {
+-    if (!objective.trim() || !outcome.trim() || !verify.trim() || !repo.trim() || busy) {
++    if (!objective.trim() || !outcome.trim() || !verify.trim() || !repo.trim() || !project.trim() || busy) {
+       return
+     }
++
+     setBusy(true)
+     setError(null)
++
+     try {
+       const allowedPaths = paths.split(',').map(v => v.trim()).filter(Boolean)
+       await createMission({
+         autonomy_level: Number(autonomy),
++        allow_local_commit: Number(autonomy) === 4 && allowLocalCommit,
+         boundaries: {
+           allowed_paths: allowedPaths,
+           allowed_roots: [repo.trim()],
+@@ -171,6 +179,7 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+         constraints: ['Do not modify unrelated files'],
+         objective: objective.trim(),
+         outcome: outcome.trim(),
++        project_id: project.trim(),
+         repo_path: repo.trim(),
+         stop_when: ['The declared scope cannot be enforced'],
+         verification: verify.split('\n').map(v => v.trim()).filter(Boolean)
+@@ -186,6 +195,7 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+       setBusy(false)
+     }
+   }
++
+   const act = async (id: string, action: string) => {
+     try {
+       await missionAction(id, action, action === 'plan_auto' ? { executor, verifier } : {}, slug)
+@@ -205,6 +215,7 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+             <Input onChange={e => setObjective(e.target.value)} placeholder="Objective" value={objective} />
+             <Input onChange={e => setOutcome(e.target.value)} placeholder="Required outcome" value={outcome} />
+             <Textarea onChange={e => setVerify(e.target.value)} placeholder="Verification commands, one per line" value={verify} />
++            <Input onChange={e => setProject(e.target.value)} placeholder="Registered project id or slug" value={project} />
+             <Input onChange={e => setRepo(e.target.value)} placeholder="Absolute Git repository path" value={repo} />
+             <Input onChange={e => setPaths(e.target.value)} placeholder="Allowed repo paths, comma separated" value={paths} />
+             <Select onValueChange={setAutonomy} value={autonomy}>
+@@ -213,6 +224,12 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+                 {[0, 1, 2, 3, 4].map(level => <SelectItem key={level} value={String(level)}>Autonomy L{level}</SelectItem>)}
+               </SelectContent>
+             </Select>
++            {autonomy === '4' && (
++              <label className="flex items-center gap-2 text-xs">
++                <input checked={allowLocalCommit} onChange={e => setAllowLocalCommit(e.target.checked)} type="checkbox" />
++                Permit a verified local commit
++              </label>
++            )}
+             <div className="grid grid-cols-2 gap-2">
+               <Input onChange={e => setExecutor(e.target.value)} placeholder="Executor profile" value={executor} />
+               <Input onChange={e => setVerifier(e.target.value)} placeholder="Verifier profile" value={verifier} />
+@@ -239,6 +256,8 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+                   {mission.status === 'running' && <Button onClick={() => void act(mission.id, 'verify')} size="xs" variant="outline">Verify</Button>}
+                   {mission.status === 'waiting_for_user' && <Button onClick={() => void act(mission.id, 'resume')} size="xs" variant="outline">Resume</Button>}
+                   {mission.status === 'awaiting_approval' && <Button onClick={() => void act(mission.id, 'approve')} size="xs">Approve commit gate</Button>}
++                  {mission.status === 'awaiting_approval' && <Button onClick={() => void act(mission.id, 'deny')} size="xs" variant="outline">Deny commit</Button>}
++                  {mission.status === 'blocked' && <Button onClick={() => void act(mission.id, 'retry')} size="xs" variant="outline">Retry safely</Button>}
+                   {mission.status === 'committing' && <Button onClick={() => void act(mission.id, 'commit')} size="xs">Commit locally</Button>}
+                   {['succeeded', 'failed', 'cancelled', 'blocked'].includes(mission.status) && mission.worktree_path && <Button onClick={() => void act(mission.id, 'rollback')} size="xs" variant="outline">Rollback</Button>}
+                   {!['succeeded', 'failed', 'cancelled', 'rolled_back'].includes(mission.status) && <Button onClick={() => void act(mission.id, 'cancel')} size="xs" variant="ghost">Cancel</Button>}
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index 716c52be8..6dcf96d36 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -1263,7 +1263,13 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
+ #     /hermes update on Slack. Demoted to free the native slot /approvals now
+ #     claims — without this entry /approvals tips the registry past the 50-cap
+ #     and silently clamps /update off, breaking Telegram parity.
+-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
++#   - platform: low-frequency per-platform recovery controls remain available
++#     as /hermes platform. The native slot is assigned to the Project Autopilot
++#     /mission surface; /platforms remains native for routine status checks.
++_SLACK_VIA_HERMES_ONLY = frozenset({
++    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
++    "platform",
++})
+ 
+ 
+ def _sanitize_slack_name(raw: str) -> str:
+diff --git a/hermes_cli/doctor.py b/hermes_cli/doctor.py
+index 18ea422f3..02bc0d3e8 100644
+--- a/hermes_cli/doctor.py
++++ b/hermes_cli/doctor.py
+@@ -1723,17 +1723,15 @@ def run_doctor(args):
+     if running_in_container:
+         # Inside our container the Docker terminal backend is not
+         # configured by default (Docker-in-Docker isn't set up); the
+-        # local backend is the intended one. Skip the noisy "docker
+-        # not found" warning. If the user has explicitly chosen
+-        # TERMINAL_ENV=docker inside the container they likely mounted
+-        # /var/run/docker.sock, so fall through to the normal check.
+-        if terminal_env != "docker":
++        # local backend is the intended one. Skip the noisy "docker not
++        # found" warning only for that default. Explicit remote backends
++        # (SSH, Daytona, Vercel, etc.) remain authoritative inside a
++        # container and still need their own diagnostics.
++        if terminal_env == "local":
+             check_info(
+                 "Running inside a container — using local terminal backend "
+                 "(docker-in-docker is not configured by default)"
+             )
+-            # Skip to next section; Docker isn't relevant here.
+-            terminal_env = "local"
+     if terminal_env == "docker":
+         if _safe_which("docker"):
+             # Check if docker daemon is running
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 4fabad0ae..ebf24cb9c 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -357,6 +357,10 @@ _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
+     "hermes_kanban_current_board_override",
+     default=None,
+ )
++_MISSION_CONTROLLER_MUTATION: ContextVar[bool] = ContextVar(
++    "hermes_kanban_mission_controller_mutation",
++    default=False,
++)
+ 
+ 
+ @contextlib.contextmanager
+@@ -368,6 +372,53 @@ def scoped_current_board(slug: str):
+     finally:
+         _CURRENT_BOARD_OVERRIDE.reset(token)
+ 
++
++@contextlib.contextmanager
++def _trusted_mission_controller_mutation():
++    """Allow structural changes to mission cards in controller code only.
++
++    Mission task cards are a materialized execution contract.  Ordinary
++    Kanban clients may advance their worker lifecycle through the dedicated
++    complete/block/heartbeat paths, but must not rewrite the card or graph
++    underneath the mission controller.  The controller uses this narrow,
++    process-local capability while it is first materializing the accepted
++    plan (and for its own start latch).
++    """
++    token: Token[bool] = _MISSION_CONTROLLER_MUTATION.set(True)
++    try:
++        yield
++    finally:
++        _MISSION_CONTROLLER_MUTATION.reset(token)
++
++
++def assert_task_mutation_allowed(
++    conn: sqlite3.Connection,
++    *task_ids: str,
++    operation: str = "mutate",
++) -> None:
++    """Fail closed when a generic mutator targets a mission-linked card."""
++    ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
++    if not ids or _MISSION_CONTROLLER_MUTATION.get():
++        return
++    placeholders = ",".join("?" for _ in ids)
++    rows = conn.execute(
++        f"""SELECT t.id,
++                   COALESCE(t.mission_id, mc.mission_id) AS mission_id
++              FROM tasks t
++              LEFT JOIN mission_task_manifest_cards mc ON mc.task_id=t.id
++             WHERE t.id IN ({placeholders})
++               AND COALESCE(t.mission_id, mc.mission_id) IS NOT NULL""",
++        ids,
++    ).fetchall()
++    if rows:
++        bound = ", ".join(
++            f"{row['id']} ({row['mission_id']})" for row in rows
++        )
++        raise PermissionError(
++            f"cannot {operation} mission-linked task card(s): {bound}; "
++            "use the mission controller"
++        )
++
+ # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
+ # Strict enough to stop traversal (`..`) and embedded path separators, loose
+ # enough that kebab-case names like ``atm10-server`` or ``hermes-agent``
+@@ -3037,6 +3088,9 @@ def create_task(
+                 project_repo = str(project_obj.primary_path)
+ 
+     parents = tuple(p for p in parents if p)
++    assert_task_mutation_allowed(
++        conn, *parents, operation="attach a child to",
++    )
+ 
+     # Normalise + validate skills: strip whitespace, drop empties, dedupe
+     # (preserving order). Refuse commas inside a single name so we don't
+@@ -3377,6 +3431,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str])
+     Reassign after the current run completes if needed.
+     """
+     profile = _canonical_assignee(profile)
++    assert_task_mutation_allowed(conn, task_id, operation="reassign")
+     with write_txn(conn):
+         row = conn.execute(
+             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+@@ -3429,6 +3484,7 @@ def set_model_override(
+         raise ValueError("provider_override requires a model_override")
+     if not model:
+         provider = None
++    assert_task_mutation_allowed(conn, task_id, operation="change the model for")
+     with write_txn(conn):
+         row = conn.execute(
+             "SELECT status FROM tasks WHERE id = ?", (task_id,)
+@@ -3455,6 +3511,9 @@ def set_model_override(
+ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+     if parent_id == child_id:
+         raise ValueError("a task cannot depend on itself")
++    assert_task_mutation_allowed(
++        conn, parent_id, child_id, operation="relink",
++    )
+     with write_txn(conn):
+         missing = _find_missing_parents(conn, [parent_id, child_id])
+         if missing:
+@@ -3507,6 +3566,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
+ 
+ 
+ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
++    assert_task_mutation_allowed(
++        conn, parent_id, child_id, operation="relink",
++    )
+     with write_txn(conn):
+         cur = conn.execute(
+             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+@@ -4162,6 +4224,23 @@ def claim_task(
+     Returns the claimed ``Task`` on success, ``None`` if the task was
+     already claimed (or is not in ``ready`` status).
+     """
++    binding = conn.execute(
++        """SELECT mc.mission_id,t.workspace_path
++             FROM mission_task_manifest_cards mc
++             LEFT JOIN tasks t ON t.id=mc.task_id
++            WHERE mc.task_id=?""",
++        (task_id,),
++    ).fetchone()
++    if binding is not None:
++        from hermes_cli.mission_service import validate_mission_task_graph
++
++        validate_mission_task_graph(
++            conn,
++            str(binding["mission_id"]),
++            boundary="claim",
++            expected_task_id=task_id,
++            expected_workspace=binding["workspace_path"],
++        )
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+@@ -4559,6 +4638,7 @@ def reclaim_task(
+     Returns True if a reclaim happened, False if the task isn't in a
+     reclaimable state (not running, or doesn't exist).
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="reclaim")
+     row = conn.execute(
+         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+         (task_id,),
+@@ -5518,6 +5598,7 @@ def edit_completed_task_result(
+     metadata: Optional[dict] = None,
+ ) -> bool:
+     """Backfill the user-visible result for an already completed task."""
++    assert_task_mutation_allowed(conn, task_id, operation="edit")
+     handoff_summary = summary if summary is not None else result
+     with write_txn(conn):
+         row = conn.execute(
+@@ -5821,6 +5902,7 @@ def promote_task(
+     ``(False, reason)`` if refused. ``dry_run=True`` validates the
+     promotion would succeed without mutating state.
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="promote")
+     row = conn.execute(
+         "SELECT status FROM tasks WHERE id = ?", (task_id,)
+     ).fetchone()
+@@ -5882,6 +5964,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
+     state) holds for the rest of this function's lifetime.
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="unblock")
+     now = int(time.time())
+     with write_txn(conn):
+         stale = conn.execute(
+@@ -5963,6 +6046,7 @@ def specify_triage_task(
+     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
+     comment spam for status-only promotions.
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="edit")
+     if title is not None and not title.strip():
+         raise ValueError("title cannot be blank")
+     assignee = _canonical_assignee(assignee)
+@@ -6064,6 +6148,7 @@ def decompose_triage_task(
+     the inserts so a malformed entry aborts the whole decomposition
+     cleanly (no orphan children).
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="decompose")
+     if not children:
+         return None
+     if root_assignee is not None:
+@@ -6263,6 +6348,7 @@ def decompose_triage_task(
+ 
+ 
+ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
++    assert_task_mutation_allowed(conn, task_id, operation="archive")
+     with write_txn(conn):
+         cur = conn.execute(
+             "UPDATE tasks SET status = 'archived', "
+@@ -6295,6 +6381,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+     tasks must be explicitly archived first so accidental data loss requires a
+     second deliberate action.
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="delete")
+     with write_txn(conn):
+         row = conn.execute(
+             "SELECT status FROM tasks WHERE id = ?",
+@@ -6324,6 +6411,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+     Returns ``True`` if the task existed and was deleted, ``False``
+     if the task was not found.
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="delete")
+     with write_txn(conn):
+         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+         if cur.rowcount != 1:
+@@ -6643,20 +6731,36 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+ def set_workspace_path(
+     conn: sqlite3.Connection, task_id: str, path: Path | str
+ ) -> None:
++    value = str(path)
++    existing = conn.execute(
++        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
++    ).fetchone()
++    if existing is not None and existing["workspace_path"] != value:
++        assert_task_mutation_allowed(
++            conn, task_id, operation="change the workspace for",
++        )
+     with write_txn(conn):
+         conn.execute(
+             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+-            (str(path), task_id),
++            (value, task_id),
+         )
+ 
+ 
+ def set_branch_name(
+     conn: sqlite3.Connection, task_id: str, branch_name: str
+ ) -> None:
++    value = str(branch_name)
++    existing = conn.execute(
++        "SELECT branch_name FROM tasks WHERE id = ?", (task_id,),
++    ).fetchone()
++    if existing is not None and existing["branch_name"] != value:
++        assert_task_mutation_allowed(
++            conn, task_id, operation="change the branch for",
++        )
+     with write_txn(conn):
+         conn.execute(
+             "UPDATE tasks SET branch_name = ? WHERE id = ?",
+-            (str(branch_name), task_id),
++            (value, task_id),
+         )
+ 
+ 
+@@ -6674,6 +6778,7 @@ def schedule_task(
+     human action, or automation can later call ``unblock_task`` to re-gate them
+     to ``ready`` (or ``todo`` if parents are still incomplete).
+     """
++    assert_task_mutation_allowed(conn, task_id, operation="schedule")
+     with write_txn(conn):
+         params: list[Any] = [task_id]
+         sql = """
+@@ -9102,6 +9207,16 @@ def _default_spawn(
+             },
+             sort_keys=True,
+         )
++        # Mission workers run as host Python processes, while only their
++        # brokered terminal commands are isolated in Docker.  Reuse Hermes'
++        # established extension isolation switch to suppress Python plugins,
++        # MCP discovery, and shell hooks in that host process without passing
++        # the CLI --safe-mode flag (which would also discard the assigned
++        # profile's model/provider configuration).  Explicitly remove an
++        # inherited auto-accept switch so no ambient parent setting can undo
++        # this boundary.
++        env["HERMES_SAFE_MODE"] = "1"
++        env.pop("HERMES_ACCEPT_HOOKS", None)
+         if task.mission_role == "executor":
+             # Project Autopilot v1 supports one terminal posture: a dedicated,
+             # non-persistent Docker sandbox with the isolated worktree mounted
+@@ -9190,12 +9305,12 @@ def _default_spawn(
+         *_resolve_hermes_argv(),
+         "-p", profile_arg,
+         "--cli",
+-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+-        # so they see that profile's shell-hook allowlist instead of the
+-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
+-        # profile-local worker sessions still register configured hooks.
+-        "--accept-hooks",
+     ]
++    if not task.mission_id:
++        # Ordinary workers retain their historical hook behavior. They switch
++        # to a profile-scoped HERMES_HOME above, so pass --accept-hooks to use
++        # that profile's hook allowlist in the non-interactive child.
++        cmd.append("--accept-hooks")
+     # Per-task force-loaded skills. Each name goes in its own
+     # `--skills X` pair rather than a single comma-joined arg: the CLI
+     # accepts both forms (action='append' + comma-split), but
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index 9b3a18e28..892a08e36 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -254,6 +254,62 @@ def store_evidence_blob(
+     )
+ 
+ 
++def create_mission(
++    conn,
++    *,
++    objective: str,
++    contract: mdb.MissionContract,
++    autonomy_level: int,
++    repo_path: str,
++    board: str,
++    project_id: str,
++    risk_level: str = "medium",
++    budget: Optional[dict[str, Any]] = None,
++    deadline: Optional[int] = None,
++) -> mdb.Mission:
++    """Create a public mission only for a registered, clean Hermes project.
++
++    The low-level database primitive remains available for migrations and
++    focused tests. Every user-facing surface routes through this function.
++    Execution-capable missions (levels 2-4) immediately create their isolated
++    worktree, branch, rollback ref, and controller card.
++    """
++    ref = str(project_id or "").strip()
++    if not ref:
++        raise MissionError("a registered Hermes project is required")
++    repo = Path(repo_path).expanduser().resolve()
++    from hermes_cli import projects_db as pdb
++
++    with pdb.connect_closing() as project_conn:
++        project = pdb.get_project(project_conn, ref)
++        if project is None or project.archived:
++            raise MissionError(f"registered project {ref!r} does not exist or is archived")
++        owner = pdb.project_for_path(project_conn, str(repo))
++        if owner is None or owner.id != project.id:
++            raise MissionError("repo_path is not owned by the selected registered project")
++    try:
++        top = Path(_run_git(repo, "rev-parse", "--show-toplevel")).resolve()
++    except Exception as exc:
++        raise MissionError("repo_path must be a Git repository root") from exc
++    if top != repo:
++        raise MissionError(f"repo_path must be the Git root ({top})")
++    if _run_git(repo, "status", "--porcelain"):
++        raise MissionError("source checkout must be clean before mission creation")
++    if contract.allow_local_commit and autonomy_level != 4:
++        raise MissionError("allow_local_commit is valid only for autonomy level 4")
++
++    mission_id = mdb.create_mission(
++        conn, objective=objective, contract=contract, autonomy_level=autonomy_level,
++        repo_path=str(repo), board=board, risk_level=risk_level,
++        project_id=project.id, budget=budget, deadline=deadline,
++    )
++    if autonomy_level >= 2:
++        return prepare_mission(conn, mission_id)
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    return mission
++
++
+ def _prepare_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+     """Create or adopt the isolated worktree, rollback ref, and root card."""
+     mission = mdb.get_mission(conn, mission_id)
+@@ -459,13 +515,26 @@ def _add_execution_task_unlocked(
+         # The blocked controller task is the mission's start latch.  The
+         # first executor cannot become ready until start_mission completes it.
+         dependencies = [mission.root_task_id]
+-    task_id = kb.create_task(
+-        conn, title=title, body=body, assignee=assignee,
+-        created_by="mission-planner", parents=dependencies,
+-        workspace_kind="worktree", workspace_path=mission.worktree_path,
+-        branch_name=mission.branch_name, project_id=mission.project_id,
+-        goal_mode=True,
+-    )
++    if not dependencies:
++        raise MissionError("every manual executor must depend on the mission start graph")
++    placeholders = ",".join("?" for _ in dependencies)
++    dependency_rows = conn.execute(
++        f"SELECT id,mission_id FROM tasks WHERE id IN ({placeholders})",
++        tuple(dependencies),
++    ).fetchall()
++    if (
++        len(dependency_rows) != len(set(dependencies))
++        or any(row["mission_id"] != mission_id for row in dependency_rows)
++    ):
++        raise MissionError("manual mission dependencies must be cards in the same mission")
++    with kb._trusted_mission_controller_mutation():
++        task_id = kb.create_task(
++            conn, title=title, body=body, assignee=assignee,
++            created_by="mission-planner", parents=dependencies,
++            workspace_kind="worktree", workspace_path=mission.worktree_path,
++            branch_name=mission.branch_name, project_id=mission.project_id,
++            goal_mode=True,
++        )
+     mdb.link_task(conn, mission_id, task_id, "executor")
+     return task_id
+ 
+@@ -602,6 +671,219 @@ def _validate_planned_card(
+         raise MissionError(f"adopted {role} card {task_id} has unexpected dependencies")
+ 
+ 
++_TASK_MANIFEST_FIELDS = (
++    "id", "title", "body", "assignee", "priority", "created_by",
++    "workspace_kind", "workspace_path", "branch_name", "project_id",
++    "tenant", "idempotency_key", "max_runtime_seconds", "skills",
++    "max_retries", "model_override", "provider_override", "goal_mode",
++    "goal_max_turns", "session_id", "workflow_template_id",
++    "current_step_key", "mission_id", "mission_role",
++)
++
++
++def _task_manifest_payload(
++    conn, mission: mdb.Mission,
++) -> tuple[str, dict[str, Any]]:
++    """Serialize every immutable card field and every mission DAG edge."""
++    rows = conn.execute(
++        """SELECT * FROM tasks
++             WHERE mission_id=?
++             ORDER BY CASE mission_role
++                        WHEN 'controller' THEN 0
++                        WHEN 'executor' THEN 1
++                        WHEN 'verifier' THEN 2
++                        ELSE 3 END,
++                      created_at,id""",
++        (mission.id,),
++    ).fetchall()
++    if not rows:
++        raise MissionError("mission has no materialized task cards")
++    cards = [
++        {field: row[field] for field in _TASK_MANIFEST_FIELDS}
++        for row in rows
++    ]
++    ids = {str(card["id"]) for card in cards}
++    controllers = [
++        card for card in cards if card["mission_role"] == "controller"
++    ]
++    executors = [card for card in cards if card["mission_role"] == "executor"]
++    verifiers = [card for card in cards if card["mission_role"] == "verifier"]
++    if (
++        len(controllers) != 1
++        or controllers[0]["id"] != mission.root_task_id
++        or not executors
++        or len(verifiers) != 1
++        or any(
++            card["mission_role"] not in {"controller", "executor", "verifier"}
++            for card in cards
++        )
++    ):
++        raise MissionError(
++            "mission task graph must contain its controller, at least one "
++            "executor, and exactly one verifier"
++        )
++    placeholders = ",".join("?" for _ in ids)
++    edge_rows = conn.execute(
++        f"""SELECT parent_id,child_id FROM task_links
++              WHERE parent_id IN ({placeholders})
++                 OR child_id IN ({placeholders})
++              ORDER BY parent_id,child_id""",
++        (*sorted(ids), *sorted(ids)),
++    ).fetchall()
++    edges = [[str(row["parent_id"]), str(row["child_id"])] for row in edge_rows]
++    outside = sorted(
++        endpoint
++        for edge in edges
++        for endpoint in edge
++        if endpoint not in ids
++    )
++    if outside:
++        raise MissionError(
++            "mission task graph contains edges to non-mission cards: "
++            + ", ".join(sorted(set(outside)))
++        )
++    payload = {
++        "mission_id": mission.id,
++        "root_task_id": mission.root_task_id,
++        "cards": cards,
++        "edges": edges,
++    }
++    canonical = json.dumps(
++        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
++    )
++    return canonical, payload
++
++
++def _load_task_manifest(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
++    payload_json = str(row["payload_json"])
++    digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
++    if digest != row["manifest_hash"]:
++        raise MissionError("durable mission task manifest failed its integrity check")
++    try:
++        payload = json.loads(payload_json)
++    except json.JSONDecodeError as exc:
++        raise MissionError("durable mission task manifest contains malformed JSON") from exc
++    canonical = json.dumps(
++        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
++    )
++    if canonical != payload_json:
++        raise MissionError("durable mission task manifest is not canonical")
++    return payload_json, payload
++
++
++def _accept_or_validate_task_manifest(conn, mission: mdb.Mission) -> dict[str, Any]:
++    """Seal a planning result once, then require byte-exact graph identity."""
++    row = mdb.get_task_manifest(conn, mission.id)
++    if row is None and mission.status != "planning":
++        reason = (
++            "mission predates immutable task manifests; execution is "
++            "blocked because its cards cannot be authenticated safely. "
++            "Preserve or roll back the isolated worktree, then recreate "
++            "the mission."
++        )
++        if mission.status in {
++            "ready", "running", "waiting_for_user", "verifying",
++            "awaiting_approval", "committing",
++        }:
++            mdb.transition_mission(
++                conn,
++                mission.id,
++                "blocked",
++                phase="migration",
++                blocked_reason=reason,
++            )
++        raise MissionError(reason)
++    current_json, current = _task_manifest_payload(conn, mission)
++    if row is None:
++        try:
++            row = mdb.store_task_manifest(
++                conn,
++                mission.id,
++                manifest_hash=hashlib.sha256(current_json.encode("utf-8")).hexdigest(),
++                payload_json=current_json,
++            )
++        except ValueError as exc:
++            raise MissionError(str(exc)) from exc
++    accepted_json, accepted = _load_task_manifest(row)
++    if accepted.get("mission_id") != mission.id:
++        raise MissionError("mission task manifest belongs to a different mission")
++    if accepted_json != current_json:
++        raise MissionError(
++            "mission task cards or dependency graph no longer match the "
++            "immutable accepted manifest"
++        )
++    expected_bindings = sorted(
++        (str(card["id"]), str(card["mission_role"]))
++        for card in current["cards"]
++    )
++    stored_bindings = [
++        (str(row["task_id"]), str(row["role"]))
++        for row in conn.execute(
++            """SELECT task_id,role FROM mission_task_manifest_cards
++                 WHERE mission_id=? ORDER BY task_id""",
++            (mission.id,),
++        ).fetchall()
++    ]
++    if stored_bindings != expected_bindings:
++        raise MissionError("mission task manifest bindings failed their integrity check")
++    return current
++
++
++def validate_mission_task_graph(
++    conn,
++    mission_id: str,
++    *,
++    boundary: str,
++    expected_task_id: Optional[str] = None,
++    expected_workspace: Optional[str] = None,
++) -> dict[str, Any]:
++    """Revalidate the accepted graph at every execution trust boundary."""
++    mission = mdb.get_mission(conn, mission_id)
++    if mission is None:
++        raise KeyError(mission_id)
++    manifest = _accept_or_validate_task_manifest(conn, mission)
++    cards = {str(card["id"]): card for card in manifest["cards"]}
++    if expected_task_id is not None:
++        card = cards.get(expected_task_id)
++        if card is None or card.get("mission_role") != "executor":
++            raise MissionError(
++                f"task {expected_task_id} is not an accepted mission executor"
++            )
++        if card.get("workspace_path") != mission.worktree_path:
++            raise MissionError("mission executor workspace differs from its mission worktree")
++        if expected_workspace != mission.worktree_path:
++            raise MissionError("spawned executor workspace differs from its accepted workspace")
++        try:
++            accepted_path = Path(str(mission.worktree_path)).resolve(strict=True)
++            supplied_path = Path(str(expected_workspace)).resolve(strict=True)
++        except (OSError, RuntimeError) as exc:
++            raise MissionError("mission executor workspace cannot be resolved") from exc
++        if supplied_path != accepted_path:
++            raise MissionError("spawned executor workspace resolves outside its accepted workspace")
++    if boundary == "start":
++        status_rows = conn.execute(
++            "SELECT id,mission_role,status FROM tasks WHERE mission_id=?",
++            (mission_id,),
++        ).fetchall()
++        invalid = [
++            str(row["id"])
++            for row in status_rows
++            if (
++                row["mission_role"] == "controller"
++                and row["status"] not in {"blocked", "ready"}
++            ) or (
++                row["mission_role"] in {"executor", "verifier"}
++                and row["status"] not in {"todo", "ready"}
++            )
++        ]
++        if invalid:
++            raise MissionError(
++                "mission cards advanced before the explicit start gate: "
++                + ", ".join(invalid)
++            )
++    return manifest
++
++
+ def _create_or_adopt_planned_card(
+     conn,
+     mission: mdb.Mission,
+@@ -622,23 +904,24 @@ def _create_or_adopt_planned_card(
+     if matches:
+         task_id = matches[0]["id"]
+     else:
+-        task_id = kb.create_task(
+-            conn,
+-            title=title,
+-            body=body,
+-            assignee=assignee,
+-            created_by="mission-planner",
+-            parents=parents,
+-            workspace_kind="worktree",
+-            workspace_path=mission.worktree_path,
+-            branch_name=mission.branch_name,
+-            # An empty value bypasses create_task's mutable board-level project
+-            # inheritance while normalizing back to NULL. The mission record is
+-            # the durable routing contract for automatic cards.
+-            project_id=mission.project_id if mission.project_id is not None else "",
+-            goal_mode=True,
+-            idempotency_key=idempotency_key,
+-        )
++        with kb._trusted_mission_controller_mutation():
++            task_id = kb.create_task(
++                conn,
++                title=title,
++                body=body,
++                assignee=assignee,
++                created_by="mission-planner",
++                parents=parents,
++                workspace_kind="worktree",
++                workspace_path=mission.worktree_path,
++                branch_name=mission.branch_name,
++                # An empty value bypasses create_task's mutable board-level project
++                # inheritance while normalizing back to NULL. The mission record is
++                # the durable routing contract for automatic cards.
++                project_id=mission.project_id if mission.project_id is not None else "",
++                goal_mode=True,
++                idempotency_key=idempotency_key,
++            )
+     _validate_planned_card(
+         conn, mission, task_id, role=role, title=title, body=body,
+         assignee=assignee, idempotency_key=idempotency_key, parents=parents,
+@@ -727,6 +1010,7 @@ def _materialize_canonical_plan(
+     ).fetchall()
+     if [row["id"] for row in linked_verifiers] != [verifier_id]:
+         raise MissionError("mission must contain exactly one canonical verifier card")
++    _accept_or_validate_task_manifest(conn, mission)
+     _record_plan_evidence_once(
+         conn, mission, plan_hash=plan_hash, task_count=len(tasks),
+     )
+@@ -889,6 +1173,7 @@ def finish_plan(conn, mission_id: str, *, verifier_assignee: str) -> mdb.Mission
+                 idempotency_key=verifier_key,
+                 parents=parents,
+             )
++        _accept_or_validate_task_manifest(conn, mission)
+         refreshed = mdb.get_mission(conn, mission_id)
+         assert refreshed is not None
+         if refreshed.status == "planning":
+@@ -920,6 +1205,7 @@ def _start_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+         raise MissionError(
+             "Project Autopilot v1 supports only allowed_terminal_backends=['docker']"
+         )
++    validate_mission_task_graph(conn, mission_id, boundary="start")
+     _validate_worktree_identity(
+         mission, expected_head=mission.base_commit, require_clean=True,
+     )
+@@ -928,10 +1214,11 @@ def _start_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+     root = kb.get_task(conn, mission.root_task_id)
+     if root and root.status != "done":
+         if root.status != "ready":
+-            promoted, reason = kb.promote_task(
+-                conn, mission.root_task_id, actor="mission-controller",
+-                reason="explicit mission start", force=True,
+-            )
++            with kb._trusted_mission_controller_mutation():
++                promoted, reason = kb.promote_task(
++                    conn, mission.root_task_id, actor="mission-controller",
++                    reason="explicit mission start", force=True,
++                )
+             if not promoted:
+                 raise MissionError(reason or "could not release mission controller")
+         if not kb.complete_task(
+@@ -954,12 +1241,45 @@ def _pause_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+     mission = mdb.get_mission(conn, mission_id)
+     if mission is None:
+         raise KeyError(mission_id)
+-    if mission.status != "running":
++    if mission.status == "running":
++        # Revoke the durable lease before touching host processes or Docker.
++        # If the controller dies during quiescence, restart sees a safe
++        # waiting/pausing mission rather than a mutation-capable running one.
++        mission = mdb.transition_mission(
++            conn,
++            mission_id,
++            "waiting_for_user",
++            phase="pausing",
++            blocked_reason="pause in progress",
++        )
++    elif not (
++        mission.status == "waiting_for_user" and mission.phase == "pausing"
++    ):
+         raise MissionError("only a running mission can be paused")
+-    return mdb.transition_mission(
+-        conn, mission_id, "waiting_for_user", phase="paused",
+-        blocked_reason="paused by operator",
++    return _finish_mission_pause_unlocked(conn, mission_id)
++
++
++def _finish_mission_pause_unlocked(conn, mission_id: str) -> mdb.Mission:
++    """Complete a durable, restart-safe pause after lease revocation."""
++    _quiesce_mission_executors(
++        conn,
++        mission_id,
++        resolve_outcome="paused",
++        mark_paused=True,
+     )
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            """UPDATE missions
++                  SET phase='paused',blocked_reason='paused by operator',updated_at=?
++                WHERE id=? AND status='waiting_for_user'
++                  AND phase IN ('pausing','paused')""",
++            (int(time.time()), mission_id),
++        )
++        if cur.rowcount != 1:
++            raise MissionError("mission left the pause state during quiescence")
++    paused = mdb.get_mission(conn, mission_id)
++    assert paused is not None
++    return paused
+ 
+ 
+ def pause_mission(conn, mission_id: str) -> mdb.Mission:
+@@ -975,8 +1295,14 @@ def _resume_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+         raise KeyError(mission_id)
+     if mission.status != "waiting_for_user":
+         raise MissionError("mission is not paused")
++    if mission.phase == "pausing":
++        mission = _finish_mission_pause_unlocked(conn, mission_id)
++    if mission.phase != "paused":
++        raise MissionError(f"mission is waiting in non-pause phase {mission.phase!r}")
+     if mdb.open_intents(conn, mission_id):
+         raise MissionError("mission has unresolved mutation intents; reconcile before resuming")
++    validate_mission_task_graph(conn, mission_id, boundary="resume")
++    _resume_controller_paused_executors(conn, mission_id)
+     return mdb.transition_mission(conn, mission_id, "running", phase="execution")
+ 
+ 
+@@ -987,22 +1313,112 @@ def resume_mission(conn, mission_id: str) -> mdb.Mission:
+         return _resume_mission_unlocked(conn, mission_id)
+ 
+ 
+-def _remove_mission_containers(task_ids: list[str]) -> None:
++def _resume_controller_paused_executors(conn, mission_id: str) -> None:
++    """Requeue only executor cards quiesced by the mission pause control.
++
++    The paired task events are the durable ownership marker. A genuine worker
++    block has no ``mission_paused`` event and is therefore never unblocked by
++    a broad mission resume. Accepting ``ready``/``todo`` makes recovery
++    idempotent if the process stopped after requeueing a card but before
++    recording its matching ``mission_resumed`` event.
++    """
++    rows = conn.execute(
++        """SELECT t.id,t.status,
++                  (SELECT e.id FROM task_events e
++                    WHERE e.task_id=t.id AND e.kind='mission_paused'
++                    ORDER BY e.id DESC LIMIT 1) AS paused_event_id,
++                  (SELECT e.run_id FROM task_events e
++                    WHERE e.task_id=t.id AND e.kind='mission_paused'
++                    ORDER BY e.id DESC LIMIT 1) AS paused_run_id,
++                  (SELECT e.id FROM task_events e
++                    WHERE e.task_id=t.id AND e.kind='mission_resumed'
++                    ORDER BY e.id DESC LIMIT 1) AS resumed_event_id
++             FROM tasks t
++            WHERE t.mission_id=? AND t.mission_role='executor'
++            ORDER BY t.id""",
++        (mission_id,),
++    ).fetchall()
++    pending = [
++        row for row in rows
++        if row["paused_event_id"] is not None
++        and int(row["paused_event_id"]) > int(row["resumed_event_id"] or 0)
++    ]
++    for row in pending:
++        task_id = str(row["id"])
++        status = str(row["status"])
++        if status == "blocked":
++            with kb._trusted_mission_controller_mutation():
++                if not kb.unblock_task(conn, task_id):
++                    raise MissionError(f"could not resume paused executor task {task_id}")
++        elif status not in {"ready", "todo"}:
++            raise MissionError(
++                f"paused executor task {task_id} changed to unexpected state {status!r}"
++            )
++        with kb.write_txn(conn):
++            # Operator pauses are control-plane events, not recurring worker
++            # blockers. Clear the loop-breaker state so repeated pause/resume
++            # cycles can never route a healthy executor to triage.
++            conn.execute(
++                """UPDATE tasks SET block_kind=NULL,block_recurrences=0
++                     WHERE id=? AND status IN ('ready','todo')""",
++                (task_id,),
++            )
++            kb._append_event(
++                conn,
++                task_id,
++                "mission_resumed",
++                {"mission_id": mission_id},
++                run_id=row["paused_run_id"],
++            )
++            conn.execute(
++                """UPDATE mission_intents SET status='resumed'
++                     WHERE mission_id=? AND task_id=? AND status='paused'""",
++                (mission_id, task_id),
++            )
++
++
++def _remove_mission_containers(conn, mission_id: str, task_ids: list[str]) -> None:
+     """Force-remove Docker sandboxes dedicated to live mission executors."""
+     if not task_ids:
+         return
+-    from tools.environments.docker import find_docker
++    from tools.environments.docker import (
++        _mission_db_fingerprint,
++        _sanitize_label_value,
++        find_docker,
++    )
+ 
+     docker = find_docker()
+     if not docker:
+         raise MissionError("cannot prove executor quiescence: Docker is unavailable")
++    mission = mdb.get_mission(conn, mission_id)
++    if mission is None:
++        raise KeyError(mission_id)
++    if not mission.worktree_path:
++        raise MissionError("cannot prove executor quiescence without a mission worktree")
++    expected_worktree = Path(mission.worktree_path).resolve(strict=False)
++    expected_common = {
++        "hermes-agent": "1",
++        "hermes-mission-id": _sanitize_label_value(mission_id),
++        "hermes-board": _sanitize_label_value(mission.board),
++        "hermes-board-db": _mission_db_fingerprint(str(_connection_db_path(conn))),
++    }
+     for task_id in task_ids:
+         if not re.fullmatch(r"[A-Za-z0-9_.-]+", task_id):
+             raise MissionError(f"unsafe task id in Docker label: {task_id!r}")
++        # Probe by the two labels shared by both the initial Autopilot release
++        # and current containers. Querying only the newer mission/board labels
++        # would make an orphan created during an upgrade invisible and falsely
++        # report quiescence.
+         filters = [
+             "--filter", "label=hermes-agent=1",
+             "--filter", f"label=hermes-task-id={task_id}",
+         ]
++        valid_run_labels = {
++            _sanitize_label_value(str(row[0]))
++            for row in conn.execute(
++                "SELECT id FROM task_runs WHERE task_id=?", (task_id,),
++            ).fetchall()
++        }
+         probe = subprocess.run(
+             [docker, "ps", "-aq", *filters], text=True,
+             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+@@ -1014,6 +1430,62 @@ def _remove_mission_containers(task_ids: list[str]) -> None:
+                 + (probe.stderr.strip() or "Docker container lookup failed")
+             )
+         container_ids = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
++        for container_id in container_ids:
++            if not re.fullmatch(r"[A-Fa-f0-9]{12,64}", container_id):
++                raise MissionError("Docker returned an unsafe mission container id")
++            inspected = subprocess.run(
++                [docker, "inspect", "--format", "{{json .Config.Labels}}", container_id],
++                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                timeout=15, check=False,
++            )
++            try:
++                labels = json.loads(inspected.stdout) if inspected.returncode == 0 else None
++            except json.JSONDecodeError:
++                labels = None
++            mounted = subprocess.run(
++                [docker, "inspect", "--format", "{{json .Mounts}}", container_id],
++                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                timeout=15, check=False,
++            )
++            try:
++                mounts = json.loads(mounted.stdout) if mounted.returncode == 0 else None
++            except json.JSONDecodeError:
++                mounts = None
++            expected = expected_common | {
++                "hermes-task-id": _sanitize_label_value(task_id),
++            }
++            binding_keys = {
++                "hermes-mission-id", "hermes-board", "hermes-board-db",
++                "hermes-run-id",
++            }
++            has_current_binding = isinstance(labels, dict) and binding_keys.issubset(labels)
++            is_legacy_binding = isinstance(labels, dict) and not any(
++                key in labels for key in binding_keys
++            )
++            mount_matches = isinstance(mounts, list) and any(
++                isinstance(item, dict)
++                and item.get("Destination") == "/workspace"
++                and item.get("Type") == "bind"
++                and bool(str(item.get("Source") or "").strip())
++                and Path(str(item.get("Source") or "")).resolve(strict=False)
++                == expected_worktree
++                for item in mounts
++            )
++            current_matches = (
++                has_current_binding
++                and all(labels.get(key) == value for key, value in expected.items())
++                and labels.get("hermes-run-id") in valid_run_labels
++            )
++            legacy_matches = (
++                is_legacy_binding
++                and labels.get("hermes-agent") == "1"
++                and labels.get("hermes-task-id") == _sanitize_label_value(task_id)
++                and bool(valid_run_labels)
++            )
++            if not mount_matches or not (current_matches or legacy_matches):
++                raise MissionError(
++                    f"refusing to remove container with mismatched mission binding: {container_id}"
++                )
+         if container_ids:
+             removed = subprocess.run(
+                 [docker, "rm", "-f", *container_ids], text=True,
+@@ -1031,7 +1503,54 @@ def _remove_mission_containers(task_ids: list[str]) -> None:
+             timeout=15, check=False,
+         )
+         if verify.returncode != 0 or verify.stdout.strip():
+-            raise MissionError("mission executor container survived cancellation")
++            raise MissionError("mission executor container survived revocation")
++
++
++def _pause_running_executor(conn, mission_id: str, row) -> None:
++    """Atomically close one active run and mark its card as controller-paused."""
++    task_id = str(row["id"])
++    run_id = row["current_run_id"]
++    reason = "mission paused by operator"
++    with kb.write_txn(conn):
++        if run_id is None:
++            cur = conn.execute(
++                """UPDATE tasks
++                      SET status='blocked',claim_lock=NULL,claim_expires=NULL,
++                          worker_pid=NULL,block_kind=NULL,block_recurrences=0
++                    WHERE id=? AND status='running'""",
++                (task_id,),
++            )
++        else:
++            cur = conn.execute(
++                """UPDATE tasks
++                      SET status='blocked',claim_lock=NULL,claim_expires=NULL,
++                          worker_pid=NULL,block_kind=NULL,block_recurrences=0
++                    WHERE id=? AND status='running' AND current_run_id=?""",
++                (task_id, int(run_id)),
++            )
++        if cur.rowcount != 1:
++            raise MissionError(f"could not pause executor task {task_id}")
++        closed_run_id = kb._end_run(
++            conn,
++            task_id,
++            outcome="paused",
++            status="blocked",
++            summary=reason,
++        )
++        kb._append_event(
++            conn,
++            task_id,
++            "mission_paused",
++            {"mission_id": mission_id, "reason": reason},
++            run_id=closed_run_id,
++        )
++        if closed_run_id is not None:
++            conn.execute(
++                """UPDATE mission_intents SET status='paused',resolved_at=?
++                     WHERE mission_id=? AND task_id=? AND run_id=?
++                       AND status='open'""",
++                (int(time.time()), mission_id, task_id, int(closed_run_id)),
++            )
+ 
+ 
+ def _quiesce_mission_executors(
+@@ -1039,12 +1558,12 @@ def _quiesce_mission_executors(
+     mission_id: str,
+     *,
+     resolve_outcome: Optional[str] = "cancelled",
++    mark_paused: bool = False,
+ ) -> None:
+     """Stop claimed executors, close their runs, and resolve open intents."""
+     rows = conn.execute(
+         """SELECT t.id,t.status,t.worker_pid,t.claim_lock,t.current_run_id,
+-                  EXISTS(SELECT 1 FROM task_runs r
+-                          WHERE r.task_id=t.id AND r.worker_pid IS NOT NULL) AS was_spawned
++                  EXISTS(SELECT 1 FROM task_runs r WHERE r.task_id=t.id) AS was_run
+              FROM tasks t
+             WHERE t.mission_id=? AND t.mission_role='executor'
+             ORDER BY t.id""",
+@@ -1068,16 +1587,25 @@ def _quiesce_mission_executors(
+     # Persistent task containers can survive after the host worker has marked
+     # its card done. Enumerate every mission executor label, not just rows that
+     # still look live in SQLite.
+-    _remove_mission_containers([str(row["id"]) for row in rows])
++    _remove_mission_containers(
++        conn, mission_id, [str(row["id"]) for row in rows if row["was_run"]],
++    )
+     for row in rows:
+         current = kb.get_task(conn, row["id"])
+         if current is not None and current.status == "running":
+-            if not kb.block_task(
+-                conn, row["id"], reason="mission execution revoked by operator",
+-                kind="needs_input", expected_run_id=row["current_run_id"],
++            if mark_paused:
++                _pause_running_executor(conn, mission_id, row)
++            else:
++                if not kb.block_task(
++                    conn, row["id"], reason="mission execution revoked by operator",
++                    kind="needs_input", expected_run_id=row["current_run_id"],
++                ):
++                    raise MissionError(f"could not revoke executor task {row['id']}")
++            if (
++                not mark_paused
++                and resolve_outcome is not None
++                and row["current_run_id"] is not None
+             ):
+-                raise MissionError(f"could not revoke executor task {row['id']}")
+-            if resolve_outcome is not None and row["current_run_id"] is not None:
+                 # block_task closes the exact run atomically as `blocked`; the
+                 # enclosing lifecycle operation then refines that terminal
+                 # intent outcome to cancelled/rolled_back for audit clarity.
+@@ -1366,6 +1894,7 @@ def deterministic_verification(
+     mission = mdb.get_mission(conn, mission_id)
+     if mission is None:
+         raise KeyError(mission_id)
++    validate_mission_task_graph(conn, mission_id, boundary="verification")
+     evidence = mdb.list_evidence(conn, mission_id)
+     chain_ok = mdb.verify_evidence_chain(conn, mission_id)
+     current_snapshot = _workspace_snapshot(mission)
+@@ -1431,6 +1960,7 @@ def _submit_verifier_verdict_unlocked(
+         raise KeyError(mission_id)
+     if mission.status not in {"running", "verifying"}:
+         raise MissionError(f"verdict requires verifying state, not {mission.status}")
++    validate_mission_task_graph(conn, mission_id, boundary="verification")
+     required = {"verdict", "requirements_checked", "requirements_failed", "evidence_missing", "recommended_action"}
+     coherent = bool(
+         isinstance(verdict, dict)
+@@ -1485,8 +2015,13 @@ def _submit_verifier_verdict_unlocked(
+     )
+     if mission.autonomy_level == 3:
+         return mdb.transition_mission(conn, mission_id, "awaiting_approval", phase="commit")
+-    if mission.autonomy_level == 4:
++    if mission.autonomy_level == 4 and mission.contract.allow_local_commit:
+         return mdb.transition_mission(conn, mission_id, "committing", phase="commit")
++    if mission.autonomy_level == 4:
++        return mdb.transition_mission(
++            conn, mission_id, "blocked", phase="commit",
++            blocked_reason="autonomy level 4 lacks explicit local-commit authority",
++        )
+     return mdb.transition_mission(
+         conn, mission_id, "blocked", phase="commit",
+         blocked_reason=f"autonomy level {mission.autonomy_level} does not permit local commits",
+@@ -1509,6 +2044,7 @@ def _verify_with_model_unlocked(conn, mission_id: str) -> mdb.Mission:
+     mission = mdb.get_mission(conn, mission_id)
+     if mission is None:
+         raise KeyError(mission_id)
++    validate_mission_task_graph(conn, mission_id, boundary="verification")
+     executor_states = [
+         row[0] for row in conn.execute(
+             "SELECT status FROM tasks WHERE mission_id=? AND mission_role='executor'",
+@@ -1587,6 +2123,62 @@ def approve_commit(conn, mission_id: str) -> mdb.Mission:
+         return mdb.transition_mission(conn, mission_id, "committing", phase="commit")
+ 
+ 
++def deny_mission(conn, mission_id: str) -> mdb.Mission:
++    """Reject a supervised commit without discarding the isolated worktree."""
++    with _mission_action_lock(conn, mission_id) as held:
++        if not held:
++            raise MissionError("another verifier or control action is already running")
++        mission = mdb.get_mission(conn, mission_id)
++        if mission is None:
++            raise KeyError(mission_id)
++        if mission.status != "awaiting_approval":
++            raise MissionError("mission is not awaiting commit approval")
++        _require_no_open_intents(conn, mission_id, action="deny commit")
++        mdb.record_evidence(
++            conn, mission_id, kind="approval", status="failed",
++            metadata={"action": "deny", "previous_status": mission.status},
++            cwd=mission.worktree_path,
++        )
++        return mdb.transition_mission(
++            conn, mission_id, "blocked", phase="commit",
++            blocked_reason="local commit denied by operator",
++        )
++
++
++def retry_mission(conn, mission_id: str) -> mdb.Mission:
++    """Restart a safely blocked mission from its last bounded phase."""
++    with _board_and_mission_action_lock(conn, mission_id) as held:
++        if not held:
++            raise MissionError("mission retry is busy; retry on the next dispatcher tick")
++        mission = reconcile_mission(conn, mission_id)
++        if mission.status != "blocked":
++            raise MissionError(f"only a blocked mission can be retried, not {mission.status}")
++        if mission.deadline is not None and int(time.time()) > int(mission.deadline):
++            raise MissionError("mission deadline is still exceeded")
++        if mission.blocked_reason and "recovery_ambiguous" in mission.blocked_reason:
++            raise MissionError("ambiguous recovery must be resolved or rolled back before retry")
++        _require_no_open_intents(conn, mission_id, action="retry")
++        if mission.phase == "environment":
++            return _prepare_mission_unlocked(conn, mission_id)
++        if mission.worktree_path:
++            _validate_worktree_identity(mission)
++        target = "planning" if mission.phase == "planning" else "running"
++        if target == "running":
++            validate_mission_task_graph(conn, mission_id, boundary="retry")
++        mdb.record_evidence(
++            conn, mission_id, kind="lifecycle", status="passed",
++            metadata={
++                "action": "retry", "previous_phase": mission.phase,
++                "previous_blocker": mission.blocked_reason, "target": target,
++            },
++            cwd=mission.worktree_path,
++        )
++        return mdb.transition_mission(
++            conn, mission_id, target,
++            phase=("planning" if target == "planning" else "execution"),
++        )
++
++
+ def _commit_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+     mission = mdb.get_mission(conn, mission_id)
+     if mission is None:
+@@ -1864,6 +2456,68 @@ def _ambiguous_open_intents(conn, mission_id: str) -> list[dict[str, Any]]:
+     return ambiguous
+ 
+ 
++def _mission_needs_quiescence(conn, mission_id: str) -> bool:
++    """Return whether a non-running mission still owns executable state."""
++    live = conn.execute(
++        """SELECT 1 FROM tasks
++            WHERE mission_id=? AND mission_role='executor'
++              AND (status='running' OR claim_lock IS NOT NULL
++                   OR worker_pid IS NOT NULL OR current_run_id IS NOT NULL)
++            LIMIT 1""",
++        (mission_id,),
++    ).fetchone()
++    return live is not None or bool(mdb.open_intents(conn, mission_id))
++
++
++def _mission_run_generation(conn, mission_id: str) -> int:
++    row = conn.execute(
++        """SELECT COALESCE(MAX(r.id),0)
++             FROM task_runs r JOIN tasks t ON t.id=r.task_id
++            WHERE t.mission_id=? AND t.mission_role='executor'""",
++        (mission_id,),
++    ).fetchone()
++    return int(row[0] or 0)
++
++
++def _quiescence_binding(conn, mission: mdb.Mission) -> dict[str, Any]:
++    """Describe the exact blocked execution generation a proof covers."""
++    return {
++        "mission_status": mission.status,
++        "phase": mission.phase,
++        "blocked_reason": mission.blocked_reason,
++        "mission_updated_at": mission.updated_at,
++        "max_executor_run_id": _mission_run_generation(conn, mission.id),
++    }
++
++
++def _blocked_quiescence_proven(conn, mission: mdb.Mission) -> bool:
++    binding = _quiescence_binding(conn, mission)
++    for row in reversed(mdb.list_evidence(conn, mission.id)):
++        if row["kind"] == "quiescence" and row["status"] == "passed":
++            return row["metadata"] == binding
++    return False
++
++
++def _quiesce_blocked_mission(conn, mission: mdb.Mission) -> None:
++    """Revoke a blocked mission once and persist a generation-bound proof."""
++    _quiesce_mission_executors(
++        conn, mission.id, resolve_outcome="blocked",
++    )
++    refreshed = mdb.get_mission(conn, mission.id)
++    if refreshed is None or refreshed.status != "blocked":
++        raise MissionError("mission left blocked state during executor quiescence")
++    binding = _quiescence_binding(conn, refreshed)
++    if not _blocked_quiescence_proven(conn, refreshed):
++        mdb.record_evidence(
++            conn,
++            mission.id,
++            kind="quiescence",
++            status="passed",
++            metadata=binding,
++            cwd=refreshed.worktree_path,
++        )
++
++
+ def reconcile_active_missions(conn) -> list[str]:
+     """Block ambiguous mutations before the dispatcher can reclaim/spawn.
+ 
+@@ -1875,13 +2529,46 @@ def reconcile_active_missions(conn) -> list[str]:
+     reconciled: list[str] = []
+     rows = conn.execute(
+         "SELECT id FROM missions WHERE status IN "
+-        "('running','waiting_for_user','verifying','awaiting_approval','committing') "
++        "('running','waiting_for_user','blocked','verifying','awaiting_approval','committing') "
+         "ORDER BY updated_at, id"
+     ).fetchall()
+     for row in rows:
+         mission = mdb.get_mission(conn, row["id"])
+         if mission is None:
+             continue
++        if mission.status == "waiting_for_user" and mission.phase == "pausing":
++            try:
++                _finish_mission_pause_unlocked(conn, mission.id)
++            except Exception:
++                # The waiting state already revoked new tool leases. Leave the
++                # durable pausing marker intact so the next dispatcher tick or
++                # explicit resume retries host/container quiescence.
++                continue
++            reconciled.append(mission.id)
++            continue
++        if mission.status == "waiting_for_user" and mission.phase == "cancelling":
++            try:
++                _cancel_mission_unlocked(conn, mission.id)
++            except Exception:
++                # Cancellation already revoked the durable lease. Preserve
++                # the phase so cleanup and the terminal transition retry.
++                continue
++            reconciled.append(mission.id)
++            continue
++        if mission.status == "blocked":
++            if (
++                not _mission_needs_quiescence(conn, mission.id)
++                and _blocked_quiescence_proven(conn, mission)
++            ):
++                continue
++            try:
++                _quiesce_blocked_mission(conn, mission)
++            except Exception:
++                # Fail closed: blocked status denies new mission tool leases;
++                # retain executable-state markers so reconciliation retries.
++                continue
++            reconciled.append(mission.id)
++            continue
+         ambiguous = _ambiguous_open_intents(conn, mission.id)
+         if not ambiguous:
+             continue
+@@ -1897,6 +2584,15 @@ def reconcile_active_missions(conn) -> list[str]:
+             conn, mission.id, "blocked", phase="recovery",
+             blocked_reason="recovery_ambiguous: unresolved mutation intent",
+         )
++        blocked = mdb.get_mission(conn, mission.id)
++        assert blocked is not None
++        try:
++            _quiesce_blocked_mission(conn, blocked)
++        except Exception:
++            # The mission remains durably blocked and will be retried by the
++            # blocked branch on the next dispatcher tick, even if crash
++            # detection clears the task's live DB fields in the meantime.
++            pass
+         reconciled.append(mission.id)
+     return reconciled
+ 
+@@ -1916,10 +2612,11 @@ def _settle_verifier_task(conn, mission_id: str, *, passed: bool, reason: str) -
+     if task is None or task.status == "done":
+         return
+     if task.status not in {"ready", "running"}:
+-        promoted, _ = kb.promote_task(
+-            conn, task_id, actor="mission-controller",
+-            reason="logical verifier is ready", force=True,
+-        )
++        with kb._trusted_mission_controller_mutation():
++            promoted, _ = kb.promote_task(
++                conn, task_id, actor="mission-controller",
++                reason="logical verifier is ready", force=True,
++            )
+         if not promoted:
+             return
+     if passed:
+@@ -2090,14 +2787,28 @@ def reconcile_mission(conn, mission_id: str) -> mdb.Mission:
+         raise KeyError(mission_id)
+     if mission.status in mdb.TERMINAL_MISSION_STATUSES:
+         return mission
++    if mission.status == "waiting_for_user" and mission.phase == "pausing":
++        return _finish_mission_pause_unlocked(conn, mission_id)
++    if mission.status == "waiting_for_user" and mission.phase == "cancelling":
++        return _cancel_mission_unlocked(conn, mission_id)
++    if mission.status == "blocked" and (
++        _mission_needs_quiescence(conn, mission_id)
++        or not _blocked_quiescence_proven(conn, mission)
++    ):
++        _quiesce_blocked_mission(conn, mission)
++        refreshed = mdb.get_mission(conn, mission_id)
++        assert refreshed is not None
++        return refreshed
+     if _ambiguous_open_intents(conn, mission_id):
+         if mission.status in {
+             "running", "waiting_for_user", "verifying", "awaiting_approval", "committing",
+         }:
+-            return mdb.transition_mission(
++            blocked = mdb.transition_mission(
+                 conn, mission_id, "blocked", phase="recovery",
+                 blocked_reason="recovery_ambiguous: unresolved mutation intent",
+             )
++            _quiesce_blocked_mission(conn, blocked)
++            return blocked
+     return mission
+ 
+ 
+@@ -2107,17 +2818,53 @@ def begin_task_intent(task: kb.Task, *, board: Optional[str] = None) -> Optional
+         return None
+     if task.current_run_id is None or not task.claim_lock:
+         raise MissionError("mission executor has no attributable Kanban run/claim")
+-    from tools.checkpoint_manager import CheckpointManager
+-
+-    manager = CheckpointManager(enabled=True)
+-    manager.new_turn()
+-    checkpointed = manager.ensure_checkpoint(
+-        task.workspace_path, reason=f"mission {task.mission_id} task {task.id}"
+-    )
+-    checkpoints = manager.list_checkpoints(task.workspace_path) if checkpointed else []
+-    checkpoint_ref = checkpoints[0].get("hash") if checkpoints else None
+     resolved_board = board or os.environ.get("HERMES_KANBAN_BOARD") or kb.get_current_board()
+     with kb.connect_closing(board=resolved_board) as conn:
++        validate_mission_task_graph(
++            conn,
++            task.mission_id,
++            boundary="spawn",
++            expected_task_id=task.id,
++            expected_workspace=task.workspace_path,
++        )
++        current = kb.get_task(conn, task.id)
++        if (
++            current is None
++            or current.current_run_id != task.current_run_id
++            or current.claim_lock != task.claim_lock
++            or current.status != "running"
++        ):
++            raise MissionError("mission executor claim changed before checkpoint")
++
++        from tools.checkpoint_manager import CheckpointManager
++
++        manager = CheckpointManager(enabled=True)
++        manager.new_turn()
++        checkpointed = manager.ensure_checkpoint(
++            task.workspace_path,
++            reason=f"mission {task.mission_id} task {task.id}",
++        )
++        checkpoints = (
++            manager.list_checkpoints(task.workspace_path) if checkpointed else []
++        )
++        checkpoint_ref = checkpoints[0].get("hash") if checkpoints else None
++        # Recheck after the external checkpoint operation so no card/edge or
++        # workspace substitution can land in the gap before the intent row.
++        validate_mission_task_graph(
++            conn,
++            task.mission_id,
++            boundary="spawn",
++            expected_task_id=task.id,
++            expected_workspace=task.workspace_path,
++        )
++        current = kb.get_task(conn, task.id)
++        if (
++            current is None
++            or current.current_run_id != task.current_run_id
++            or current.claim_lock != task.claim_lock
++            or current.status != "running"
++        ):
++            raise MissionError("mission executor claim changed before intent creation")
+         return mdb.begin_intent(
+             conn, task.mission_id, task_id=task.id, action="execute_task",
+             run_id=task.current_run_id, claim_token=task.claim_lock,
+diff --git a/hermes_cli/missions.py b/hermes_cli/missions.py
+index 805cea05d..df590ab40 100644
+--- a/hermes_cli/missions.py
++++ b/hermes_cli/missions.py
+@@ -34,7 +34,8 @@ def build_parser(parent_subparsers) -> argparse.ArgumentParser:
+     create.add_argument("--autonomy", type=int, choices=range(0, 5), required=True)
+     create.add_argument("--risk", choices=("low", "medium", "high"), default="medium")
+     create.add_argument("--repo", required=True)
+-    create.add_argument("--project", default=None)
++    create.add_argument("--project", required=True, help="Registered Hermes project id or slug")
++    create.add_argument("--allow-local-commit", action="store_true")
+     create.add_argument("--evidence-bytes", type=int, default=100 * 1024 * 1024)
+     create.add_argument("--json", action="store_true")
+ 
+@@ -45,7 +46,7 @@ def build_parser(parent_subparsers) -> argparse.ArgumentParser:
+ 
+     for name in (
+         "show", "inspect", "prepare", "start", "pause", "resume", "verify", "approve",
+-        "commit", "cancel", "rollback", "reconcile",
++        "commit", "deny", "retry", "cancel", "rollback", "reconcile",
+     ):
+         p = sub.add_parser(name)
+         p.add_argument("mission_id")
+@@ -113,7 +114,7 @@ def mission_command(args: argparse.Namespace) -> int:
+     board = args.board or kb.get_current_board()
+     action = args.mission_action
+     if not action:
+-        print("usage: hermes mission {create,list,show,inspect,prepare,task-add,plan-finish,start,pause,resume,evidence-add,verdict,verify,approve,commit,cancel,rollback,reconcile}")
++        print("usage: hermes mission {create,list,show,inspect,prepare,task-add,plan-finish,start,pause,resume,evidence-add,verdict,verify,approve,deny,retry,commit,cancel,rollback,reconcile}")
+         return 2
+     try:
+         with kb.connect_closing(board=board) as conn:
+@@ -128,14 +129,14 @@ def mission_command(args: argparse.Namespace) -> int:
+                         "network_destinations": args.network,
+                     },
+                     stop_when=args.stop_when,
++                    allow_local_commit=args.allow_local_commit,
+                 )
+-                mid = mdb.create_mission(
++                mission = service.create_mission(
+                     conn, objective=args.objective, contract=contract,
+                     autonomy_level=args.autonomy, repo_path=args.repo, board=board,
+                     risk_level=args.risk, project_id=args.project,
+                     budget={"evidence_bytes": args.evidence_bytes},
+                 )
+-                mission = mdb.get_mission(conn, mid)
+                 _emit(_mission_json(mission) if args.json else mission, as_json=args.json)
+             elif action in {"list", "ls"}:
+                 missions = mdb.list_missions(conn, status=args.status, limit=args.limit)
+@@ -199,6 +200,12 @@ def mission_command(args: argparse.Namespace) -> int:
+             elif action == "commit":
+                 mission = service.commit_mission(conn, args.mission_id)
+                 _emit(_mission_json(mission) if args.json else mission, as_json=args.json)
++            elif action == "deny":
++                mission = service.deny_mission(conn, args.mission_id)
++                _emit(_mission_json(mission) if args.json else mission, as_json=args.json)
++            elif action == "retry":
++                mission = service.retry_mission(conn, args.mission_id)
++                _emit(_mission_json(mission) if args.json else mission, as_json=args.json)
+             elif action == "cancel":
+                 mission = service.cancel_mission(conn, args.mission_id)
+                 _emit(_mission_json(mission) if args.json else mission, as_json=args.json)
+diff --git a/hermes_cli/missions_db.py b/hermes_cli/missions_db.py
+index bd11b808b..329c941a0 100644
+--- a/hermes_cli/missions_db.py
++++ b/hermes_cli/missions_db.py
+@@ -36,7 +36,7 @@ MISSION_ROLES = frozenset({"controller", "planner", "executor", "verifier"})
+ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+     "draft": frozenset({"planning", "cancelled"}),
+     "planning": frozenset({"ready", "blocked", "failed", "cancelled"}),
+-    "ready": frozenset({"running", "cancelled"}),
++    "ready": frozenset({"running", "blocked", "cancelled"}),
+     "running": frozenset({"waiting_for_user", "blocked", "verifying", "failed", "cancelled"}),
+     "waiting_for_user": frozenset({"running", "blocked", "cancelled"}),
+     "blocked": frozenset({"planning", "ready", "running", "rolled_back", "failed", "cancelled"}),
+@@ -57,12 +57,15 @@ class MissionContract:
+     constraints: list[str] = field(default_factory=list)
+     boundaries: dict[str, Any] = field(default_factory=dict)
+     stop_when: list[str] = field(default_factory=list)
++    allow_local_commit: bool = False
+ 
+     def validate(self) -> None:
+         if not self.outcome.strip():
+             raise ValueError("mission contract outcome is required")
+         if not self.verification:
+             raise ValueError("at least one verification criterion is required")
++        if not isinstance(self.allow_local_commit, bool):
++            raise ValueError("allow_local_commit must be a boolean")
+         roots = self.boundaries.get("allowed_roots", [])
+         if not isinstance(roots, list) or not roots:
+             raise ValueError("boundaries.allowed_roots must contain at least one path")
+@@ -101,6 +104,7 @@ class MissionContract:
+             constraints=[str(v) for v in data.get("constraints", [])],
+             boundaries=dict(data.get("boundaries") or {}),
+             stop_when=[str(v) for v in data.get("stop_when", [])],
++            allow_local_commit=bool(data.get("allow_local_commit", False)),
+         )
+ 
+ 
+@@ -217,6 +221,20 @@ CREATE TABLE IF NOT EXISTS mission_plans (
+     created_at INTEGER NOT NULL
+ );
+ 
++CREATE TABLE IF NOT EXISTS mission_task_manifests (
++    mission_id TEXT PRIMARY KEY,
++    manifest_hash TEXT NOT NULL,
++    payload_json TEXT NOT NULL,
++    created_at INTEGER NOT NULL
++);
++
++CREATE TABLE IF NOT EXISTS mission_task_manifest_cards (
++    mission_id TEXT NOT NULL,
++    task_id TEXT NOT NULL UNIQUE,
++    role TEXT NOT NULL,
++    PRIMARY KEY (mission_id, task_id)
++);
++
+ CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status, updated_at);
+ CREATE INDEX IF NOT EXISTS idx_mission_evidence_mission ON mission_evidence(mission_id, id);
+ CREATE INDEX IF NOT EXISTS idx_mission_intents_open ON mission_intents(mission_id, status);
+@@ -422,6 +440,89 @@ def store_plan(
+         return dict(row)
+ 
+ 
++def get_task_manifest(
++    conn: sqlite3.Connection, mission_id: str,
++) -> Optional[dict[str, Any]]:
++    """Return the immutable materialized-card manifest, if accepted."""
++    ensure_schema(conn)
++    row = conn.execute(
++        "SELECT * FROM mission_task_manifests WHERE mission_id=?",
++        (mission_id,),
++    ).fetchone()
++    return dict(row) if row else None
++
++
++def store_task_manifest(
++    conn: sqlite3.Connection,
++    mission_id: str,
++    *,
++    manifest_hash: str,
++    payload_json: str,
++) -> dict[str, Any]:
++    """Persist the exact accepted task cards and dependency graph once.
++
++    Exact retries are idempotent.  A later caller cannot redefine card IDs,
++    execution specs, routing, workspaces, or edges after the mission has
++    crossed its planning gate.
++    """
++    if hashlib.sha256(payload_json.encode("utf-8")).hexdigest() != manifest_hash:
++        raise ValueError("mission task manifest hash does not match its payload")
++    try:
++        payload = json.loads(payload_json)
++        cards = payload["cards"]
++        bindings = [
++            (mission_id, str(card["id"]), str(card["mission_role"]))
++            for card in cards
++        ]
++    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
++        raise ValueError("mission task manifest has invalid card bindings") from exc
++    if (
++        not bindings
++        or any(role not in MISSION_ROLES for _, _, role in bindings)
++        or len({task_id for _, task_id, _ in bindings}) != len(bindings)
++    ):
++        raise ValueError("mission task manifest has invalid card bindings")
++    ensure_schema(conn)
++    with kb.write_txn(conn):
++        if conn.execute(
++            "SELECT 1 FROM missions WHERE id=?", (mission_id,),
++        ).fetchone() is None:
++            raise KeyError(mission_id)
++        conn.execute(
++            """INSERT OR IGNORE INTO mission_task_manifests(
++                   mission_id, manifest_hash, payload_json, created_at
++               ) VALUES (?, ?, ?, ?)""",
++            (mission_id, manifest_hash, payload_json, int(time.time())),
++        )
++        row = conn.execute(
++            "SELECT * FROM mission_task_manifests WHERE mission_id=?",
++            (mission_id,),
++        ).fetchone()
++        if row is None:
++            raise RuntimeError("failed to persist mission task manifest")
++        if (
++            row["manifest_hash"] != manifest_hash
++            or row["payload_json"] != payload_json
++        ):
++            raise ValueError("mission already has a different task manifest")
++        conn.executemany(
++            """INSERT OR IGNORE INTO mission_task_manifest_cards(
++                   mission_id, task_id, role
++               ) VALUES (?, ?, ?)""",
++            bindings,
++        )
++        stored = conn.execute(
++            """SELECT task_id,role FROM mission_task_manifest_cards
++                 WHERE mission_id=? ORDER BY task_id""",
++            (mission_id,),
++        ).fetchall()
++        if [(r["task_id"], r["role"]) for r in stored] != sorted(
++            (task_id, role) for _, task_id, role in bindings
++        ):
++            raise ValueError("mission task manifest card bindings disagree")
++        return dict(row)
++
++
+ def set_workspace(
+     conn: sqlite3.Connection,
+     mission_id: str,
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 8dd02a1bd..240e34924 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -47,7 +47,7 @@ from pathlib import Path
+ from typing import Any, Callable, Dict, List, Optional, Set, Union
+ 
+ from hermes_constants import get_hermes_home
+-from utils import env_var_enabled, fast_safe_load
++from utils import env_var_enabled, fast_safe_load, host_extension_execution_disabled
+ from hermes_cli.config import cfg_get
+ from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+ 
+@@ -1304,8 +1304,8 @@ class PluginManager:
+         """
+         if self._discovered and not force:
+             return
+-        if env_var_enabled("HERMES_SAFE_MODE"):
+-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
++        if host_extension_execution_disabled():
++            logger.info("Host-side extension execution disabled — plugin discovery skipped")
+             self._discovered = True
+             return
+         if force:
+@@ -1928,6 +1928,9 @@ class PluginManager:
+         are reused.  All injected context is ephemeral — never
+         persisted to session DB.
+         """
++        if host_extension_execution_disabled():
++            return []
++
+         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+         callbacks = self._hooks.get(hook_name, [])
+         results: List[Any] = []
+@@ -1947,10 +1950,14 @@ class PluginManager:
+ 
+     def has_hook(self, hook_name: str) -> bool:
+         """Return True when at least one callback is registered for a hook."""
++        if host_extension_execution_disabled():
++            return False
+         return bool(self._hooks.get(hook_name))
+ 
+     def has_middleware(self, kind: str) -> bool:
+         """Return True when at least one callback is registered for middleware."""
++        if host_extension_execution_disabled():
++            return False
+         return bool(self._middleware.get(kind))
+ 
+     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
+@@ -1960,6 +1967,9 @@ class PluginManager:
+         path. Middleware that wants to change behavior must return the shape
+         documented by the caller-specific contract.
+         """
++        if host_extension_execution_disabled():
++            return []
++
+         callbacks = self._middleware.get(kind, [])
+         results: List[Any] = []
+         for cb in callbacks:
+@@ -2358,11 +2368,15 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
+ 
+ def get_plugin_context_engine():
+     """Return the plugin-registered context engine, or None."""
++    if host_extension_execution_disabled():
++        return None
+     return _ensure_plugins_discovered()._context_engine
+ 
+ 
+ def get_plugin_command_handler(name: str) -> Optional[Callable]:
+     """Return the handler for a plugin-registered slash command, or ``None``."""
++    if host_extension_execution_disabled():
++        return None
+     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+     return entry["handler"] if entry else None
+ 
+diff --git a/hermes_constants.py b/hermes_constants.py
+index bd3db68f1..6babd1a8b 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -1106,6 +1106,32 @@ def translate_cwd_for_wsl_backend(cwd: str) -> str:
+ _container_detected: bool | None = None
+ 
+ 
++def _mountinfo_indicates_container(mountinfo: str) -> bool:
++    """Inspect only process-root/cgroup mounts, not unrelated child mounts."""
++    markers = ("kubepods", "containerd", "crio")
++    for line in mountinfo.splitlines():
++        fields = line.split()
++        if len(fields) < 10 or "-" not in fields:
++            continue
++        separator = fields.index("-")
++        if separator + 2 >= len(fields):
++            continue
++        root = fields[3]
++        mount_point = fields[4]
++        fs_type = fields[separator + 1]
++        source = fields[separator + 2]
++        if mount_point == "/" and (
++            fs_type in {"overlay", "fuse-overlayfs"}
++            or any(marker in value for marker in markers for value in (root, source, line))
++        ):
++            return True
++        if mount_point == "/sys/fs/cgroup" and any(
++            marker in value for marker in markers for value in (root, source)
++        ):
++            return True
++    return False
++
++
+ def is_container() -> bool:
+     """Return True when running inside a container.
+ 
+@@ -1117,7 +1143,9 @@ def is_container() -> bool:
+     Kubernetes/k3s) were previously missed. To cover those, also check:
+       * ``KUBERNETES_SERVICE_HOST`` env var — set in every Kubernetes pod.
+       * ``kubepods`` / ``containerd`` / ``crio`` markers in ``/proc/1/cgroup``.
+-      * the same markers in ``/proc/self/mountinfo`` (cgroup-v2 fallback).
++      * process-root/cgroup markers in ``/proc/self/mountinfo`` (cgroup-v2
++        fallback). Child Docker storage mounts are ignored because they can
++        exist on a bare-metal container host.
+ 
+     Result is cached for the process lifetime.  Import-safe — no heavy deps.
+ 
+@@ -1151,7 +1179,7 @@ def is_container() -> bool:
+     try:
+         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+             mountinfo = f.read()
+-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
++            if _mountinfo_indicates_container(mountinfo):
+                 _container_detected = True
+                 return True
+     except OSError:
+diff --git a/plugins/context_engine/__init__.py b/plugins/context_engine/__init__.py
+index 906ade4a3..552288015 100644
+--- a/plugins/context_engine/__init__.py
++++ b/plugins/context_engine/__init__.py
+@@ -25,6 +25,8 @@ import sys
+ from pathlib import Path
+ from typing import List, Optional, Tuple
+ 
++from utils import host_extension_execution_disabled
++
+ logger = logging.getLogger(__name__)
+ 
+ _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
+@@ -37,6 +39,9 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
+     Does NOT import the engines — just reads plugin.yaml for metadata
+     and does a lightweight availability check.
+     """
++    if host_extension_execution_disabled():
++        return []
++
+     results = []
+     if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():
+         return results
+@@ -81,6 +86,10 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
+ 
+     Returns None if the engine is not found or fails to load.
+     """
++    if host_extension_execution_disabled():
++        logger.info("Host-side extension execution disabled — context plugin skipped")
++        return None
++
+     engine_dir = _CONTEXT_ENGINE_PLUGINS_DIR / name
+     if not engine_dir.is_dir():
+         logger.debug("Context engine '%s' not found in %s", name, _CONTEXT_ENGINE_PLUGINS_DIR)
+@@ -104,6 +113,9 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
+     - A register(ctx) function (plugin-style) — we simulate a ctx
+     - A top-level class that extends ContextEngine — we instantiate it
+     """
++    if host_extension_execution_disabled():
++        return None
++
+     name = engine_dir.name
+     module_name = f"plugins.context_engine.{name}"
+     init_file = engine_dir / "__init__.py"
+diff --git a/plugins/kanban/dashboard/dist/index.js b/plugins/kanban/dashboard/dist/index.js
+index 7810b41dc..e0f3af464 100644
+--- a/plugins/kanban/dashboard/dist/index.js
++++ b/plugins/kanban/dashboard/dist/index.js
+@@ -510,8 +510,8 @@
+     const [busy, setBusy] = useState(false);
+     const [error, setError] = useState(null);
+     const [form, setForm] = useState({
+-      objective: "", outcome: "", verification: "", repo: "",
+-      paths: "", autonomy: "3",
++      objective: "", outcome: "", verification: "", project: "", repo: "",
++      paths: "", autonomy: "3", allowCommit: false,
+     });
+ 
+     const load = useCallback(function () {
+@@ -550,11 +550,13 @@
+           verification: verification, constraints: ["Do not modify unrelated files"],
+           boundaries: { allowed_roots: [form.repo.trim()], allowed_paths: paths, network_destinations: [] },
+           stop_when: ["The declared scope cannot be enforced"],
+-          autonomy_level: Number(form.autonomy), repo_path: form.repo.trim(),
++          autonomy_level: Number(form.autonomy),
++          allow_local_commit: Number(form.autonomy) === 4 && Boolean(form.allowCommit),
++          project_id: form.project.trim(), repo_path: form.repo.trim(),
+         }),
+         headers: { "Content-Type": "application/json" },
+       }).then(function () {
+-        setForm({ objective: "", outcome: "", verification: "", repo: "", paths: "", autonomy: "3" });
++        setForm({ objective: "", outcome: "", verification: "", project: form.project, repo: "", paths: "", autonomy: "3", allowCommit: false });
+         return load();
+       }).catch(function (err) { setError(parseApiErrorMessage(err)); })
+         .finally(function () { setBusy(false); });
+@@ -588,7 +590,8 @@
+       if (m.status === "ready" && m.autonomy_level >= 3) add("start", "Start");
+       if (m.status === "running") { add("pause", "Pause"); add("verify", "Verify"); }
+       if (m.status === "waiting_for_user") add("resume", "Resume");
+-      if (m.status === "awaiting_approval") add("approve", "Approve commit gate");
++      if (m.status === "awaiting_approval") { add("approve", "Approve commit gate"); add("deny", "Deny commit"); }
++      if (m.status === "blocked") add("retry", "Retry safely");
+       if (m.status === "committing") add("commit", "Commit locally");
+       if (["succeeded", "failed", "cancelled", "blocked"].includes(m.status) && m.worktree_path) add("rollback", "Rollback");
+       if (!["succeeded", "failed", "cancelled", "rolled_back"].includes(m.status)) add("cancel", "Cancel");
+@@ -606,9 +609,13 @@
+           h("strong", null, "Create mission"),
+           field("objective", "Objective"), field("outcome", "Required outcome"),
+           field("verification", "Verification commands, one per line", true),
++          field("project", "Registered project id or slug"),
+           field("repo", "Absolute Git repository path"), field("paths", "Allowed repo paths, comma separated"),
+           h("select", { className: "hermes-kanban-mission-input", value: form.autonomy, onChange: function (e) { setForm(Object.assign({}, form, { autonomy: e.target.value })); } },
+             [0,1,2,3,4].map(function (v) { return h("option", { key: v, value: String(v) }, "Autonomy L" + v); })),
++          form.autonomy === "4" ? h("label", { className: "text-xs" },
++            h("input", { type: "checkbox", checked: Boolean(form.allowCommit), onChange: function (e) { setForm(Object.assign({}, form, { allowCommit: e.target.checked })); } }),
++            " Permit a verified local commit") : null,
+           h(Button, { disabled: busy, onClick: create }, busy ? "Working…" : "Create draft"),
+         ),
+         h("div", { className: "hermes-kanban-mission-list" },
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 57c34fc17..dc4602704 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -66,7 +66,8 @@ class MissionCreate(BaseModel):
+     autonomy_level: int = Field(ge=0, le=4)
+     repo_path: str
+     risk_level: Literal["low", "medium", "high"] = "medium"
+-    project_id: Optional[str] = None
++    project_id: str
++    allow_local_commit: bool = False
+     budget: dict[str, Any] = Field(default_factory=dict)
+ 
+ 
+@@ -110,6 +111,7 @@ def get_mission(mission_id: str, board: Optional[str] = Query(default=None)):
+ 
+ @router.post("/missions", status_code=201)
+ def create_mission(payload: MissionCreate, board: Optional[str] = Query(default=None)):
++    from hermes_cli import mission_service as svc
+     from hermes_cli import missions_db as mdb
+ 
+     resolved = _resolve_board(board)
+@@ -120,17 +122,18 @@ def create_mission(payload: MissionCreate, board: Optional[str] = Query(default=
+         constraints=payload.constraints,
+         boundaries=payload.boundaries,
+         stop_when=payload.stop_when,
++        allow_local_commit=payload.allow_local_commit,
+     )
+     try:
+         with kanban_db.connect_closing(board=resolved) as conn:
+-            mid = mdb.create_mission(
++            mission = svc.create_mission(
+                 conn, objective=payload.objective, contract=contract,
+                 autonomy_level=payload.autonomy_level, repo_path=payload.repo_path,
+                 board=board_slug, risk_level=payload.risk_level,
+                 project_id=payload.project_id, budget=payload.budget,
+             )
+-        return {"mission_id": mid}
+-    except ValueError as exc:
++        return {"mission_id": mission.id}
++    except (ValueError, svc.MissionError) as exc:
+         raise HTTPException(status_code=400, detail=str(exc))
+ 
+ 
+@@ -167,6 +170,10 @@ def mission_action(
+                 mission = svc.verify_with_model(conn, mission_id)
+             elif payload.action == "approve":
+                 mission = svc.approve_commit(conn, mission_id)
++            elif payload.action == "deny":
++                mission = svc.deny_mission(conn, mission_id)
++            elif payload.action == "retry":
++                mission = svc.retry_mission(conn, mission_id)
+             elif payload.action == "commit":
+                 mission = svc.commit_mission(conn, mission_id)
+             elif payload.action == "cancel":
+@@ -977,6 +984,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+         task = kanban_db.get_task(conn, task_id)
+         if task is None:
+             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
++        try:
++            kanban_db.assert_task_mutation_allowed(
++                conn, task_id, operation="edit",
++            )
++        except PermissionError as exc:
++            raise HTTPException(status_code=409, detail=str(exc)) from exc
+ 
+         # --- assignee ----------------------------------------------------
+         if payload.assignee is not None:
+@@ -1113,7 +1126,10 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
+     board = _resolve_board(board)
+     conn = _conn(board=board)
+     try:
+-        ok = kanban_db.delete_task(conn, task_id)
++        try:
++            ok = kanban_db.delete_task(conn, task_id)
++        except PermissionError as exc:
++            raise HTTPException(status_code=409, detail=str(exc)) from exc
+         if not ok:
+             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+         return {"deleted": True, "task_id": task_id}
+@@ -1288,6 +1304,8 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
+     try:
+         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+         return {"ok": True}
++    except PermissionError as e:
++        raise HTTPException(status_code=409, detail=str(e))
+     except ValueError as e:
+         raise HTTPException(status_code=400, detail=str(e))
+     finally:
+@@ -1303,7 +1321,10 @@ def delete_link(
+     board = _resolve_board(board)
+     conn = _conn(board=board)
+     try:
+-        ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
++        try:
++            ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
++        except PermissionError as exc:
++            raise HTTPException(status_code=409, detail=str(exc)) from exc
+         return {"ok": bool(ok)}
+     finally:
+         conn.close()
+@@ -1351,6 +1372,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
+                     entry.update(ok=False, error="not found")
+                     results.append(entry)
+                     continue
++                kanban_db.assert_task_mutation_allowed(
++                    conn, tid, operation="bulk edit",
++                )
+                 if payload.archive:
+                     if not kanban_db.archive_task(conn, tid):
+                         entry.update(ok=False, error="archive refused")
+@@ -1849,12 +1873,15 @@ def reassign_task_endpoint(
+     board = _resolve_board(board)
+     conn = _conn(board=board)
+     try:
+-        ok = kanban_db.reassign_task(
+-            conn, task_id,
+-            payload.profile or None,
+-            reclaim_first=bool(payload.reclaim_first),
+-            reason=payload.reason,
+-        )
++        try:
++            ok = kanban_db.reassign_task(
++                conn, task_id,
++                payload.profile or None,
++                reclaim_first=bool(payload.reclaim_first),
++                reason=payload.reason,
++            )
++        except PermissionError as exc:
++            raise HTTPException(status_code=409, detail=str(exc)) from exc
+         if not ok:
+             raise HTTPException(
+                 status_code=409,
+diff --git a/plugins/memory/__init__.py b/plugins/memory/__init__.py
+index 53eeb998a..1d9d1431e 100644
+--- a/plugins/memory/__init__.py
++++ b/plugins/memory/__init__.py
+@@ -29,6 +29,7 @@ import sys
+ from pathlib import Path
+ from typing import List, Optional, Tuple
+ from hermes_cli.config import cfg_get
++from utils import host_extension_execution_disabled
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -160,6 +161,9 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
+     Returns list of (name, description, is_available) tuples.
+     Bundled providers take precedence on name collisions.
+     """
++    if host_extension_execution_disabled():
++        return []
++
+     results = []
+ 
+     for name, child in _iter_provider_dirs():
+@@ -200,6 +204,10 @@ def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
+ 
+     Returns None if the provider is not found or fails to load.
+     """
++    if host_extension_execution_disabled():
++        logger.info("Host-side extension execution disabled — memory plugin skipped")
++        return None
++
+     provider_dir = find_provider_dir(name)
+     if not provider_dir:
+         logger.debug("Memory provider '%s' not found in bundled or user plugins", name)
+@@ -223,6 +231,9 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
+     - A register(ctx) function (plugin-style) — we simulate a ctx
+     - A top-level class that extends MemoryProvider — we instantiate it
+     """
++    if host_extension_execution_disabled():
++        return None
++
+     name = provider_dir.name
+     # Use a separate namespace for user-installed plugins so they don't
+     # collide with bundled providers in sys.modules.
+@@ -379,6 +390,9 @@ def discover_plugin_cli_commands() -> List[dict]:
+     full plugin module.  Safe to call during argparse setup before
+     any provider is loaded.
+     """
++    if host_extension_execution_disabled():
++        return []
++
+     results: List[dict] = []
+     if not _MEMORY_PLUGINS_DIR.is_dir():
+         return results
+diff --git a/providers/__init__.py b/providers/__init__.py
+index a394e74b3..f6f4cde37 100644
+--- a/providers/__init__.py
++++ b/providers/__init__.py
+@@ -37,6 +37,7 @@ import sys
+ from pathlib import Path
+ 
+ from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
++from utils import host_extension_execution_disabled
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -160,6 +161,17 @@ def _discover_providers() -> None:
+                 continue
+             _import_plugin_dir(child, "bundled")
+ 
++    # Bundled profiles are trusted runtime adapters and preserve the assigned
++    # provider/model's wire behavior. User provider plugins and legacy module
++    # drop-ins are arbitrary host Python, so mission/safe-mode processes stop
++    # here before consulting either source.
++    if host_extension_execution_disabled():
++        logger.info(
++            "Host-side extension execution disabled — user and legacy "
++            "provider plugins skipped"
++        )
++        return
++
+     # 2. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
+     #    These can override any bundled profile of the same name (last-writer-wins
+     #    in register_provider()).
+diff --git a/scripts/evaluate_project_autopilot.py b/scripts/evaluate_project_autopilot.py
+new file mode 100755
+index 000000000..feb8a5925
+--- /dev/null
++++ b/scripts/evaluate_project_autopilot.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""Run the Project Autopilot v1 safety release gate.
++
++Each scenario is a focused, deterministic acceptance test. The report is JSON
++so a human, Continuous Integration system, or Hermes itself can decide whether
++v1 is safe to release. Any failed safety scenario counts as a safety escape and
++keeps ``release_ready`` false.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++SCENARIOS = (
++    ("mission_success", "tests/hermes_cli/test_missions.py::test_controller_tick_auto_verifies_and_commits_level_four", False, 0),
++    ("false_success_prevention", "tests/hermes_cli/test_missions.py::test_fail_closed_verifier_and_local_commit_gate", True, 0),
++    ("scope_escape_prevention", "tests/hermes_cli/test_missions.py::test_scope_violation_blocks_verification", True, 0),
++    ("source_checkout_preservation", "tests/hermes_cli/test_missions.py::test_prepare_isolates_worktree_and_preserves_source_checkout", True, 0),
++    ("registered_clean_project_gate", "tests/hermes_cli/test_missions.py::test_public_creation_requires_registered_clean_project", True, 0),
++    ("explicit_commit_authority", "tests/hermes_cli/test_missions.py::test_level_four_requires_explicit_local_commit_authority", True, 0),
++    ("operator_deny_and_retry", "tests/hermes_cli/test_missions.py::test_operator_deny_and_safe_retry", False, 1),
++    ("restart_recovery", "tests/hermes_cli/test_missions.py::test_predispatch_recovery_blocks_orphaned_intent_before_respawn", True, 0),
++    ("rollback_success", "tests/hermes_cli/test_missions.py::test_pause_cancel_and_verified_rollback", True, 0),
++    ("git_identity_tamper_prevention", "tests/hermes_cli/test_mission_git_integrity.py::test_gitdir_identity_tamper_blocks_control_mutation[commit]", True, 0),
++    ("rollback_ref_tamper_prevention", "tests/hermes_cli/test_mission_git_integrity.py::test_moved_rollback_ref_is_rejected_before_reset", True, 0),
++    ("graph_mutation_prevention", "tests/hermes_cli/test_mission_graph_integrity.py::test_generic_kanban_structural_mutators_reject_mission_cards", True, 0),
++    ("sandbox_escape_prevention", "tests/tools/test_mission_docker_scope.py::test_mission_config_scrubs_profile_docker_escape_vectors", True, 0),
++    ("network_scope_prevention", "tests/hermes_cli/test_missions.py::test_execution_rejects_unenforceable_network_scope", True, 0),
++)
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", type=Path, help="Write the JSON report to this path")
++    parser.add_argument("--pytest", default=sys.executable, help="Python executable containing pytest")
++    args = parser.parse_args()
++
++    root = Path(__file__).resolve().parents[1]
++    results: list[dict[str, object]] = []
++    started = time.monotonic()
++    for name, nodeid, safety_critical, human_interventions in SCENARIOS:
++        scenario_started = time.monotonic()
++        proc = subprocess.run(
++            [args.pytest, "-m", "pytest", "-q", nodeid],
++            cwd=root,
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            check=False,
++        )
++        results.append(
++            {
++                "name": name,
++                "nodeid": nodeid,
++                "passed": proc.returncode == 0,
++                "safety_critical": safety_critical,
++                "human_interventions": human_interventions,
++                "completion_time_seconds": round(time.monotonic() - scenario_started, 3),
++                "exit_code": proc.returncode,
++                "output_tail": "\n".join(proc.stdout.splitlines()[-12:]),
++            }
++        )
++
++    failed = [item for item in results if not item["passed"]]
++    safety_escapes = [item for item in failed if item["safety_critical"]]
++    report = {
++        "suite": "Hermes Project Autopilot v1",
++        "schema_version": 1,
++        "scenario_count": len(results),
++        "passed": len(results) - len(failed),
++        "failed": len(failed),
++        "safety_escapes": len(safety_escapes),
++        "recovery_success": next(item["passed"] for item in results if item["name"] == "restart_recovery"),
++        "rollback_success": next(item["passed"] for item in results if item["name"] == "rollback_success"),
++        "human_interventions": sum(int(item["human_interventions"]) for item in results),
++        "completion_time_seconds": round(time.monotonic() - started, 3),
++        "release_threshold": "all scenarios pass and safety_escapes equals zero",
++        "release_ready": not failed and not safety_escapes,
++        "scenarios": results,
++    }
++    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
++    if args.output:
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(rendered, encoding="utf-8")
++    print(rendered, end="")
++    return 0 if report["release_ready"] else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_commands.py b/tests/hermes_cli/test_commands.py
+index b9ea9a9fd..f17278c26 100644
+--- a/tests/hermes_cli/test_commands.py
++++ b/tests/hermes_cli/test_commands.py
+@@ -242,6 +242,12 @@ class TestSlackNativeSlashes:
+             f"commands on Telegram but missing from Slack native slashes: {sorted(missing)}"
+         )
+ 
++    def test_mission_owns_native_slot_over_platform_recovery(self):
++        names = {name for name, _desc, _hint in slack_native_slashes()}
++        assert "mission" in names
++        assert "platform" not in names
++        assert "platform" in _SLACK_VIA_HERMES_ONLY
++
+ 
+ class TestSlackAppManifest:
+     """Generated Slack app manifest (used by `hermes slack manifest`)."""
+diff --git a/tests/hermes_cli/test_doctor.py b/tests/hermes_cli/test_doctor.py
+index aae133a0e..da2848392 100644
+--- a/tests/hermes_cli/test_doctor.py
++++ b/tests/hermes_cli/test_doctor.py
+@@ -193,6 +193,7 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+     monkeypatch.setenv("VERCEL_TOKEN", "super-secret-value")
+     monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
+     monkeypatch.setenv("VERCEL_TEAM_ID", "team")
++    monkeypatch.setattr("hermes_constants.is_container", lambda: True)
+     monkeypatch.setattr(doctor_mod.importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)
+ 
+     fake_model_tools = types.SimpleNamespace(
+diff --git a/tests/hermes_cli/test_mission_git_integrity.py b/tests/hermes_cli/test_mission_git_integrity.py
+index b705b49ff..7b556dc8f 100644
+--- a/tests/hermes_cli/test_mission_git_integrity.py
++++ b/tests/hermes_cli/test_mission_git_integrity.py
+@@ -54,6 +54,7 @@ def _contract(repo: Path) -> mdb.MissionContract:
+             "network_destinations": [],
+         },
+         stop_when=["scope cannot be enforced"],
++        allow_local_commit=True,
+     )
+ 
+ 
+diff --git a/tests/hermes_cli/test_mission_graph_integrity.py b/tests/hermes_cli/test_mission_graph_integrity.py
+new file mode 100644
+index 000000000..861772745
+--- /dev/null
++++ b/tests/hermes_cli/test_mission_graph_integrity.py
+@@ -0,0 +1,198 @@
++from __future__ import annotations
++
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import mission_service as service
++from hermes_cli import missions_db as mdb
++
++
++def _git(repo: Path, *args: str) -> str:
++    proc = subprocess.run(
++        ["git", "-C", str(repo), *args],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++    )
++    return proc.stdout.strip()
++
++
++@pytest.fixture
++def planned_mission(tmp_path, monkeypatch):
++    hermes_home = tmp_path / "hermes"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_home / "kanban"))
++    repo = tmp_path / "project"
++    repo.mkdir()
++    _git(repo, "init")
++    _git(repo, "config", "user.email", "mission@example.test")
++    _git(repo, "config", "user.name", "Mission Test")
++    (repo / "app.py").write_text("VALUE = 1\n")
++    _git(repo, "add", "app.py")
++    _git(repo, "commit", "-m", "base")
++    contract = mdb.MissionContract(
++        outcome="Update app.py safely",
++        verification=["verify-ok"],
++        constraints=["Do not modify unrelated files"],
++        boundaries={
++            "allowed_roots": [str(repo)],
++            "allowed_paths": ["app.py"],
++            "network_destinations": [],
++        },
++        stop_when=["scope cannot be enforced"],
++    )
++    with kb.connect_closing(board="default") as conn:
++        mission_id = mdb.create_mission(
++            conn,
++            objective="Change app.py",
++            contract=contract,
++            autonomy_level=4,
++            repo_path=str(repo),
++            board="default",
++        )
++        mission = service.prepare_mission(conn, mission_id)
++        executor = service.add_execution_task(
++            conn,
++            mission_id,
++            title="Edit app.py",
++            body="Set VALUE and produce verification evidence",
++            assignee="default",
++        )
++        service.finish_plan(conn, mission_id, verifier_assignee="default")
++        yield conn, mission_id, mission, executor
++
++
++def _tamper(conn, executor: str, kind: str) -> None:
++    if kind == "edit":
++        conn.execute("UPDATE tasks SET body='tampered' WHERE id=?", (executor,))
++    elif kind == "delete":
++        conn.execute("DELETE FROM tasks WHERE id=?", (executor,))
++    elif kind == "reassign":
++        conn.execute("UPDATE tasks SET assignee='attacker' WHERE id=?", (executor,))
++    elif kind == "relink":
++        conn.execute("DELETE FROM task_links WHERE child_id=?", (executor,))
++    else:  # pragma: no cover - test helper guard
++        raise AssertionError(kind)
++    conn.commit()
++
++
++def test_generic_kanban_structural_mutators_reject_mission_cards(planned_mission):
++    conn, mission_id, _mission, executor = planned_mission
++    root = mdb.get_mission(conn, mission_id).root_task_id
++    ordinary = kb.create_task(conn, title="ordinary")
++
++    with pytest.raises(PermissionError, match="mission-linked"):
++        kb.assign_task(conn, executor, "other")
++    with pytest.raises(PermissionError, match="mission-linked"):
++        kb.reassign_task(conn, executor, "other")
++    with pytest.raises(PermissionError, match="mission-linked"):
++        kb.unlink_tasks(conn, root, executor)
++    with pytest.raises(PermissionError, match="mission-linked"):
++        kb.link_tasks(conn, executor, ordinary)
++    with pytest.raises(PermissionError, match="mission-linked"):
++        kb.archive_task(conn, executor)
++    with pytest.raises(PermissionError, match="mission-linked"):
++        kb.delete_task(conn, executor)
++
++
++@pytest.mark.parametrize("kind", ["edit", "delete", "reassign", "relink"])
++def test_start_revalidates_accepted_cards_and_edges(planned_mission, kind):
++    conn, mission_id, _mission, executor = planned_mission
++    _tamper(conn, executor, kind)
++
++    with pytest.raises(service.MissionError, match="mission task"):
++        service.start_mission(conn, mission_id)
++
++
++@pytest.mark.parametrize("kind", ["edit", "delete", "reassign", "relink"])
++def test_verification_revalidates_started_cards_and_edges(planned_mission, kind):
++    conn, mission_id, mission, executor = planned_mission
++    service.start_mission(conn, mission_id)
++    worktree = Path(mission.worktree_path)
++    (worktree / "app.py").write_text("VALUE = 2\n")
++    service.record_command_result(
++        conn,
++        mission_id,
++        command="verify-ok",
++        cwd=str(worktree),
++        exit_code=0,
++        stdout="passed",
++    )
++    assert kb.complete_task(conn, executor, result="done", summary="done")
++    _tamper(conn, executor, kind)
++
++    with pytest.raises(service.MissionError, match="mission task"):
++        service.submit_verifier_verdict(
++            conn,
++            mission_id,
++            {
++                "verdict": "pass",
++                "requirements_checked": 1,
++                "requirements_failed": [],
++                "evidence_missing": [],
++                "recommended_action": "commit",
++            },
++        )
++
++
++def test_claim_revalidates_manifest_workspace(planned_mission):
++    conn, mission_id, _mission, executor = planned_mission
++    service.start_mission(conn, mission_id)
++    conn.execute(
++        "UPDATE tasks SET workspace_path='/tmp/substituted' WHERE id=?",
++        (executor,),
++    )
++    conn.commit()
++
++    with pytest.raises(service.MissionError, match="mission task"):
++        kb.claim_task(conn, executor)
++
++
++def test_spawn_validates_workspace_before_checkpoint(planned_mission, monkeypatch):
++    conn, mission_id, _mission, executor = planned_mission
++    service.start_mission(conn, mission_id)
++    claimed = kb.claim_task(conn, executor)
++    assert claimed is not None
++    conn.execute(
++        "UPDATE tasks SET workspace_path='/tmp/substituted' WHERE id=?",
++        (executor,),
++    )
++    conn.commit()
++
++    from tools.checkpoint_manager import CheckpointManager
++
++    monkeypatch.setattr(
++        CheckpointManager,
++        "ensure_checkpoint",
++        lambda *args, **kwargs: (_ for _ in ()).throw(
++            AssertionError("checkpoint ran before graph validation")
++        ),
++    )
++    with pytest.raises(service.MissionError, match="mission task"):
++        service.begin_task_intent(claimed, board="default")
++
++
++def test_pre_manifest_mission_is_durably_blocked_with_recovery_guidance(
++    planned_mission,
++):
++    conn, mission_id, _mission, _executor = planned_mission
++    with kb.write_txn(conn):
++        conn.execute(
++            "DELETE FROM mission_task_manifest_cards WHERE mission_id=?",
++            (mission_id,),
++        )
++        conn.execute(
++            "DELETE FROM mission_task_manifests WHERE mission_id=?",
++            (mission_id,),
++        )
++
++    with pytest.raises(service.MissionError, match="recreate the mission"):
++        service.start_mission(conn, mission_id)
++    blocked = mdb.get_mission(conn, mission_id)
++    assert blocked.status == "blocked"
++    assert blocked.phase == "migration"
++    assert "cannot be authenticated safely" in blocked.blocked_reason
+diff --git a/tests/hermes_cli/test_mission_host_extensions.py b/tests/hermes_cli/test_mission_host_extensions.py
+new file mode 100644
+index 000000000..a83c068c8
+--- /dev/null
++++ b/tests/hermes_cli/test_mission_host_extensions.py
+@@ -0,0 +1,161 @@
++from __future__ import annotations
++
++import contextlib
++import subprocess
++from pathlib import Path
++from types import SimpleNamespace
++
++
++def _task(kb, task_id: str, *, mission: bool):
++    return kb.Task(
++        id=task_id,
++        title="host extension isolation",
++        body=None,
++        assignee="default",
++        status="running",
++        priority=0,
++        created_by="test",
++        created_at=1,
++        started_at=None,
++        completed_at=None,
++        workspace_kind="dir",
++        workspace_path=None,
++        claim_lock="claim",
++        claim_expires=None,
++        tenant=None,
++        current_run_id=1,
++        mission_id="m_isolated" if mission else None,
++        mission_role="verifier" if mission else None,
++    )
++
++
++def test_mission_spawn_disables_host_extensions_but_ordinary_worker_keeps_hooks(
++    monkeypatch, tmp_path: Path,
++):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import missions_db as mdb
++
++    root = tmp_path / ".hermes"
++    workspace = tmp_path / "workspace"
++    workspace.mkdir()
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
++    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
++
++    mission = SimpleNamespace(
++        id="m_isolated",
++        board="default",
++        autonomy_level=4,
++        worktree_path=str(workspace),
++        contract=SimpleNamespace(
++            boundaries={
++                "allowed_paths": ["."],
++                "network_destinations": [],
++                "allowed_terminal_backends": ["docker"],
++            }
++        ),
++    )
++    monkeypatch.setattr(kb, "connect_closing", lambda board=None: contextlib.nullcontext(object()))
++    monkeypatch.setattr(mdb, "get_mission", lambda _conn, _mid: mission)
++    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
++    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
++    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: root / "kanban.db")
++    monkeypatch.setattr(kb, "workspaces_root", lambda board=None: root / "workspaces")
++    monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: root / "logs")
++
++    spawned: list[tuple[list[str], dict[str, str]]] = []
++
++    class Proc:
++        pid = 1234
++
++    def fake_popen(cmd, *args, **kwargs):
++        spawned.append((list(cmd), dict(kwargs["env"])))
++        return Proc()
++
++    monkeypatch.setattr(subprocess, "Popen", fake_popen)
++
++    kb._default_spawn(_task(kb, "t_mission", mission=True), str(workspace), board="default")
++    kb._default_spawn(_task(kb, "t_ordinary", mission=False), str(workspace), board="default")
++
++    mission_cmd, mission_env = spawned[0]
++    ordinary_cmd, ordinary_env = spawned[1]
++    assert mission_env["HERMES_SAFE_MODE"] == "1"
++    assert "HERMES_ACCEPT_HOOKS" not in mission_env
++    assert "--accept-hooks" not in mission_cmd
++    # Do not pass CLI --safe-mode: mission workers still need their assigned
++    # profile's model/provider settings; the internal env switch isolates only
++    # host-side extensions and MCP startup.
++    assert "--safe-mode" not in mission_cmd
++
++    assert "HERMES_SAFE_MODE" not in ordinary_env
++    assert ordinary_env["HERMES_ACCEPT_HOOKS"] == "1"
++    assert "--accept-hooks" in ordinary_cmd
++
++
++def test_mission_policy_blocks_late_hook_and_python_plugin_execution(monkeypatch, tmp_path):
++    from agent import shell_hooks
++    from hermes_cli.plugins import PluginManager
++    import plugins.context_engine as context_plugins
++    import plugins.memory as memory_plugins
++    import providers
++
++    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
++    monkeypatch.setenv("HERMES_MISSION_POLICY", "{}")
++
++    plugin_calls: list[str] = []
++    manager = PluginManager()
++    manager._hooks["pre_tool_call"] = [lambda **_kwargs: plugin_calls.append("hook")]
++    manager._middleware["tool"] = [lambda **_kwargs: plugin_calls.append("middleware")]
++    monkeypatch.setattr(manager, "_discover_and_load_inner", lambda: plugin_calls.append("load"))
++
++    manager.discover_and_load()
++    assert manager.invoke_hook("pre_tool_call") == []
++    assert manager.invoke_middleware("tool") == []
++    assert manager.has_hook("pre_tool_call") is False
++    assert manager.has_middleware("tool") is False
++    assert plugin_calls == []
++
++    shell_calls: list[str] = []
++    monkeypatch.setattr(
++        shell_hooks.subprocess,
++        "run",
++        lambda *_args, **_kwargs: shell_calls.append("spawn"),
++    )
++    spec = shell_hooks.ShellHookSpec(event="pre_tool_call", command="user-hook")
++    assert shell_hooks.register_from_config(
++        {"hooks": {"pre_tool_call": [{"command": "user-hook"}]}},
++        accept_hooks=True,
++    ) == []
++    result = shell_hooks.run_once(spec, {"tool_name": "terminal", "args": {}})
++    assert result["error"] == "host-side extension execution is disabled"
++    assert shell_calls == []
++
++    def unexpected(*_args, **_kwargs):
++        raise AssertionError("plugin loader reached under mission policy")
++
++    bundled_root = tmp_path / "bundled-providers"
++    bundled_profile = bundled_root / "trusted"
++    bundled_profile.mkdir(parents=True)
++    provider_imports: list[tuple[Path, str]] = []
++    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled_root)
++    monkeypatch.setattr(
++        providers,
++        "_import_plugin_dir",
++        lambda path, source: provider_imports.append((path, source)),
++    )
++    monkeypatch.setattr(providers, "_user_plugins_dir", unexpected)
++    monkeypatch.setattr(providers.importlib, "import_module", unexpected)
++    monkeypatch.setattr(providers, "_discovered", False)
++    providers._discover_providers()
++    assert providers._discovered is True
++    assert provider_imports == [(bundled_profile, "bundled")]
++
++    monkeypatch.setattr(memory_plugins, "find_provider_dir", unexpected)
++    assert memory_plugins.discover_memory_providers() == []
++    assert memory_plugins.discover_plugin_cli_commands() == []
++    assert memory_plugins.load_memory_provider("user-plugin") is None
++
++    monkeypatch.setattr(context_plugins, "_load_engine_from_dir", unexpected)
++    assert context_plugins.discover_context_engines() == []
++    assert context_plugins.load_context_engine("user-plugin") is None
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index 9f23931d6..4b03f7a76 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -39,7 +39,7 @@ def mission_env(tmp_path, monkeypatch):
+         yield conn, repo
+ 
+ 
+-def _contract(repo: Path, *, allowed_paths=None):
++def _contract(repo: Path, *, allowed_paths=None, allow_local_commit=True):
+     return mdb.MissionContract(
+         outcome="Update the value safely",
+         verification=["verify-ok"],
+@@ -50,6 +50,7 @@ def _contract(repo: Path, *, allowed_paths=None):
+             "network_destinations": [],
+         },
+         stop_when=["scope cannot be enforced"],
++        allow_local_commit=allow_local_commit,
+     )
+ 
+ 
+@@ -57,7 +58,7 @@ def _created(conn, repo: Path, *, autonomy=4, budget=None) -> str:
+     return mdb.create_mission(
+         conn,
+         objective="Change app.py",
+-        contract=_contract(repo),
++        contract=_contract(repo, allow_local_commit=(autonomy == 4)),
+         autonomy_level=autonomy,
+         repo_path=str(repo),
+         board="default",
+@@ -293,7 +294,9 @@ def test_predispatch_recovery_leaves_live_intent_running(mission_env):
+     assert mdb.get_mission(conn, mid).status == "running"
+ 
+ 
+-def test_predispatch_recovery_rejects_intent_owned_by_another_run(mission_env):
++def test_predispatch_recovery_rejects_intent_owned_by_another_run(
++    mission_env, monkeypatch,
++):
+     conn, repo = mission_env
+     mid = _created(conn, repo)
+     service.prepare_mission(conn, mid)
+@@ -313,6 +316,11 @@ def test_predispatch_recovery_rejects_intent_owned_by_another_run(mission_env):
+         conn, mid, task_id=executor, action="old-run",
+         run_id=int(claimed.current_run_id) + 1, claim_token=claimed.claim_lock,
+     )
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda *_args: {})
++    monkeypatch.setattr(kb, "_worker_survived_termination", lambda _result: False)
++    monkeypatch.setattr(
++        service, "_remove_mission_containers", lambda *_args, **_kwargs: None,
++    )
+     result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: None)
+     assert result.missions_reconciled == [mid]
+     assert mdb.get_mission(conn, mid).status == "blocked"
+@@ -854,7 +862,8 @@ def test_cancel_quiesces_claim_and_resolves_exact_intent(mission_env, monkeypatc
+     )
+     removed = []
+     monkeypatch.setattr(
+-        service, "_remove_mission_containers", lambda task_ids: removed.extend(task_ids),
++        service, "_remove_mission_containers",
++        lambda _conn, _mission_id, task_ids: removed.extend(task_ids),
+     )
+     cancelled = service.cancel_mission(conn, mid)
+     assert cancelled.status == "cancelled"
+@@ -869,6 +878,340 @@ def test_cancel_quiesces_claim_and_resolves_exact_intent(mission_env, monkeypatc
+     assert intent["resolved_at"] is not None
+ 
+ 
++@pytest.mark.parametrize(
++    "binding", ["current", "legacy", "legacy_wrong_mount", "mismatched"],
++)
++def test_container_cleanup_requires_exact_board_mission_task_and_run_binding(
++    mission_env, monkeypatch, binding,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo)
++    service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Edit", body="Edit", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    claimed = kb.claim_task(conn, executor)
++    assert claimed is not None
++
++    from tools.environments import docker as docker_env
++
++    container_id = "a" * 64
++    removed = False
++    calls = []
++    db_label = docker_env._mission_db_fingerprint(str(service._connection_db_path(conn)))
++    labels = {
++        "hermes-agent": "1",
++        "hermes-task-id": executor,
++        "hermes-mission-id": "m_wrong" if binding == "mismatched" else mid,
++        "hermes-board": "default",
++        "hermes-board-db": db_label,
++        "hermes-run-id": str(claimed.current_run_id),
++    }
++    if binding.startswith("legacy"):
++        for key in (
++            "hermes-mission-id", "hermes-board", "hermes-board-db",
++            "hermes-run-id",
++        ):
++            labels.pop(key)
++    mounts = [{
++        "Type": "bind",
++        "Source": (
++            str(repo) if binding == "legacy_wrong_mount"
++            else mdb.get_mission(conn, mid).worktree_path
++        ),
++        "Destination": "/workspace",
++    }]
++
++    def fake_run(cmd, **kwargs):
++        nonlocal removed
++        calls.append(list(cmd))
++        if cmd[1:3] == ["ps", "-aq"]:
++            return subprocess.CompletedProcess(
++                cmd, 0, stdout=("" if removed else container_id + "\n"), stderr="",
++            )
++        if cmd[1] == "inspect":
++            payload = mounts if ".Mounts" in cmd[3] else labels
++            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
++        if cmd[1:3] == ["rm", "-f"]:
++            removed = True
++            return subprocess.CompletedProcess(cmd, 0, stdout=container_id + "\n", stderr="")
++        raise AssertionError(cmd)
++
++    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
++    monkeypatch.setattr(service.subprocess, "run", fake_run)
++
++    if binding in {"mismatched", "legacy_wrong_mount"}:
++        with pytest.raises(service.MissionError, match="mismatched mission binding"):
++            service._remove_mission_containers(conn, mid, [executor])
++        assert not removed
++    else:
++        service._remove_mission_containers(conn, mid, [executor])
++        assert removed
++        probe = next(cmd for cmd in calls if cmd[1:3] == ["ps", "-aq"])
++        assert "label=hermes-agent=1" in probe
++        assert f"label=hermes-task-id={executor}" in probe
++        assert not any("hermes-mission-id" in part for part in probe)
++
++
++def test_pause_quiesces_active_executor_and_resume_only_requeues_pause_marker(
++    mission_env, monkeypatch,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo)
++    prepared = service.prepare_mission(conn, mid)
++    active = service.add_execution_task(
++        conn, mid, title="Active edit", body="Edit", assignee="default",
++    )
++    genuinely_blocked = service.add_execution_task(
++        conn,
++        mid,
++        title="Needs a decision",
++        body="Wait",
++        assignee="default",
++        parents=[prepared.root_task_id],
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    claimed = kb.claim_task(conn, active)
++    assert claimed is not None
++    intent_id = mdb.begin_intent(
++        conn,
++        mid,
++        task_id=active,
++        action="execute_task",
++        run_id=claimed.current_run_id,
++        claim_token=claimed.claim_lock,
++    )
++    assert kb.block_task(
++        conn,
++        genuinely_blocked,
++        reason="real human decision required",
++        kind="needs_input",
++    )
++
++    removed = []
++    monkeypatch.setattr(
++        service, "_remove_mission_containers",
++        lambda _conn, _mission_id, task_ids: removed.extend(task_ids),
++    )
++    monkeypatch.setattr(
++        kb,
++        "_terminate_reclaimed_worker",
++        lambda _pid, _claim: {"survived": False},
++    )
++    monkeypatch.setattr(kb, "_worker_survived_termination", lambda _result: False)
++
++    paused = service.pause_mission(conn, mid)
++    assert paused.status == "waiting_for_user"
++    assert set(removed) == {active, genuinely_blocked}
++    assert kb.get_task(conn, active).status == "blocked"
++    assert kb.get_task(conn, active).claim_lock is None
++    assert kb.get_task(conn, genuinely_blocked).status == "blocked"
++    intent = conn.execute(
++        "SELECT status,resolved_at FROM mission_intents WHERE id=?", (intent_id,),
++    ).fetchone()
++    assert intent["status"] == "paused"
++    assert intent["resolved_at"] is not None
++    assert conn.execute(
++        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='mission_paused'",
++        (active,),
++    ).fetchone()[0] == 1
++
++    resumed = service.resume_mission(conn, mid)
++    assert resumed.status == "running"
++    assert kb.get_task(conn, active).status == "ready"
++    assert kb.get_task(conn, genuinely_blocked).status == "blocked"
++    assert conn.execute(
++        "SELECT status FROM mission_intents WHERE id=?", (intent_id,),
++    ).fetchone()[0] == "resumed"
++    assert conn.execute(
++        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='mission_resumed'",
++        (active,),
++    ).fetchone()[0] == 1
++
++
++def test_pause_revokes_mission_state_before_quiescence_and_resume_recovers(
++    mission_env, monkeypatch,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo)
++    service.prepare_mission(conn, mid)
++    service.add_execution_task(
++        conn, mid, title="Edit", body="Edit", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++
++    real_quiesce = service._quiesce_mission_executors
++    monkeypatch.setattr(
++        service,
++        "_quiesce_mission_executors",
++        lambda *_args, **_kwargs: (_ for _ in ()).throw(
++            service.MissionError("simulated controller interruption")
++        ),
++    )
++    with pytest.raises(service.MissionError, match="simulated controller interruption"):
++        service.pause_mission(conn, mid)
++    interrupted = mdb.get_mission(conn, mid)
++    assert interrupted.status == "waiting_for_user"
++    assert interrupted.phase == "pausing"
++
++    monkeypatch.setattr(service, "_quiesce_mission_executors", real_quiesce)
++    resumed = service.resume_mission(conn, mid)
++    assert resumed.status == "running"
++    assert resumed.phase == "execution"
++
++
++def test_restart_reconciliation_finishes_durable_pausing_state(
++    mission_env, monkeypatch,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo)
++    service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Edit", body="Edit", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    claimed = kb.claim_task(conn, executor)
++    assert claimed is not None
++    intent_id = mdb.begin_intent(
++        conn,
++        mid,
++        task_id=executor,
++        action="execute_task",
++        run_id=claimed.current_run_id,
++        claim_token=claimed.claim_lock,
++    )
++    mdb.transition_mission(
++        conn,
++        mid,
++        "waiting_for_user",
++        phase="pausing",
++        blocked_reason="pause in progress",
++    )
++    removed = []
++    monkeypatch.setattr(
++        service, "_remove_mission_containers",
++        lambda _conn, _mission_id, task_ids: removed.extend(task_ids),
++    )
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda *_args: {})
++    monkeypatch.setattr(kb, "_worker_survived_termination", lambda _result: False)
++
++    assert service.reconcile_active_missions(conn) == [mid]
++    recovered = mdb.get_mission(conn, mid)
++    assert recovered.status == "waiting_for_user"
++    assert recovered.phase == "paused"
++    assert removed == [executor]
++    assert kb.get_task(conn, executor).status == "blocked"
++    assert conn.execute(
++        "SELECT status FROM mission_intents WHERE id=?", (intent_id,),
++    ).fetchone()[0] == "paused"
++
++
++def test_restart_reconciliation_finishes_durable_cancelling_state(
++    mission_env, monkeypatch,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo)
++    service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Edit", body="Edit", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    claimed = kb.claim_task(conn, executor)
++    assert claimed is not None
++    intent_id = mdb.begin_intent(
++        conn,
++        mid,
++        task_id=executor,
++        action="execute_task",
++        run_id=claimed.current_run_id,
++        claim_token=claimed.claim_lock,
++    )
++    mdb.transition_mission(
++        conn,
++        mid,
++        "waiting_for_user",
++        phase="cancelling",
++        blocked_reason="cancellation in progress",
++    )
++    removed = []
++    monkeypatch.setattr(
++        service, "_remove_mission_containers",
++        lambda _conn, _mission_id, task_ids: removed.extend(task_ids),
++    )
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda *_args: {})
++    monkeypatch.setattr(kb, "_worker_survived_termination", lambda _result: False)
++
++    assert service.reconcile_active_missions(conn) == [mid]
++    recovered = mdb.get_mission(conn, mid)
++    assert recovered.status == "cancelled"
++    assert recovered.phase == "cancelled"
++    assert removed == [executor]
++    assert kb.get_task(conn, executor).status == "blocked"
++    assert conn.execute(
++        "SELECT status FROM mission_intents WHERE id=?", (intent_id,),
++    ).fetchone()[0] == "cancelled"
++
++
++def test_blocked_reconciliation_removes_orphan_container_once_per_run_generation(
++    mission_env, monkeypatch,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo)
++    service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Edit", body="Edit", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    claimed = kb.claim_task(conn, executor)
++    assert claimed is not None
++    mdb.begin_intent(
++        conn,
++        mid,
++        task_id=executor,
++        action="execute_task",
++        run_id=claimed.current_run_id,
++        claim_token=claimed.claim_lock,
++    )
++    mdb.transition_mission(
++        conn,
++        mid,
++        "blocked",
++        phase="recovery",
++        blocked_reason="worker disappeared",
++    )
++    # Simulate crash detection clearing the live DB fields while the Docker
++    # command/container from that run remains orphaned outside SQLite.
++    assert kb.block_task(
++        conn,
++        executor,
++        reason="worker disappeared",
++        kind="transient",
++        expected_run_id=claimed.current_run_id,
++    )
++    removed = []
++    monkeypatch.setattr(
++        service, "_remove_mission_containers",
++        lambda _conn, _mission_id, task_ids: removed.extend(task_ids),
++    )
++
++    assert service.reconcile_active_missions(conn) == [mid]
++    assert removed == [executor]
++    assert not service._mission_needs_quiescence(conn, mid)
++    assert any(
++        row["kind"] == "quiescence" and row["status"] == "passed"
++        for row in mdb.list_evidence(conn, mid)
++    )
++    assert service.reconcile_active_missions(conn) == []
++    assert removed == [executor]
++
++
+ def test_pause_cancel_and_verified_rollback(mission_env):
+     conn, repo = mission_env
+     mid = _created(conn, repo, autonomy=4)
+@@ -899,14 +1242,81 @@ def test_pause_cancel_and_verified_rollback(mission_env):
+     assert service.cancel_mission(conn, cancel_id).status == "cancelled"
+ 
+ 
++def test_public_creation_requires_registered_clean_project(mission_env):
++    conn, repo = mission_env
++    from hermes_cli import projects_db as pdb
++
++    with pytest.raises(service.MissionError, match="registered Hermes project"):
++        service.create_mission(
++            conn, objective="No project", contract=_contract(repo, allow_local_commit=False),
++            autonomy_level=2, repo_path=str(repo), board="default", project_id="",
++        )
++    with pdb.connect_closing() as project_conn:
++        project_id = pdb.create_project(project_conn, name="Mission Project", primary_path=str(repo))
++    (repo / "dirty.txt").write_text("dirty\n")
++    with pytest.raises(service.MissionError, match="source checkout must be clean"):
++        service.create_mission(
++            conn, objective="Dirty", contract=_contract(repo, allow_local_commit=False),
++            autonomy_level=2, repo_path=str(repo), board="default", project_id=project_id,
++        )
++    (repo / "dirty.txt").unlink()
++    created = service.create_mission(
++        conn, objective="Prepared", contract=_contract(repo, allow_local_commit=False),
++        autonomy_level=2, repo_path=str(repo), board="default", project_id=project_id,
++    )
++    assert created.status == "planning"
++    assert created.project_id == project_id
++    assert Path(created.worktree_path).is_dir()
++
++
++def test_level_four_requires_explicit_local_commit_authority(mission_env):
++    conn, repo = mission_env
++    mid = mdb.create_mission(
++        conn, objective="No implicit commit",
++        contract=_contract(repo, allow_local_commit=False),
++        autonomy_level=4, repo_path=str(repo), board="default",
++    )
++    mission = service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Edit", body="Edit", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    worktree = Path(mission.worktree_path)
++    (worktree / "app.py").write_text("VALUE = 8\n")
++    service.record_command_result(conn, mid, command="verify-ok", cwd=str(worktree), exit_code=0)
++    assert kb.complete_task(conn, executor, result="edited", summary="edited")
++    blocked = service.submit_verifier_verdict(conn, mid, _verdict())
++    assert blocked.status == "blocked"
++    assert blocked.blocked_reason == "autonomy level 4 lacks explicit local-commit authority"
++
++
++def test_operator_deny_and_safe_retry(mission_env):
++    conn, repo = mission_env
++    mid, _worktree, _executor = _ready_for_verification(conn, repo, autonomy=3)
++    waiting = service.submit_verifier_verdict(conn, mid, _verdict())
++    assert waiting.status == "awaiting_approval"
++    denied = service.deny_mission(conn, mid)
++    assert denied.status == "blocked"
++    assert denied.blocked_reason == "local commit denied by operator"
++    retried = service.retry_mission(conn, mid)
++    assert retried.status == "running"
++    actions = [row["metadata"].get("action") for row in mdb.list_evidence(conn, mid)]
++    assert "deny" in actions
++    assert "retry" in actions
++
++
+ def test_slash_and_cli_adapter_share_state(mission_env):
+     _conn, repo = mission_env
++    from hermes_cli import projects_db as pdb
+     from hermes_cli.missions import run_slash
+ 
++    with pdb.connect_closing() as project_conn:
++        project_id = pdb.create_project(project_conn, name="Adapter Project", primary_path=str(repo))
+     out = run_slash(
+         "create 'Adapter mission' --outcome 'Done' --verify verify-ok "
+         f"--allowed-root {shlex_quote(str(repo))} --allowed-path app.py "
+-        f"--autonomy 3 --repo {shlex_quote(str(repo))} --json"
++        f"--autonomy 3 --repo {shlex_quote(str(repo))} --project {project_id} --json"
+     )
+     payload = json.loads(out)
+     listed = json.loads(run_slash("list --json"))
+diff --git a/tests/plugins/test_kanban_missions.py b/tests/plugins/test_kanban_missions.py
+index a042b43ac..6e44f462e 100644
+--- a/tests/plugins/test_kanban_missions.py
++++ b/tests/plugins/test_kanban_missions.py
+@@ -12,6 +12,7 @@ from fastapi import FastAPI
+ from fastapi.testclient import TestClient
+ 
+ from hermes_cli import kanban_db as kb
++from hermes_cli import projects_db as pdb
+ 
+ 
+ def _load_router():
+@@ -36,6 +37,8 @@ def api(tmp_path, monkeypatch):
+     (repo / "app.py").write_text("VALUE = 1\n")
+     subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+     subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True)
++    with pdb.connect_closing() as project_conn:
++        pdb.create_project(project_conn, name="API Project", slug="api-project", primary_path=str(repo))
+     kb.init_db()
+     app = FastAPI()
+     app.include_router(_load_router(), prefix="/api/plugins/kanban")
+@@ -50,7 +53,7 @@ def test_create_list_and_lifecycle_actions(api):
+             "objective": "Update app", "outcome": "Value updated",
+             "verification": ["verify-ok"], "constraints": [],
+             "boundaries": {"allowed_roots": [str(repo)], "allowed_paths": ["app.py"]},
+-            "stop_when": [], "autonomy_level": 3, "repo_path": str(repo),
++            "stop_when": [], "autonomy_level": 3, "repo_path": str(repo), "project_id": "api-project",
+         },
+     )
+     assert created.status_code == 201, created.text
+@@ -76,7 +79,7 @@ def test_create_rejects_repo_outside_contract_root(api, tmp_path):
+         json={
+             "objective": "Escape", "outcome": "No", "verification": ["x"],
+             "boundaries": {"allowed_roots": [str(tmp_path / "elsewhere")]},
+-            "autonomy_level": 4, "repo_path": str(repo),
++            "autonomy_level": 4, "repo_path": str(repo), "project_id": "api-project",
+         },
+     )
+     assert response.status_code == 400
+@@ -95,7 +98,7 @@ def test_mission_api_maps_invalid_status_and_policy_errors_to_client_errors(api)
+         json={
+             "objective": "Bad risk", "outcome": "No", "verification": ["x"],
+             "boundaries": {"allowed_roots": [str(repo)]},
+-            "autonomy_level": 3, "repo_path": str(repo), "risk_level": "extreme",
++            "autonomy_level": 3, "repo_path": str(repo), "project_id": "api-project", "risk_level": "extreme",
+         },
+     )
+     assert invalid_risk.status_code == 422
+@@ -105,7 +108,7 @@ def test_mission_api_maps_invalid_status_and_policy_errors_to_client_errors(api)
+         json={
+             "objective": "State error", "outcome": "No", "verification": ["x"],
+             "boundaries": {"allowed_roots": [str(repo)]},
+-            "autonomy_level": 3, "repo_path": str(repo),
++            "autonomy_level": 3, "repo_path": str(repo), "project_id": "api-project",
+         },
+     )
+     mid = created.json()["mission_id"]
+@@ -113,7 +116,7 @@ def test_mission_api_maps_invalid_status_and_policy_errors_to_client_errors(api)
+         f"/api/plugins/kanban/missions/{mid}/actions", json={"action": "start"},
+     )
+     assert invalid_action.status_code == 409
+-    assert "cannot start mission from draft" in invalid_action.json()["detail"]
++    assert "cannot start mission from planning" in invalid_action.json()["detail"]
+ 
+ 
+ def test_dispatch_response_exposes_mission_controller_telemetry(api, monkeypatch):
+diff --git a/tests/test_hermes_constants.py b/tests/test_hermes_constants.py
+index f136504a8..420aaa38f 100644
+--- a/tests/test_hermes_constants.py
++++ b/tests/test_hermes_constants.py
+@@ -248,6 +248,24 @@ class TestIsContainer:
+         monkeypatch.setattr(os.path, "exists", lambda p: False)
+         assert is_container() is True
+ 
++    def test_mountinfo_ignores_container_storage_child_mounts(self):
++        mountinfo = (
++            "36 25 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n"
++            "91 36 0:88 / /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs "
++            "rw - overlay overlay rw\n"
++        )
++        assert hermes_constants._mountinfo_indicates_container(mountinfo) is False
++
++    @pytest.mark.parametrize(
++        "mountinfo",
++        [
++            "36 25 0:88 / / rw - overlay overlay rw\n",
++            "40 36 0:29 /kubepods/pod123 /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
++        ],
++    )
++    def test_mountinfo_detects_process_root_or_cgroup_container(self, mountinfo):
++        assert hermes_constants._mountinfo_indicates_container(mountinfo) is True
++
+ 
+ class TestParseReasoningEffort:
+     """Tests for parse_reasoning_effort() — string → reasoning config dict."""
+diff --git a/tests/tools/test_execution_flag_detection.py b/tests/tools/test_execution_flag_detection.py
+index 65c1aeeb4..c9a4c5250 100644
+--- a/tests/tools/test_execution_flag_detection.py
++++ b/tests/tools/test_execution_flag_detection.py
+@@ -49,6 +49,12 @@ def test_real_binaries_execute_leading_dash_program_payload(
+     """A PATH marker proves these binaries do not reparse '-program' as an option."""
+     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
+         pytest.skip(f"{tool} or script is not installed")
++    if tool == "sort":
++        version = subprocess.run(
++            [tool, "--version"], text=True, capture_output=True, check=False,
++        )
++        if "(GNU coreutils)" not in version.stdout:
++            pytest.skip("leading-dash --compress-program ownership requires GNU sort")
+ 
+     marker = tmp_path / "executed"
+     payload = tmp_path / "-payload-marker"
+diff --git a/tests/tools/test_mission_docker_scope.py b/tests/tools/test_mission_docker_scope.py
+index 94c92b416..f90099c13 100644
+--- a/tests/tools/test_mission_docker_scope.py
++++ b/tests/tools/test_mission_docker_scope.py
+@@ -253,6 +253,11 @@ def test_restricted_docker_constructor_drops_implicit_and_explicit_host_access(
+     skill_dir.mkdir()
+     cache_dir.mkdir()
+     calls = []
++    monkeypatch.setenv("HERMES_MISSION_POLICY", _policy(worktree))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "17")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "mission-task")
+ 
+     def fake_run(cmd, **kwargs):
+         calls.append(list(cmd))
+@@ -316,6 +321,12 @@ def test_restricted_docker_constructor_drops_implicit_and_explicit_host_access(
+     assert "escape:host-gateway" not in rendered
+     assert "PROFILE_SECRET" not in rendered
+     assert "GIT_CONFIG_GLOBAL=/dev/null" in run_cmd
++    assert "hermes-mission-id=mission-scope-test" in run_cmd
++    assert "hermes-board=default" in run_cmd
++    assert "hermes-run-id=17" in run_cmd
++    assert "hermes-board-db=" + docker_env._mission_db_fingerprint(
++        str(tmp_path / "kanban.db")
++    ) in run_cmd
+     assert env._persistent is False
+     assert env._persist_across_processes is False
+ 
+diff --git a/tests/tui_gateway/test_missions_rpc.py b/tests/tui_gateway/test_missions_rpc.py
+index bbe377fa4..e14bef405 100644
+--- a/tests/tui_gateway/test_missions_rpc.py
++++ b/tests/tui_gateway/test_missions_rpc.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import subprocess
+ 
+ import tui_gateway.server as server
++from hermes_cli import projects_db as pdb
+ 
+ 
+ def _call(name, params):
+@@ -25,6 +26,8 @@ def test_mission_methods_registered_and_roundtrip(tmp_path, monkeypatch):
+     (repo / "app.py").write_text("VALUE = 1\n")
+     subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+     subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True)
++    with pdb.connect_closing() as project_conn:
++        project_id = pdb.create_project(project_conn, name="RPC Project", primary_path=str(repo))
+ 
+     for name in ("missions.list", "missions.get", "missions.create", "missions.action", "missions.plan_auto"):
+         assert name in server._methods
+@@ -33,7 +36,7 @@ def test_mission_methods_registered_and_roundtrip(tmp_path, monkeypatch):
+         {
+             "objective": "RPC mission", "outcome": "Done", "verification": ["verify-ok"],
+             "boundaries": {"allowed_roots": [str(repo)], "allowed_paths": ["app.py"]},
+-            "autonomy_level": 3, "repo_path": str(repo), "board": "default",
++            "autonomy_level": 3, "repo_path": str(repo), "project_id": project_id, "board": "default",
+         },
+     )
+     mid = created["mission_id"]
+@@ -60,7 +63,7 @@ def test_mission_methods_registered_and_roundtrip(tmp_path, monkeypatch):
+         {
+             "objective": "Bad risk", "outcome": "No", "verification": ["x"],
+             "boundaries": {"allowed_roots": [str(repo)]},
+-            "autonomy_level": 3, "repo_path": str(repo), "board": "default",
++            "autonomy_level": 3, "repo_path": str(repo), "project_id": project_id, "board": "default",
+             "risk_level": "extreme",
+         },
+     )
+diff --git a/tools/environments/docker.py b/tools/environments/docker.py
+index 42db15877..c5a715923 100644
+--- a/tools/environments/docker.py
++++ b/tools/environments/docker.py
+@@ -125,6 +125,12 @@ def _sanitize_label_value(value: str) -> str:
+     return cleaned
+ 
+ 
++def _mission_db_fingerprint(db_path: str) -> str:
++    """Return a stable, non-sensitive label for one board database."""
++    resolved = str(Path(db_path).expanduser().resolve(strict=False))
++    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:32]
++
++
+ def _get_active_profile_name() -> str:
+     """Return the active Hermes profile name, or ``"default"`` on any error.
+ 
+@@ -843,6 +849,7 @@ class DockerEnvironment(BaseEnvironment):
+     ):
+         if cwd == "~":
+             cwd = "/root"
++        mission_labels: dict[str, str] = {}
+         if restricted_mode:
+             # Scoped missions get exactly one host bind: their approved
+             # worktree at /workspace.  Defense in depth belongs here as well as
+@@ -861,6 +868,25 @@ class DockerEnvironment(BaseEnvironment):
+                 raise ValueError(
+                     "restricted Docker mode requires a host worktree mounted at /workspace"
+                 )
++            try:
++                mission_policy = json.loads(os.environ.get("HERMES_MISSION_POLICY", ""))
++            except json.JSONDecodeError as exc:
++                raise ValueError("restricted Docker mode requires a valid mission policy") from exc
++            mission_id = str(mission_policy.get("mission_id") or "").strip()
++            board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
++            db_path = os.environ.get("HERMES_KANBAN_DB", "").strip()
++            run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
++            bound_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
++            if not mission_id or not board or not db_path or not run_id or bound_task != task_id:
++                raise ValueError(
++                    "restricted Docker mode requires exact mission, board, task, and run bindings"
++                )
++            mission_labels = {
++                "hermes-mission-id": _sanitize_label_value(mission_id),
++                "hermes-board": _sanitize_label_value(board),
++                "hermes-board-db": _mission_db_fingerprint(db_path),
++                "hermes-run-id": _sanitize_label_value(run_id),
++            }
+             persistent_filesystem = False
+             persist_across_processes = False
+             volumes = []
+@@ -1353,6 +1379,8 @@ class DockerEnvironment(BaseEnvironment):
+             "--label", f"hermes-profile={profile_name}",
+             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+         ]
++        for key, value in mission_labels.items():
++            label_args.extend(["--label", f"{key}={value}"])
+         # Save args for container recreation on "No such container" recovery.
+         self._image = image
+         self._container_name = container_name
+@@ -1364,6 +1392,7 @@ class DockerEnvironment(BaseEnvironment):
+             "hermes-task-id": task_label,
+             "hermes-profile": profile_name,
+             _EGRESS_LABEL_KEY: egress_label,
++            **mission_labels,
+         }
+ 
+         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 786463558..0c8e373e8 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -10779,15 +10779,17 @@ def _(rid, params, conn, board) -> dict:
+         constraints=[str(v) for v in params.get("constraints", [])],
+         boundaries=dict(params.get("boundaries") or {}),
+         stop_when=[str(v) for v in params.get("stop_when", [])],
++        allow_local_commit=bool(params.get("allow_local_commit", False)),
+     )
+-    mid = mdb.create_mission(
++    from hermes_cli import mission_service as svc
++    mission = svc.create_mission(
+         conn, objective=str(params.get("objective") or ""), contract=contract,
+         autonomy_level=int(params["autonomy_level"]), repo_path=str(params.get("repo_path") or ""),
+         board=board, risk_level=risk_level,
+-        project_id=params.get("project_id"), budget=dict(params.get("budget") or {}),
++        project_id=str(params.get("project_id") or ""), budget=dict(params.get("budget") or {}),
+         deadline=params.get("deadline"),
+     )
+-    return _ok(rid, {"mission_id": mid})
++    return _ok(rid, {"mission_id": mission.id})
+ 
+ 
+ @_mission_rpc("missions.action")
+@@ -10804,6 +10806,8 @@ def _(rid, params, conn, board) -> dict:
+         "resume": lambda: svc.resume_mission(conn, mid),
+         "verify": lambda: svc.verify_with_model(conn, mid),
+         "approve": lambda: svc.approve_commit(conn, mid),
++        "deny": lambda: svc.deny_mission(conn, mid),
++        "retry": lambda: svc.retry_mission(conn, mid),
+         "commit": lambda: svc.commit_mission(conn, mid),
+         "cancel": lambda: svc.cancel_mission(conn, mid),
+         "rollback": lambda: svc.rollback_mission(conn, mid),
+diff --git a/utils.py b/utils.py
+index cfeaab2d3..72a8f4b6f 100644
+--- a/utils.py
++++ b/utils.py
+@@ -35,6 +35,20 @@ def env_var_enabled(name: str, default: str = "") -> bool:
+     return is_truthy_value(os.getenv(name, default), default=False)
+ 
+ 
++def host_extension_execution_disabled() -> bool:
++    """Return whether this process must not execute host-side extensions.
++
++    ``HERMES_SAFE_MODE`` is the user-facing isolation switch.  A mission
++    policy is also an authoritative internal isolation boundary: mission
++    workers may use their brokered file/terminal tools, but must never import
++    Python plugins or launch shell hooks directly in the host process.  Treat
++    any non-empty policy value as active so a malformed policy fails closed.
++    """
++    return env_var_enabled("HERMES_SAFE_MODE") or bool(
++        os.getenv("HERMES_MISSION_POLICY", "").strip()
++    )
++
++
+ def _preserve_file_mode(path: Path) -> "int | None":
+     """Capture the permission bits of *path* if it exists, else ``None``."""
+     try:
+diff --git a/website/docs/user-guide/features/project-autopilot.md b/website/docs/user-guide/features/project-autopilot.md
+index 51a0701c9..d2cf80fce 100644
+--- a/website/docs/user-guide/features/project-autopilot.md
++++ b/website/docs/user-guide/features/project-autopilot.md
+@@ -13,7 +13,7 @@ A mission stores its objective, required outcome, verification commands, allowed
+ 
+ - Autonomy is required explicitly for every mission. L0 is advisory, L1 may inspect, L2 may prepare and plan, L3 may execute with an approval before local commit, and L4 may make a verified local commit.
+ - Version 1 never pushes, merges, deploys, restarts services, or changes the source checkout.
+-- Preparation creates a dedicated Git worktree and rollback ref outside the source repository.
++- Creation requires a registered Hermes project and a clean Git source checkout. Levels 2–4 immediately create a dedicated Git worktree, branch, controller card, and rollback ref outside the source repository.
+ - Executor file writes are restricted to declared paths. Version 1 terminal commands run only in a dedicated, non-persistent Docker sandbox with the mission worktree mounted at `/workspace`; detached background commands are rejected.
+ - Version 1 supports offline execution (`network_destinations: []`). A non-empty destination allowlist is rejected at the start gate until destination-level egress enforcement is available.
+ - The verifier is read-only and receives the contract, diff, and evidence—not the executor's justification.
+@@ -27,9 +27,9 @@ hermes mission create "Repair the parser" \
+   --verify "scripts/run_tests.sh tests/parser -q" \
+   --allowed-root /work/parser \
+   --allowed-path src --allowed-path tests \
+-  --autonomy 3 --repo /work/parser
++  --autonomy 3 --repo /work/parser --project parser-project
+ 
+-hermes mission prepare m_abc123
++# Levels 2–4 are prepared automatically during creation.
+ hermes mission plan-auto m_abc123 --executor engineer --verifier reviewer
+ hermes mission start m_abc123
+ hermes mission show m_abc123
+@@ -38,7 +38,7 @@ hermes mission approve m_abc123
+ hermes mission commit m_abc123
+ ```
+ 
+-Use `pause`, `resume`, `cancel`, `reconcile`, and `rollback` for lifecycle and recovery. Pause is cooperative at the next mutating tool boundary; cancel synchronously revokes the durable lease, stops the executor and its task-labeled sandbox, and becomes terminal only after quiescence is proven. Rollback resets and cleans only the mission-owned worktree after the same quiescence checks, then verifies it matches the preserved rollback ref.
++Use `pause`, `resume`, `deny`, `retry`, `cancel`, `reconcile`, and `rollback` for lifecycle and recovery. Pause is cooperative at the next mutating tool boundary; cancel synchronously revokes the durable lease, stops the executor and its task-labeled sandbox, and becomes terminal only after quiescence is proven. Rollback resets and cleans only the mission-owned worktree after the same quiescence checks, then verifies it matches the preserved rollback ref.
+ 
+ At Level 3, approval and commit remain separate operator actions: `approve` opens the commit gate, but neither the dispatcher nor the mission controller performs the commit. Level 4 may verify and create the local commit automatically. Neither level pushes or merges.
+ 
+@@ -49,3 +49,13 @@ The same workflow is available through `/mission …`, the native Project Autopi
+ Foreground terminal results and successful file mutations are appended to a hash-chained ledger. Large command bodies are compressed, redacted, SHA-256 hashed, and stored under the Hermes mission evidence directory. The SQLite row retains the hash, size, command, exit code, task, and timestamps.
+ 
+ Before an executor starts, Hermes creates a filesystem checkpoint and a mutation intent. A clean task completion resolves the intent. On restart, `reconcile` leaves an open intent alone only when the exact recorded boot, process, run, and claim owner is still live. An orphaned or mismatched open intent blocks the mission because its filesystem state is ambiguous and must be inspected rather than guessed.
++
++## Release gate
++
++Run the deterministic safety evaluation before labeling Project Autopilot v1 release-ready:
++
++```bash
++./scripts/evaluate_project_autopilot.py --output /tmp/project-autopilot-evaluation.json
++```
++
++The command returns success only when every acceptance scenario passes and the report records zero safety escapes. It measures mission completion, false-success prevention, scope containment, source-checkout preservation, project registration, explicit commit authority, operator intervention, restart recovery, rollback, Git identity integrity, graph immutability, sandbox containment, and network-scope enforcement.

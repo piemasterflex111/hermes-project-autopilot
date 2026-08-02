@@ -1,0 +1,72 @@
+{
+  "upstream_repository": "https://github.com/NousResearch/hermes-agent.git",
+  "base_commit": "d8de415491a4935ad54021d10b2cc18f2c3d356b",
+  "base_tree": "e6fcaef24a676190fc058096243ab557e074f207",
+  "head_commit": "a70c859e4aae7e4159522b1c2bc50ced165193e3",
+  "head_tree": "7ba19cb3ce7b36f9b856b6290e247c050dc03ab3",
+  "commits": [
+    {
+      "commit": "43361bc70595809454ef82cf76bac46308b9acd2",
+      "parents": [
+        "d8de415491a4935ad54021d10b2cc18f2c3d356b"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T17:45:03-07:00",
+      "subject": "feat: add restart-safe project autopilot missions"
+    },
+    {
+      "commit": "82060cb9697a086f42c7343dc97783baeeb21ea6",
+      "parents": [
+        "43361bc70595809454ef82cf76bac46308b9acd2"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T19:02:32-07:00",
+      "subject": "feat: complete project autopilot v1 safety gates"
+    },
+    {
+      "commit": "e1f2561adf3114cf69f759ad54fd36fe7313ecca",
+      "parents": [
+        "82060cb9697a086f42c7343dc97783baeeb21ea6"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T19:14:30-07:00",
+      "subject": "feat: add native project autopilot mission center"
+    },
+    {
+      "commit": "cb801eda583dc8319298e6485bfd855055c18ca6",
+      "parents": [
+        "e1f2561adf3114cf69f759ad54fd36fe7313ecca"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T20:19:30-07:00",
+      "subject": "feat: deliver authenticated mission controls and detail views"
+    },
+    {
+      "commit": "a70c859e4aae7e4159522b1c2bc50ced165193e3",
+      "parents": [
+        "cb801eda583dc8319298e6485bfd855055c18ca6"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T22:12:57-07:00",
+      "subject": "fix: requeue blocked executors on mission retry"
+    }
+  ],
+  "public_replay_base_commit": "e444d165807f489b5c1ab8e4a612c8d09c2e67a2",
+  "local_feature_base_commit": "d8de415491a4935ad54021d10b2cc18f2c3d356b",
+  "prerequisite_commits": [
+    {
+      "commit": "d8de415491a4935ad54021d10b2cc18f2c3d356b",
+      "parents": [
+        "e444d165807f489b5c1ab8e4a612c8d09c2e67a2"
+      ],
+      "author_name": "Payam Adloo",
+      "author_date": "2026-08-01T14:19:30-07:00",
+      "subject": "fix: reject incomplete local Qwen stop responses"
+    }
+  ]
+}

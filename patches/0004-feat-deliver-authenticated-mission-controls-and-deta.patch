@@ -1,0 +1,3017 @@
+From cb801eda583dc8319298e6485bfd855055c18ca6 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 20:19:30 -0700
+Subject: [PATCH 4/5] feat: deliver authenticated mission controls and detail
+ views
+
+---
+ apps/desktop/src/plugins/kanban/api.ts        |   4 +
+ apps/desktop/src/plugins/kanban/board.tsx     | 404 +++++++++--
+ apps/desktop/src/plugins/kanban/types.ts      |  71 ++
+ gateway/kanban_watchers.py                    | 193 ++++++
+ gateway/platforms/base.py                     |  17 +
+ gateway/platforms/qqbot/__init__.py           |   4 +
+ gateway/platforms/qqbot/adapter.py            |  75 +++
+ gateway/platforms/qqbot/keyboards.py          |  26 +
+ gateway/platforms/whatsapp_cloud.py           |  66 ++
+ gateway/relay/adapter.py                      |  59 ++
+ gateway/run.py                                |   1 +
+ gateway/slash_commands.py                     | 131 +++-
+ hermes_cli/mission_gateway.py                 | 628 ++++++++++++++++++
+ hermes_cli/missions_db.py                     |  42 ++
+ plugins/kanban/dashboard/dist/index.js        | 146 +++-
+ plugins/kanban/dashboard/dist/style.css       |  53 +-
+ scripts/evaluate_project_autopilot.py         |  17 +-
+ tests/gateway/test_mission_gateway_actions.py | 147 ++++
+ tests/gateway/test_qqbot.py                   |  34 +
+ tests/gateway/test_whatsapp_cloud.py          |  62 ++
+ tests/hermes_cli/test_mission_gateway.py      | 255 +++++++
+ tests/plugins/test_kanban_missions.py         |   8 +
+ .../user-guide/features/project-autopilot.md  |  30 +-
+ 23 files changed, 2397 insertions(+), 76 deletions(-)
+ create mode 100644 hermes_cli/mission_gateway.py
+ create mode 100644 tests/gateway/test_mission_gateway_actions.py
+ create mode 100644 tests/hermes_cli/test_mission_gateway.py
+
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 4672d9d58..7b66fc777 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -20,6 +20,7 @@ import type {
+   KanbanTask,
+   KanbanTaskDetail,
+   Mission,
++  MissionReport,
+   OrchestrationSettings,
+   TaskEstimate,
+   WorkerLog
+@@ -166,6 +167,9 @@ export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestrat
+ export const fetchMissions = (slug = $boardSlug.get()) =>
+   call<{ missions: Mission[] }>(withBoardSlug('/missions', slug))
+ 
++export const fetchMission = (id: string, slug = $boardSlug.get()) =>
++  call<MissionReport>(withBoardSlug(`/missions/${encodeURIComponent(id)}`, slug))
++
+ // ── writes ────────────────────────────────────────────────────────────────────
+ 
+ // Every board edit nudges the dispatcher (debounced, fire-and-forget) so the
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index 5700c5f0a..d087a79b4 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -73,6 +73,7 @@ import {
+   estimateNew,
+   fetchBoard,
+   fetchBoards,
++  fetchMission,
+   fetchMissions,
+   fetchProfiles,
+   missionAction,
+@@ -83,7 +84,7 @@ import {
+ import { BoardSwitcher } from './board-switcher'
+ import { TaskDrawer } from './drawer'
+ import { OrchestrationPanel } from './orchestration'
+-import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
++import { columnMeta, type KanbanBoard, type KanbanTask, type MissionReport, type TaskEstimate } from './types'
+ import {
+   $newTaskLane,
+   ago,
+@@ -131,10 +132,158 @@ function moveCard(board: KanbanBoard, id: string, toStatus: string): KanbanBoard
+   }
+ }
+ 
++function MissionDetail({ report }: { report: MissionReport }) {
++  const mission = report.mission
++  const contract = mission.contract
++  const parents = new Map<string, string[]>()
++
++  for (const link of report.links) {
++    parents.set(link.child_id, [...(parents.get(link.child_id) ?? []), link.parent_id])
++  }
++
++  return (
++    <div className="flex min-h-0 flex-col gap-3 overflow-y-auto rounded-md border border-(--ui-border) p-3">
++      <div>
++        <div className="flex items-center gap-2">
++          <span className="text-sm font-semibold">Mission detail</span>
++          <span className="ml-auto font-mono text-[0.625rem] text-(--ui-text-tertiary)">{mission.id}</span>
++        </div>
++        <p className="mt-1 text-xs">{mission.objective}</p>
++        <p className="mt-1 text-[0.65rem] text-(--ui-text-tertiary)">
++          {mission.status} · {mission.phase} · autonomy L{mission.autonomy_level} · risk {mission.risk_level}
++        </p>
++        {mission.blocked_reason && <p className="mt-1 text-xs text-destructive">{mission.blocked_reason}</p>}
++      </div>
++
++      <section className="rounded border border-(--ui-stroke-tertiary) p-2">
++        <p className="text-xs font-medium">Outcome and boundaries</p>
++        <p className="mt-1 text-[0.7rem]">{contract.outcome}</p>
++        <div className="mt-2 grid gap-1 text-[0.65rem] text-(--ui-text-tertiary)">
++          <span>Project: {mission.project_id || '—'}</span>
++          <span>Repository: {mission.repo_path}</span>
++          <span>Worktree: {mission.worktree_path || 'not prepared'}</span>
++          <span>Branch: {mission.branch_name || '—'}</span>
++          <span>Base: {mission.base_commit?.slice(0, 12) || '—'}</span>
++          <span>Rollback ref: {mission.rollback_ref || '—'}</span>
++          <span>Verified commit: {mission.verified_commit?.slice(0, 12) || '—'}</span>
++        </div>
++        <p className="mt-2 text-[0.65rem] font-medium">Verification commands</p>
++        {contract.verification.map(command => (
++          <code className="mt-1 block text-[0.625rem]" key={command}>
++            {command}
++          </code>
++        ))}
++        <p className="mt-2 text-[0.65rem] font-medium">Allowed scope</p>
++        <p className="text-[0.625rem] text-(--ui-text-tertiary)">
++          roots: {(contract.boundaries.allowed_roots ?? []).join(', ') || '—'}
++          <br />
++          paths: {(contract.boundaries.allowed_paths ?? []).join(', ') || '—'}
++          <br />
++          network: {(contract.boundaries.network_destinations ?? []).join(', ') || 'offline only'}
++        </p>
++      </section>
++
++      <section className="rounded border border-(--ui-stroke-tertiary) p-2">
++        <div className="flex items-center gap-2">
++          <p className="text-xs font-medium">Task dependency graph</p>
++          <span className="ml-auto text-[0.625rem] text-(--ui-text-tertiary)">
++            {report.tasks.length} tasks · {report.links.length} links
++          </span>
++        </div>
++        <div className="mt-2 flex flex-col gap-1">
++          {report.tasks.map(task => (
++            <div className="rounded bg-primary/[0.04] px-2 py-1" key={task.id}>
++              <div className="flex gap-2 text-[0.65rem]">
++                <span className="font-medium">{task.title}</span>
++                <span className="ml-auto">
++                  {task.status} · {task.mission_role || 'task'}
++                </span>
++              </div>
++              <p className="font-mono text-[0.58rem] text-(--ui-text-quaternary)">
++                {task.id}
++                {parents.get(task.id)?.length ? ` ← ${parents.get(task.id)!.join(', ')}` : ' · root'}
++              </p>
++            </div>
++          ))}
++          {!report.tasks.length && (
++            <p className="text-[0.65rem] text-(--ui-text-tertiary)">No task graph has been planned.</p>
++          )}
++        </div>
++      </section>
++
++      <section className="rounded border border-(--ui-stroke-tertiary) p-2">
++        <div className="flex items-center gap-2">
++          <p className="text-xs font-medium">Evidence ledger</p>
++          <span
++            className={cn(
++              'ml-auto text-[0.625rem]',
++              report.evidence_chain_valid ? 'text-emerald-500' : 'text-destructive'
++            )}
++          >
++            {report.evidence_chain_valid ? 'hash chain valid' : 'HASH CHAIN INVALID'} · {report.evidence.length} records
++          </span>
++        </div>
++        <div className="mt-2 flex max-h-52 flex-col gap-1 overflow-y-auto">
++          {report.evidence
++            .slice()
++            .reverse()
++            .map(item => (
++              <div className="border-l-2 border-(--ui-stroke-tertiary) pl-2 text-[0.625rem]" key={item.id}>
++                <div className="flex gap-2">
++                  <span className="font-medium">{item.kind}</span>
++                  <span>{item.status}</span>
++                  <span className="ml-auto font-mono text-(--ui-text-quaternary)">
++                    {item.record_hash?.slice(0, 10)}
++                  </span>
++                </div>
++                {item.command && (
++                  <code className="block truncate">
++                    {item.command}
++                    {item.exit_code == null ? '' : ` · exit ${item.exit_code}`}
++                  </code>
++                )}
++                {item.task_id && <span className="text-(--ui-text-quaternary)">task {item.task_id}</span>}
++              </div>
++            ))}
++          {!report.evidence.length && <p className="text-[0.65rem] text-(--ui-text-tertiary)">No evidence recorded.</p>}
++        </div>
++      </section>
++
++      <section className="rounded border border-(--ui-stroke-tertiary) p-2">
++        <div className="flex items-center gap-2">
++          <p className="text-xs font-medium">Recovery state</p>
++          <span
++            className={cn(
++              'ml-auto text-[0.625rem]',
++              report.open_intents.length ? 'text-destructive' : 'text-emerald-500'
++            )}
++          >
++            {report.open_intents.length
++              ? `${report.open_intents.length} unresolved mutation intents`
++              : 'no unresolved mutation intents'}
++          </span>
++        </div>
++        {report.open_intents.map(intent => (
++          <div className="mt-2 rounded bg-destructive/5 p-2 text-[0.625rem]" key={intent.id}>
++            <span className="font-medium">{intent.action}</span> · task {intent.task_id} · intent {intent.id}
++            {intent.checkpoint_ref && <code className="mt-1 block">checkpoint {intent.checkpoint_ref}</code>}
++          </div>
++        ))}
++        {!report.open_intents.length && (
++          <p className="mt-1 text-[0.65rem] text-(--ui-text-tertiary)">
++            Reconcile is safe to run after a restart; rollback remains isolated to the mission worktree.
++          </p>
++        )}
++      </section>
++    </div>
++  )
++}
++
+ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }) {
+   const qc = useQueryClient()
+   const slug = useValue($boardSlug)
+   const queryKey = missionsKey(slug)
++  const [selectedId, setSelectedId] = useState<null | string>(null)
+ 
+   const { data } = useQuery({
+     queryFn: () => fetchMissions(slug),
+@@ -143,6 +292,27 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+     refetchInterval: open ? 3_000 : false
+   })
+ 
++  const missions = useMemo(() => data?.missions ?? [], [data?.missions])
++
++  useEffect(() => {
++    if (!open) {
++      return
++    }
++
++    if (!selectedId || !missions.some(mission => mission.id === selectedId)) {
++      setSelectedId(missions[0]?.id ?? null)
++    }
++  }, [missions, open, selectedId])
++
++  const detailKey = ['kanban', 'mission', slug, selectedId]
++
++  const { data: detail, isLoading: detailLoading } = useQuery({
++    queryFn: () => fetchMission(selectedId!, slug),
++    queryKey: detailKey,
++    enabled: open && Boolean(selectedId),
++    refetchInterval: open && selectedId ? 3_000 : false
++  })
++
+   const [objective, setObjective] = useState('')
+   const [outcome, setOutcome] = useState('')
+   const [verify, setVerify] = useState('')
+@@ -156,7 +326,12 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+   const [busy, setBusy] = useState(false)
+   const [error, setError] = useState<null | string>(null)
+ 
+-  const refresh = () => qc.invalidateQueries({ queryKey })
++  const refresh = async () => {
++    await Promise.all([
++      qc.invalidateQueries({ queryKey }),
++      selectedId ? qc.invalidateQueries({ queryKey: detailKey }) : Promise.resolve()
++    ])
++  }
+ 
+   const create = async () => {
+     if (!objective.trim() || !outcome.trim() || !verify.trim() || !repo.trim() || !project.trim() || busy) {
+@@ -167,27 +342,39 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+     setError(null)
+ 
+     try {
+-      const allowedPaths = paths.split(',').map(v => v.trim()).filter(Boolean)
+-      await createMission({
+-        autonomy_level: Number(autonomy),
+-        allow_local_commit: Number(autonomy) === 4 && allowLocalCommit,
+-        boundaries: {
+-          allowed_paths: allowedPaths,
+-          allowed_roots: [repo.trim()],
+-          network_destinations: []
++      const allowedPaths = paths
++        .split(',')
++        .map(v => v.trim())
++        .filter(Boolean)
++
++      const created = await createMission(
++        {
++          autonomy_level: Number(autonomy),
++          allow_local_commit: Number(autonomy) === 4 && allowLocalCommit,
++          boundaries: {
++            allowed_paths: allowedPaths,
++            allowed_roots: [repo.trim()],
++            network_destinations: []
++          },
++          constraints: ['Do not modify unrelated files'],
++          objective: objective.trim(),
++          outcome: outcome.trim(),
++          project_id: project.trim(),
++          repo_path: repo.trim(),
++          stop_when: ['The declared scope cannot be enforced'],
++          verification: verify
++            .split('\n')
++            .map(v => v.trim())
++            .filter(Boolean)
+         },
+-        constraints: ['Do not modify unrelated files'],
+-        objective: objective.trim(),
+-        outcome: outcome.trim(),
+-        project_id: project.trim(),
+-        repo_path: repo.trim(),
+-        stop_when: ['The declared scope cannot be enforced'],
+-        verification: verify.split('\n').map(v => v.trim()).filter(Boolean)
+-      }, slug)
++        slug
++      )
++
+       setObjective('')
+       setOutcome('')
+       setVerify('')
+       setPaths('')
++      setSelectedId(created.mission_id)
+       await refresh()
+     } catch (err) {
+       setError(errText(err))
+@@ -199,6 +386,7 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+   const act = async (id: string, action: string) => {
+     try {
+       await missionAction(id, action, action === 'plan_auto' ? { executor, verifier } : {}, slug)
++      setSelectedId(id)
+       await refresh()
+     } catch (err) {
+       host.notify({ kind: 'error', message: errText(err) })
+@@ -207,26 +395,50 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+ 
+   return (
+     <Dialog onOpenChange={value => !value && onClose()} open={open}>
+-      <DialogContent className="w-[min(52rem,94vw)] max-w-none">
+-        <DialogHeader><DialogTitle>Project Autopilot missions</DialogTitle></DialogHeader>
+-        <div className="grid max-h-[72vh] gap-4 overflow-y-auto md:grid-cols-2">
+-          <div className="flex flex-col gap-2">
++      <DialogContent className="w-[min(86rem,96vw)] max-w-none">
++        <DialogHeader>
++          <DialogTitle>Project Autopilot missions</DialogTitle>
++        </DialogHeader>
++        <div className="grid max-h-[78vh] min-h-[36rem] gap-4 overflow-hidden lg:grid-cols-[18rem_23rem_minmax(24rem,1fr)]">
++          <div className="flex flex-col gap-2 overflow-y-auto pr-1">
+             <p className="text-xs font-medium">Create mission</p>
+             <Input onChange={e => setObjective(e.target.value)} placeholder="Objective" value={objective} />
+             <Input onChange={e => setOutcome(e.target.value)} placeholder="Required outcome" value={outcome} />
+-            <Textarea onChange={e => setVerify(e.target.value)} placeholder="Verification commands, one per line" value={verify} />
+-            <Input onChange={e => setProject(e.target.value)} placeholder="Registered project id or slug" value={project} />
++            <Textarea
++              onChange={e => setVerify(e.target.value)}
++              placeholder="Verification commands, one per line"
++              value={verify}
++            />
++            <Input
++              onChange={e => setProject(e.target.value)}
++              placeholder="Registered project id or slug"
++              value={project}
++            />
+             <Input onChange={e => setRepo(e.target.value)} placeholder="Absolute Git repository path" value={repo} />
+-            <Input onChange={e => setPaths(e.target.value)} placeholder="Allowed repo paths, comma separated" value={paths} />
++            <Input
++              onChange={e => setPaths(e.target.value)}
++              placeholder="Allowed repo paths, comma separated"
++              value={paths}
++            />
+             <Select onValueChange={setAutonomy} value={autonomy}>
+-              <SelectTrigger><SelectValue /></SelectTrigger>
++              <SelectTrigger>
++                <SelectValue />
++              </SelectTrigger>
+               <SelectContent>
+-                {[0, 1, 2, 3, 4].map(level => <SelectItem key={level} value={String(level)}>Autonomy L{level}</SelectItem>)}
++                {[0, 1, 2, 3, 4].map(level => (
++                  <SelectItem key={level} value={String(level)}>
++                    Autonomy L{level}
++                  </SelectItem>
++                ))}
+               </SelectContent>
+             </Select>
+             {autonomy === '4' && (
+               <label className="flex items-center gap-2 text-xs">
+-                <input checked={allowLocalCommit} onChange={e => setAllowLocalCommit(e.target.checked)} type="checkbox" />
++                <input
++                  checked={allowLocalCommit}
++                  onChange={e => setAllowLocalCommit(e.target.checked)}
++                  type="checkbox"
++                />
+                 Permit a verified local commit
+               </label>
+             )}
+@@ -235,38 +447,126 @@ function MissionCenter({ onClose, open }: { onClose: () => void; open: boolean }
+               <Input onChange={e => setVerifier(e.target.value)} placeholder="Verifier profile" value={verifier} />
+             </div>
+             {error && <p className="text-xs text-destructive">{error}</p>}
+-            <Button disabled={busy} onClick={() => void create()}>{busy ? 'Creating…' : 'Create draft'}</Button>
++            <Button disabled={busy} onClick={() => void create()}>
++              {busy ? 'Creating…' : 'Create mission'}
++            </Button>
+           </div>
+-          <div className="flex flex-col gap-2">
++
++          <div className="flex min-h-0 flex-col gap-2 overflow-y-auto pr-1">
+             <p className="text-xs font-medium">Missions</p>
+-            {(data?.missions ?? []).map(mission => (
+-              <div className="rounded-md border border-(--ui-border) p-2" key={mission.id}>
++            {missions.map(mission => (
++              <button
++                className={cn(
++                  'rounded-md border p-2 text-left transition-colors',
++                  mission.id === selectedId
++                    ? 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]'
++                    : 'border-(--ui-border) hover:bg-primary/[0.04]'
++                )}
++                key={mission.id}
++                onClick={() => setSelectedId(mission.id)}
++                type="button"
++              >
+                 <div className="flex items-center gap-2">
+                   <span className="text-xs font-medium">{mission.objective}</span>
+-                  <span className="ml-auto text-[0.625rem] text-(--ui-text-tertiary)">{mission.status} · L{mission.autonomy_level}</span>
++                  <span className="ml-auto text-[0.625rem] text-(--ui-text-tertiary)">
++                    {mission.status} · L{mission.autonomy_level}
++                  </span>
+                 </div>
+-                {mission.blocked_reason && <p className="mt-1 text-[0.65rem] text-destructive">{mission.blocked_reason}</p>}
+-                {mission.verified_commit && <p className="mt-1 font-mono text-[0.625rem]">{mission.verified_commit.slice(0, 12)}</p>}
+-                <div className="mt-2 flex flex-wrap gap-1">
+-                  {mission.status === 'draft' && mission.autonomy_level >= 1 && <Button onClick={() => void act(mission.id, 'inspect')} size="xs" variant="ghost">Inspect</Button>}
+-                  {mission.status === 'draft' && mission.autonomy_level >= 2 && <Button onClick={() => void act(mission.id, 'prepare')} size="xs" variant="outline">Prepare</Button>}
+-                  {mission.status === 'planning' && <Button onClick={() => void act(mission.id, 'plan_auto')} size="xs" variant="outline">Auto plan</Button>}
+-                  {mission.status === 'ready' && mission.autonomy_level >= 3 && <Button onClick={() => void act(mission.id, 'start')} size="xs" variant="outline">Start</Button>}
+-                  {mission.status === 'running' && <Button onClick={() => void act(mission.id, 'pause')} size="xs" variant="ghost">Pause</Button>}
+-                  {mission.status === 'running' && <Button onClick={() => void act(mission.id, 'verify')} size="xs" variant="outline">Verify</Button>}
+-                  {mission.status === 'waiting_for_user' && <Button onClick={() => void act(mission.id, 'resume')} size="xs" variant="outline">Resume</Button>}
+-                  {mission.status === 'awaiting_approval' && <Button onClick={() => void act(mission.id, 'approve')} size="xs">Approve commit gate</Button>}
+-                  {mission.status === 'awaiting_approval' && <Button onClick={() => void act(mission.id, 'deny')} size="xs" variant="outline">Deny commit</Button>}
+-                  {mission.status === 'blocked' && <Button onClick={() => void act(mission.id, 'retry')} size="xs" variant="outline">Retry safely</Button>}
+-                  {mission.status === 'committing' && <Button onClick={() => void act(mission.id, 'commit')} size="xs">Commit locally</Button>}
+-                  {['succeeded', 'failed', 'cancelled', 'blocked'].includes(mission.status) && mission.worktree_path && <Button onClick={() => void act(mission.id, 'rollback')} size="xs" variant="outline">Rollback</Button>}
+-                  {!['succeeded', 'failed', 'cancelled', 'rolled_back'].includes(mission.status) && <Button onClick={() => void act(mission.id, 'cancel')} size="xs" variant="ghost">Cancel</Button>}
+-                  {!['succeeded', 'failed', 'cancelled', 'rolled_back'].includes(mission.status) && <Button onClick={() => void act(mission.id, 'reconcile')} size="xs" variant="ghost">Reconcile</Button>}
++                {mission.blocked_reason && (
++                  <p className="mt-1 text-[0.65rem] text-destructive">{mission.blocked_reason}</p>
++                )}
++                {mission.verified_commit && (
++                  <p className="mt-1 font-mono text-[0.625rem]">{mission.verified_commit.slice(0, 12)}</p>
++                )}
++                <div className="mt-2 flex flex-wrap gap-1" onClick={event => event.stopPropagation()}>
++                  {mission.status === 'draft' && mission.autonomy_level >= 1 && (
++                    <Button onClick={() => void act(mission.id, 'inspect')} size="xs" variant="ghost">
++                      Inspect
++                    </Button>
++                  )}
++                  {mission.status === 'draft' && mission.autonomy_level >= 2 && (
++                    <Button onClick={() => void act(mission.id, 'prepare')} size="xs" variant="outline">
++                      Prepare
++                    </Button>
++                  )}
++                  {mission.status === 'planning' && (
++                    <Button onClick={() => void act(mission.id, 'plan_auto')} size="xs" variant="outline">
++                      Auto plan
++                    </Button>
++                  )}
++                  {mission.status === 'ready' && mission.autonomy_level >= 3 && (
++                    <Button onClick={() => void act(mission.id, 'start')} size="xs" variant="outline">
++                      Start
++                    </Button>
++                  )}
++                  {mission.status === 'running' && (
++                    <Button onClick={() => void act(mission.id, 'pause')} size="xs" variant="ghost">
++                      Pause
++                    </Button>
++                  )}
++                  {mission.status === 'running' && (
++                    <Button onClick={() => void act(mission.id, 'verify')} size="xs" variant="outline">
++                      Verify
++                    </Button>
++                  )}
++                  {mission.status === 'waiting_for_user' && (
++                    <Button onClick={() => void act(mission.id, 'resume')} size="xs" variant="outline">
++                      Resume
++                    </Button>
++                  )}
++                  {mission.status === 'awaiting_approval' && (
++                    <Button onClick={() => void act(mission.id, 'approve')} size="xs">
++                      Approve commit gate
++                    </Button>
++                  )}
++                  {mission.status === 'awaiting_approval' && (
++                    <Button onClick={() => void act(mission.id, 'deny')} size="xs" variant="outline">
++                      Deny commit
++                    </Button>
++                  )}
++                  {mission.status === 'blocked' && (
++                    <Button onClick={() => void act(mission.id, 'retry')} size="xs" variant="outline">
++                      Retry safely
++                    </Button>
++                  )}
++                  {mission.status === 'committing' && (
++                    <Button onClick={() => void act(mission.id, 'commit')} size="xs">
++                      Commit locally
++                    </Button>
++                  )}
++                  {['succeeded', 'failed', 'cancelled', 'blocked'].includes(mission.status) &&
++                    mission.worktree_path && (
++                      <Button onClick={() => void act(mission.id, 'rollback')} size="xs" variant="outline">
++                        Rollback
++                      </Button>
++                    )}
++                  {!['succeeded', 'failed', 'cancelled', 'rolled_back'].includes(mission.status) && (
++                    <Button onClick={() => void act(mission.id, 'cancel')} size="xs" variant="ghost">
++                      Cancel
++                    </Button>
++                  )}
++                  {!['succeeded', 'failed', 'cancelled', 'rolled_back'].includes(mission.status) && (
++                    <Button onClick={() => void act(mission.id, 'reconcile')} size="xs" variant="ghost">
++                      Reconcile
++                    </Button>
++                  )}
+                 </div>
+-              </div>
++              </button>
+             ))}
+-            {!data?.missions?.length && <p className="text-xs text-(--ui-text-tertiary)">No missions on this board.</p>}
++            {!missions.length && <p className="text-xs text-(--ui-text-tertiary)">No missions on this board.</p>}
+           </div>
++
++          {detailLoading ? (
++            <div className="flex items-center justify-center">
++              <Loader />
++            </div>
++          ) : detail ? (
++            <MissionDetail report={detail} />
++          ) : (
++            <div className="flex items-center justify-center rounded-md border border-dashed text-xs text-(--ui-text-tertiary)">
++              Select a mission to inspect its graph, evidence, and recovery state.
++            </div>
++          )}
+         </div>
+       </DialogContent>
+     </Dialog>
+diff --git a/apps/desktop/src/plugins/kanban/types.ts b/apps/desktop/src/plugins/kanban/types.ts
+index 3b50864c7..eba8845c1 100644
+--- a/apps/desktop/src/plugins/kanban/types.ts
++++ b/apps/desktop/src/plugins/kanban/types.ts
+@@ -39,6 +39,77 @@ export interface Mission {
+   updated_at: number
+ }
+ 
++export interface MissionContract {
++  outcome: string
++  verification: string[]
++  constraints: string[]
++  boundaries: {
++    allowed_roots?: string[]
++    allowed_paths?: string[]
++    network_destinations?: string[]
++    [key: string]: unknown
++  }
++  stop_when: string[]
++  allow_local_commit?: boolean
++}
++
++export interface MissionTask {
++  id: string
++  title: string
++  status: string
++  mission_role?: null | string
++  current_run_id?: null | number
++}
++
++export interface MissionLink {
++  parent_id: string
++  child_id: string
++}
++
++export interface MissionEvidence {
++  id: number
++  kind: string
++  status: string
++  created_at: number
++  task_id?: null | string
++  command?: null | string
++  exit_code?: null | number
++  record_hash?: null | string
++  previous_hash?: null | string
++  blob_path?: null | string
++  blob_bytes?: number
++  metadata?: Record<string, unknown>
++}
++
++export interface MissionIntent {
++  id: number
++  task_id: string
++  action: string
++  status: string
++  created_at: number
++  checkpoint_ref?: null | string
++  run_id?: null | number
++  claim_token?: null | string
++  details_json?: null | string
++}
++
++export interface MissionReport {
++  mission: Mission & {
++    contract: MissionContract
++    base_commit?: null | string
++    rollback_ref?: null | string
++    branch_name?: null | string
++    project_id?: null | string
++    root_task_id?: null | string
++    deadline?: null | number
++  }
++  tasks: MissionTask[]
++  links: MissionLink[]
++  evidence: MissionEvidence[]
++  evidence_chain_valid: boolean
++  open_intents: MissionIntent[]
++}
++
+ export interface KanbanColumn {
+   name: string
+   tasks: KanbanTask[]
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index b6b6f6ba7..ae3c8ccdd 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -112,6 +112,199 @@ def _release_singleton_lock(handle) -> None:
+ class GatewayKanbanWatchersMixin:
+     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+ 
++    async def _mission_action_watcher(self, interval: float = 5.0) -> None:
++        """Deliver identity-bound, restart-safe mission action prompts."""
++        from gateway.config import Platform as _Platform
++        from hermes_cli import kanban_db as _kb
++        from hermes_cli import mission_gateway as _mg
++        from hermes_cli.config import load_config as _load_config
++
++        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
++        if env_override in {"0", "false", "no", "off"}:
++            logger.info("mission action watcher: disabled with gateway dispatch")
++            return
++        try:
++            cfg = _load_config()
++        except Exception as exc:
++            logger.warning("mission action watcher: cannot load config (%s); disabled", exc)
++            return
++        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
++        if not kanban_cfg.get("dispatch_in_gateway", True):
++            logger.info("mission action watcher: disabled because gateway dispatch is disabled")
++            return
++
++        await asyncio.sleep(2)
++        while self._running:
++            try:
++                def _collect():
++                    deliveries = []
++                    try:
++                        boards = _kb.list_boards(include_archived=False)
++                    except Exception:
++                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
++                    seen_paths: set[str] = set()
++                    for meta in boards:
++                        board = meta.get("slug") or _kb.DEFAULT_BOARD
++                        db_path = str(meta.get("db_path") or _kb.kanban_db_path(board))
++                        if db_path in seen_paths:
++                            continue
++                        seen_paths.add(db_path)
++                        try:
++                            with _kb.connect_closing(board=board) as conn:
++                                deliveries.extend(_mg.claim_prompt_candidates(conn, board))
++                        except Exception as exc:
++                            logger.debug(
++                                "mission action watcher could not inspect board %s: %s",
++                                board,
++                                exc,
++                            )
++                    return deliveries
++
++                deliveries = await asyncio.to_thread(_collect)
++                for candidate in deliveries:
++                    try:
++                        platform = _Platform(candidate.identity.platform)
++                    except ValueError:
++                        logger.warning(
++                            "mission action watcher: unsupported platform %s",
++                            candidate.identity.platform,
++                        )
++                        await asyncio.to_thread(
++                            self._mission_release_prompt,
++                            candidate,
++                        )
++                        continue
++                    adapter = self._authorization_adapter(
++                        platform,
++                        candidate.notifier_profile or None,
++                    )
++                    if adapter is None:
++                        await asyncio.to_thread(self._mission_release_prompt, candidate)
++                        continue
++
++                    fresh_mission, tokens = await asyncio.to_thread(
++                        self._mission_issue_tokens,
++                        candidate,
++                    )
++                    if fresh_mission is None:
++                        continue
++                    metadata = dict(candidate.delivery_metadata)
++                    if candidate.identity.thread_id and not metadata.get("thread_id"):
++                        metadata["thread_id"] = candidate.identity.thread_id
++                    try:
++                        result = await adapter.send_mission_actions(
++                            candidate.identity.chat_id,
++                            fresh_mission,
++                            tokens,
++                            metadata=metadata,
++                        )
++                    except Exception as exc:
++                        logger.warning(
++                            "mission action native prompt failed for %s: %s",
++                            candidate.mission.id,
++                            exc,
++                        )
++                        result = None
++                    if getattr(result, "success", False):
++                        await asyncio.to_thread(self._mission_complete_prompt, candidate)
++                        continue
++
++                    commands = [
++                        f"{token.label}: `/mission action {token.token}`"
++                        for token in tokens
++                    ]
++                    blocker = str(fresh_mission.blocked_reason or "").strip()
++                    fallback = (
++                        f"🛰️ Project Autopilot decision required\n"
++                        f"Mission {fresh_mission.id} · {fresh_mission.status} · "
++                        f"L{fresh_mission.autonomy_level}\n"
++                        f"{fresh_mission.objective}\n"
++                    )
++                    if blocker:
++                        fallback += f"Blocker: {blocker[:500]}\n"
++                    fallback += "These one-use commands expire in 15 minutes and only work for the operator who requested mission controls.\n"
++                    fallback += "Choose: " + " or ".join(commands)
++                    try:
++                        sent = await adapter.send(
++                            candidate.identity.chat_id,
++                            fallback,
++                            metadata=metadata,
++                        )
++                    except Exception as exc:
++                        logger.warning(
++                            "mission action text fallback failed for %s: %s",
++                            candidate.mission.id,
++                            exc,
++                        )
++                        sent = None
++                    if getattr(sent, "success", True) is False:
++                        await asyncio.to_thread(
++                            self._mission_revoke_tokens,
++                            candidate,
++                            tokens,
++                        )
++                        await asyncio.to_thread(self._mission_release_prompt, candidate)
++                    else:
++                        await asyncio.to_thread(self._mission_complete_prompt, candidate)
++            except asyncio.CancelledError:
++                raise
++            except Exception:
++                logger.exception("mission action watcher failed")
++
++            slept = 0.0
++            while slept < interval and self._running:
++                await asyncio.sleep(min(1.0, interval - slept))
++                slept += 1.0
++
++    @staticmethod
++    def _mission_issue_tokens(candidate):
++        from hermes_cli import kanban_db as _kb
++        from hermes_cli import mission_gateway as _mg
++
++        from hermes_cli import missions_db as _mdb
++
++        with _kb.connect_closing(board=candidate.board) as conn:
++            mission = _mdb.get_mission(conn, candidate.mission.id)
++            if mission is None:
++                _mg.release_prompt(conn, candidate)
++                return None, []
++            if (
++                mission.status != candidate.mission.status
++                or mission.updated_at != candidate.mission.updated_at
++            ):
++                _mg.release_prompt(conn, candidate)
++                return None, []
++            return mission, _mg.issue_action_tokens(
++                conn,
++                candidate.board,
++                mission,
++                candidate.identity,
++            )
++
++    @staticmethod
++    def _mission_revoke_tokens(candidate, tokens) -> None:
++        from hermes_cli import kanban_db as _kb
++        from hermes_cli import mission_gateway as _mg
++
++        with _kb.connect_closing(board=candidate.board) as conn:
++            _mg.revoke_action_tokens(conn, tokens)
++
++    @staticmethod
++    def _mission_complete_prompt(candidate) -> None:
++        from hermes_cli import kanban_db as _kb
++        from hermes_cli import mission_gateway as _mg
++
++        with _kb.connect_closing(board=candidate.board) as conn:
++            _mg.complete_prompt(conn, candidate)
++
++    @staticmethod
++    def _mission_release_prompt(candidate) -> None:
++        from hermes_cli import kanban_db as _kb
++        from hermes_cli import mission_gateway as _mg
++
++        with _kb.connect_closing(board=candidate.board) as conn:
++            _mg.release_prompt(conn, candidate)
++
+     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+ 
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index d7654ff6c..c3577db3c 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3723,6 +3723,23 @@ class BasePlatformAdapter(ABC):
+         }
+         return options[start:end], meta
+ 
++    async def send_mission_actions(
++        self,
++        chat_id: str,
++        mission: Any,
++        actions: list[Any],
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Render durable Project Autopilot actions with native controls.
++
++        Adapters with an interactive-button surface override this method. The
++        default deliberately reports unsupported so the gateway watcher sends
++        the authenticated text-command fallback instead of pretending buttons
++        were delivered.
++        """
++        del chat_id, mission, actions, metadata
++        return SendResult(success=False, error="Mission action buttons not supported")
++
+     async def send_slash_confirm(
+         self,
+         chat_id: str,
+diff --git a/gateway/platforms/qqbot/__init__.py b/gateway/platforms/qqbot/__init__.py
+index d755ec48d..65ee117e6 100644
+--- a/gateway/platforms/qqbot/__init__.py
++++ b/gateway/platforms/qqbot/__init__.py
+@@ -49,9 +49,11 @@ from .keyboards import (  # noqa: F401
+     InteractionEvent,
+     build_approval_keyboard,
+     build_approval_text,
++    build_mission_action_keyboard,
+     build_update_prompt_keyboard,
+     parse_approval_button_data,
+     parse_interaction_event,
++    parse_mission_action_button_data,
+     parse_update_prompt_button_data,
+ )
+ 
+@@ -84,8 +86,10 @@ __all__ = [
+     "InteractionEvent",
+     "build_approval_keyboard",
+     "build_approval_text",
++    "build_mission_action_keyboard",
+     "build_update_prompt_keyboard",
+     "parse_approval_button_data",
+     "parse_interaction_event",
++    "parse_mission_action_button_data",
+     "parse_update_prompt_button_data",
+ ]
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 8f5d7fece..e4dce1dc4 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -130,9 +130,11 @@ from gateway.platforms.qqbot.keyboards import (
+     InlineKeyboard,
+     InteractionEvent,
+     build_approval_keyboard,
++    build_mission_action_keyboard,
+     build_update_prompt_keyboard,
+     parse_approval_button_data,
+     parse_interaction_event,
++    parse_mission_action_button_data,
+     parse_update_prompt_button_data,
+ )
+ 
+@@ -1137,6 +1139,54 @@ class QQAdapter(BasePlatformAdapter):
+         if not button_data:
+             return
+ 
++        mission_token = parse_mission_action_button_data(button_data)
++        if mission_token is not None:
++            from hermes_cli.mission_gateway import (
++                GatewayIdentity,
++                MissionGatewayError,
++                resolve_action_token,
++            )
++
++            if event.scene == "c2c":
++                identity = GatewayIdentity(
++                    platform="qqbot",
++                    chat_id=str(event.user_openid or event.operator_openid),
++                    chat_type="dm",
++                    principal_id=str(event.operator_openid),
++                )
++            elif event.scene == "group":
++                identity = GatewayIdentity(
++                    platform="qqbot",
++                    chat_id=str(event.group_openid),
++                    chat_type="group",
++                    principal_id=str(event.operator_openid),
++                )
++            else:
++                logger.warning(
++                    "[%s] Mission action buttons are unsupported for QQ scene %r",
++                    self._log_tag,
++                    event.scene,
++                )
++                return
++            try:
++                result = resolve_action_token(mission_token, identity)
++                logger.info(
++                    "[%s] Mission button resolved %s/%s → %s (operator=%s)",
++                    self._log_tag,
++                    result["mission_id"],
++                    result["action"],
++                    result["status"],
++                    event.operator_openid,
++                )
++            except MissionGatewayError as exc:
++                logger.warning(
++                    "[%s] Mission action refused (operator=%s): %s",
++                    self._log_tag,
++                    event.operator_openid,
++                    exc,
++                )
++            return
++
+         approval = parse_approval_button_data(button_data)
+         if approval is not None:
+             session_key, decision = approval
+@@ -2671,6 +2721,31 @@ class QQAdapter(BasePlatformAdapter):
+     # for button-based approval / update-confirm UX. Discord, Telegram, Slack,
+     # Matrix, and Feishu already implement the same contract.
+ 
++    async def send_mission_actions(
++            self,
++            chat_id: str,
++            mission: Any,
++            actions: list[Any],
++            metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Render durable Project Autopilot controls as a QQ keyboard."""
++        del metadata
++        blocker = str(getattr(mission, "blocked_reason", "") or "").strip()
++        body = (
++            f"🛰️ Project Autopilot decision\n\n"
++            f"Mission {mission.id} · {mission.status} · L{mission.autonomy_level}\n"
++            f"{mission.objective}"
++        )
++        if blocker:
++            body += f"\n\nBlocker: {blocker[:500]}"
++        msg_id = self._last_msg_id.get(chat_id)
++        return await self.send_with_keyboard(
++            chat_id,
++            body,
++            build_mission_action_keyboard(actions),
++            reply_to=msg_id,
++        )
++
+     async def send_exec_approval(
+             self,
+             chat_id: str,
+diff --git a/gateway/platforms/qqbot/keyboards.py b/gateway/platforms/qqbot/keyboards.py
+index 9c1afbbfa..340a39ae0 100644
+--- a/gateway/platforms/qqbot/keyboards.py
++++ b/gateway/platforms/qqbot/keyboards.py
+@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
+ 
+ APPROVAL_BUTTON_PREFIX = "approve:"
+ UPDATE_PROMPT_PREFIX = "update_prompt:"
++MISSION_ACTION_PREFIX = "mission_action:"
+ 
+ # Pattern: approve:<session_key>:<decision>
+ # session_key may itself contain colons (e.g. agent:main:qqbot:c2c:OPENID),
+@@ -179,6 +180,15 @@ def parse_update_prompt_button_data(button_data: str) -> Optional[str]:
+     return m.group(1)
+ 
+ 
++def parse_mission_action_button_data(button_data: str) -> Optional[str]:
++    """Return the opaque durable mission token carried by a QQ button."""
++    raw = str(button_data or "")
++    if not raw.startswith(MISSION_ACTION_PREFIX):
++        return None
++    token = raw[len(MISSION_ACTION_PREFIX):].strip()
++    return token or None
++
++
+ # ── Keyboard builders ────────────────────────────────────────────────
+ 
+ def _make_callback_button(
+@@ -231,6 +241,22 @@ def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -
+     return InlineKeyboard(content=KeyboardContent(rows=[KeyboardRow(buttons=buttons)]))
+ 
+ 
++def build_mission_action_keyboard(actions: list[Any]) -> InlineKeyboard:
++    """Build one mutually-exclusive row of durable mission action buttons."""
++    buttons = [
++        _make_callback_button(
++            btn_id=f"mission-{index}",
++            label=str(action.label)[:24],
++            visited_label="已处理",
++            data=f"{MISSION_ACTION_PREFIX}{action.token}",
++            style=0 if str(action.style) == "danger" else 1,
++            group_id="mission_action",
++        )
++        for index, action in enumerate(actions[:3], start=1)
++    ]
++    return InlineKeyboard(content=KeyboardContent(rows=[KeyboardRow(buttons=buttons)]))
++
++
+ def build_update_prompt_keyboard() -> InlineKeyboard:
+     """Build a Yes/No keyboard for update confirmation prompts."""
+     return InlineKeyboard(
+diff --git a/gateway/platforms/whatsapp_cloud.py b/gateway/platforms/whatsapp_cloud.py
+index 074ad1afa..559d23097 100644
+--- a/gateway/platforms/whatsapp_cloud.py
++++ b/gateway/platforms/whatsapp_cloud.py
+@@ -828,6 +828,42 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+             self._bounded_put(self._clarify_state, clarify_id, session_key)
+         return result
+ 
++    async def send_mission_actions(
++        self,
++        chat_id: str,
++        mission: Any,
++        actions: list[Any],
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Render up to three durable mission actions as WhatsApp buttons."""
++        if self._http_client is None:
++            return SendResult(success=False, error="Not connected")
++        buttons = [
++            {
++                "type": "reply",
++                "reply": {
++                    "id": f"mact:{action.token}",
++                    "title": self._truncate_button_label(action.label),
++                },
++            }
++            for action in actions[:3]
++        ]
++        blocker = str(getattr(mission, "blocked_reason", "") or "").strip()
++        body = (
++            f"🛰️ *Project Autopilot decision*\n\n"
++            f"Mission {mission.id} · {mission.status} · L{mission.autonomy_level}\n"
++            f"{mission.objective}"
++        )
++        if blocker:
++            body += f"\n\nBlocker: {blocker[:500]}"
++        interactive = {
++            "type": "button",
++            "body": {"text": self._truncate_body(body)},
++            "action": {"buttons": buttons},
++        }
++        reply_to = (metadata or {}).get("reply_to_message_id") if metadata else None
++        return await self._post_interactive(chat_id, interactive, reply_to=reply_to)
++
+     async def send_exec_approval(
+         self,
+         chat_id: str,
+@@ -1666,6 +1702,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+           ``cl:<clarify_id>:<idx|other>``  → resolve_gateway_clarify
+           ``appr:<approval_id>:approve|deny`` → resolve_gateway_approval
+           ``sc:<once|always|cancel>:<confirm_id>`` → slash_confirm.resolve
++          ``mact:<opaque-token>`` → durable mission action resolver
+         """
+         inter = raw_message.get("interactive") or {}
+         # button_reply (interactive.type=button) and list_reply
+@@ -1687,6 +1724,35 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+             # plain text (which could re-enter the agent loop).
+             return True
+ 
++        # Durable mission action: mact:<opaque token>
++        if button_id.startswith("mact:"):
++            from hermes_cli.mission_gateway import (
++                GatewayIdentity,
++                MissionGatewayError,
++                resolve_action_token,
++            )
++
++            token = button_id[len("mact:"):]
++            identity = GatewayIdentity(
++                platform=self.platform.value,
++                chat_id=sender_id,
++                chat_type="dm",
++                principal_id=sender_id,
++            )
++            try:
++                result = resolve_action_token(token, identity)
++                message = (
++                    f"✅ Mission {result['mission_id']} {result['action']} accepted "
++                    f"→ {result['status']}"
++                )
++            except MissionGatewayError as exc:
++                message = f"⛔ Mission action refused: {exc}"
++            try:
++                await self.send(sender_id, message)
++            except Exception:
++                logger.exception("[whatsapp_cloud] mission action confirmation failed")
++            return True
++
+         # Clarify: cl:<clarify_id>:<idx|other>
+         if button_id.startswith("cl:"):
+             parts = button_id.split(":", 2)
+diff --git a/gateway/relay/adapter.py b/gateway/relay/adapter.py
+index 534ffea91..dd9d8cf2c 100644
+--- a/gateway/relay/adapter.py
++++ b/gateway/relay/adapter.py
+@@ -1671,6 +1671,43 @@ class RelayAdapter(BasePlatformAdapter):
+             raw_response=result,
+         )
+ 
++    async def send_mission_actions(
++        self,
++        chat_id: str,
++        mission: Any,
++        actions: list[Any],
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Render restart-safe mission controls through the relay prompt op."""
++        options = [
++            {
++                "id": action.token,
++                "label": str(action.label)[:75],
++                "style": action.style,
++            }
++            for action in actions
++        ]
++        blocker = str(getattr(mission, "blocked_reason", "") or "").strip()
++        lines = [
++            "🛰️ **Project Autopilot requires your decision**",
++            "",
++            f"Mission `{mission.id}` · **{mission.status}** · L{mission.autonomy_level}",
++            str(mission.objective),
++        ]
++        if blocker:
++            lines.extend(["", f"Blocker: {blocker[:500]}"])
++        prompt_id = f"mission-{mission.id[-8:]}-{int(getattr(mission, 'updated_at', 0))}"
++        result = await self._send_prompt(
++            chat_id,
++            prompt_kind="approval",
++            text="\n".join(lines),
++            prompt_id=prompt_id,
++            options=options,
++            metadata=metadata,
++            timeout_s=900,
++        )
++        return result or SendResult(success=False, error="relay prompt op unavailable")
++
+     async def send_exec_approval(
+         self,
+         chat_id: str,
+@@ -1843,6 +1880,28 @@ class RelayAdapter(BasePlatformAdapter):
+         option_id = str(pr.get("option_id") or "")
+         if not prompt_id or not option_id:
+             return False
++        if option_id.startswith("ma1."):
++            from hermes_cli.mission_gateway import (
++                GatewayIdentity,
++                MissionGatewayError,
++                resolve_action_token,
++            )
++
++            try:
++                result = resolve_action_token(
++                    option_id,
++                    GatewayIdentity.from_source(getattr(event, "source", None)),
++                )
++                label = (
++                    f"✅ Mission {result['mission_id']} {result['action']} accepted "
++                    f"→ {result['status']}"
++                )
++            except MissionGatewayError as exc:
++                label = f"⛔ Mission action refused: {exc}"
++            chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
++            if chat_id:
++                await self.send(chat_id, label, metadata=self._prompt_reply_metadata(event))
++            return True
+         state = self._pop_prompt(prompt_id)
+         if state is None:
+             logger.info(
+diff --git a/gateway/run.py b/gateway/run.py
+index 8a1321268..1c1c2f26e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -11005,6 +11005,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
+         # so human-in-the-loop workflows hear back without polling.
+         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
++        self._spawn_supervised(self._mission_action_watcher, "mission_action_watcher")
+ 
+         # Start background kanban dispatcher — spawns workers for ready
+         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index 05fad6471..e5ce03ed8 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -538,8 +538,9 @@ class GatewaySlashCommandsMixin:
+         return output or t("gateway.kanban.no_output")
+ 
+     async def _handle_mission_command(self, event: MessageEvent) -> str:
+-        """Handle /mission via the same adapter used by CLI and TUI."""
+-        import asyncio
++        """Handle /mission and bind its controls to the requesting operator."""
++        from hermes_cli import kanban_db as _kb
++        from hermes_cli import mission_gateway as _mg
+         from hermes_cli.missions import run_slash
+ 
+         text = (event.text or "").strip()
+@@ -547,10 +548,136 @@ class GatewaySlashCommandsMixin:
+             text = text.lstrip("/")
+         if text.startswith("mission"):
+             text = text[len("mission"):].lstrip()
++
++        try:
++            tokens = shlex.split(text) if text else []
++        except ValueError as exc:
++            return f"Mission error: {exc}"
++        requested_board: Optional[str] = None
++        command_tokens: list[str] = []
++        index = 0
++        while index < len(tokens):
++            token = tokens[index]
++            if token == "--board" and index + 1 < len(tokens):
++                requested_board = tokens[index + 1]
++                index += 2
++                continue
++            if token.startswith("--board="):
++                requested_board = token.split("=", 1)[1]
++                index += 1
++                continue
++            command_tokens.append(token)
++            index += 1
++        action = command_tokens[0].lower() if command_tokens else ""
++        board = requested_board or _kb.get_current_board()
++
++        try:
++            identity = _mg.GatewayIdentity.from_source(event.source)
++        except _mg.MissionGatewayError as exc:
++            identity = None
++            identity_error = str(exc)
++        else:
++            identity_error = ""
++
++        if action == "action":
++            if len(command_tokens) != 2:
++                return "Usage: `/mission action <button-token>`"
++            if identity is None:
++                return f"Mission action refused: {identity_error}"
++            try:
++                result = await asyncio.to_thread(
++                    _mg.resolve_action_token,
++                    command_tokens[1],
++                    identity,
++                )
++            except _mg.MissionGatewayError as exc:
++                return f"Mission action refused: {exc}"
++            return (
++                f"Mission {result['mission_id']} {result['action']} accepted "
++                f"→ {result['status']}"
++            )
++
++        if action in {"watch", "unwatch"}:
++            if len(command_tokens) != 2:
++                return f"Usage: `/mission {action} <mission-id>`"
++            if identity is None:
++                return f"Mission controls unavailable: {identity_error}"
++            mission_id = command_tokens[1]
++            metadata = self._thread_metadata_for_source(
++                event.source,
++                self._reply_anchor_for_event(event),
++            ) or {}
++            profile = self._active_profile_name()
++
++            def _change_subscription() -> bool:
++                with _kb.connect_closing(board=board) as conn:
++                    if action == "watch":
++                        _mg.add_subscription(
++                            conn,
++                            mission_id,
++                            identity,
++                            notifier_profile=profile,
++                            delivery_metadata=metadata,
++                            reset_prompt=True,
++                        )
++                        return True
++                    return _mg.remove_subscription(conn, mission_id, identity)
++
++            try:
++                changed = await asyncio.to_thread(_change_subscription)
++            except (KeyError, ValueError, _mg.MissionGatewayError) as exc:
++                return f"Mission controls unavailable: {exc}"
++            if action == "watch":
++                return f"Mission controls enabled for {mission_id} on board {board}."
++            return (
++                f"Mission controls disabled for {mission_id}."
++                if changed
++                else f"No mission-control subscription existed for {mission_id}."
++            )
++
+         try:
+             output = await asyncio.to_thread(run_slash, text)
+         except Exception as exc:  # pragma: no cover - defensive
+             return f"Mission error: {exc}"
++
++        # Any successful command that identifies one mission enrolls the exact
++        # requesting platform/chat/thread/operator for future action prompts.
++        # Listing remains read-only and never subscribes every returned mission.
++        mission_id = None
++        if output and not output.startswith("mission:") and action not in {"list", "ls"}:
++            match = re.search(r"\b(m_[0-9a-f]{12})\b", output)
++            if match:
++                mission_id = match.group(1)
++            elif len(command_tokens) > 1 and re.fullmatch(r"m_[0-9a-f]{12}", command_tokens[1]):
++                mission_id = command_tokens[1]
++        if mission_id and identity is not None:
++            metadata = self._thread_metadata_for_source(
++                event.source,
++                self._reply_anchor_for_event(event),
++            ) or {}
++            profile = self._active_profile_name()
++
++            def _subscribe() -> None:
++                with _kb.connect_closing(board=board) as conn:
++                    _mg.add_subscription(
++                        conn,
++                        mission_id,
++                        identity,
++                        notifier_profile=profile,
++                        delivery_metadata=metadata,
++                    )
++
++            try:
++                await asyncio.to_thread(_subscribe)
++                output = output.rstrip() + (
++                    f"\nGateway controls enabled for {mission_id}; "
++                    f"use `/mission unwatch {mission_id}` to disable them."
++                )
++            except Exception as exc:
++                logger.warning("mission auto-subscribe failed: %s", exc)
++        elif mission_id and identity is None:
++            output = output.rstrip() + f"\nGateway buttons unavailable: {identity_error}"
++
+         if len(output) > 3800:
+             output = output[:3800] + "\n… (truncated; use `hermes mission show …` for full output)"
+         return output or "Mission command produced no output."
+diff --git a/hermes_cli/mission_gateway.py b/hermes_cli/mission_gateway.py
+new file mode 100644
+index 000000000..bdab3d81b
+--- /dev/null
++++ b/hermes_cli/mission_gateway.py
+@@ -0,0 +1,628 @@
++"""Durable, identity-bound gateway controls for Project Autopilot missions.
++
++Interactive platform buttons are treated as authorization capabilities, not UI
++state.  The opaque capability is stored only as a SHA-256 hash in the board
++SQLite database, expires quickly, can be claimed exactly once, and is bound to
++the originating platform/chat/thread/operator identity.  The board slug is
++encoded in the public token solely to locate the correct per-board database;
++the random secret remains the authorization material.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++import os
++import re
++import secrets
++import socket
++import time
++from dataclasses import dataclass
++from typing import Any, Mapping, Optional
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import missions_db as mdb
++
++TOKEN_PREFIX = "ma1"
++TOKEN_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
++ACTION_TOKEN_TTL_SECONDS = 15 * 60
++PROMPT_CLAIM_STALE_SECONDS = 90
++SUPPORTED_ACTIONS = frozenset(
++    {"approve", "deny", "retry", "reconcile", "resume", "cancel", "commit"}
++)
++ACTIONABLE_STATUSES = frozenset(
++    {"awaiting_approval", "blocked", "waiting_for_user", "committing"}
++)
++
++
++class MissionGatewayError(RuntimeError):
++    """A gateway action failed authorization, expiry, or mission policy."""
++
++
++@dataclass(frozen=True)
++class GatewayIdentity:
++    platform: str
++    chat_id: str
++    chat_type: str
++    principal_id: str
++    thread_id: str = ""
++    scope_id: str = ""
++
++    @classmethod
++    def from_source(cls, source: Any) -> "GatewayIdentity":
++        if source is None:
++            raise MissionGatewayError("mission gateway action requires a message source")
++        raw_platform = getattr(source, "platform", "")
++        platform = str(getattr(raw_platform, "value", raw_platform) or "").strip().lower()
++        chat_id = str(getattr(source, "chat_id", "") or "").strip()
++        chat_type = str(getattr(source, "chat_type", "") or "dm").strip().lower()
++        thread_id = str(getattr(source, "thread_id", "") or "").strip()
++        scope_id = str(
++            getattr(source, "scope_id", None)
++            or getattr(source, "guild_id", None)
++            or ""
++        ).strip()
++        principal = str(
++            getattr(source, "user_id_alt", None)
++            or getattr(source, "user_id", None)
++            or (chat_id if chat_type in {"dm", "c2c", "private"} else "")
++        ).strip()
++        return cls(
++            platform=platform,
++            chat_id=chat_id,
++            chat_type=chat_type,
++            principal_id=principal,
++            thread_id=thread_id,
++            scope_id=scope_id,
++        ).validated()
++
++    def validated(self) -> "GatewayIdentity":
++        if not self.platform or not self.chat_id or not self.chat_type:
++            raise MissionGatewayError("platform, chat, and chat type are required")
++        if not self.principal_id:
++            raise MissionGatewayError(
++                "mission buttons require a stable operator identity; group-wide anonymous authorization is refused"
++            )
++        return self
++
++    def matches_row(self, row: Mapping[str, Any]) -> bool:
++        return all(
++            str(row.get(key) or "") == value
++            for key, value in (
++                ("platform", self.platform),
++                ("chat_id", self.chat_id),
++                ("chat_type", self.chat_type),
++                ("thread_id", self.thread_id),
++                ("principal_id", self.principal_id),
++                ("scope_id", self.scope_id),
++            )
++        )
++
++
++@dataclass(frozen=True)
++class MissionActionToken:
++    action: str
++    label: str
++    style: str
++    token: str
++
++
++@dataclass(frozen=True)
++class PromptCandidate:
++    board: str
++    mission: mdb.Mission
++    identity: GatewayIdentity
++    notifier_profile: str
++    delivery_metadata: dict[str, Any]
++    claim_owner: str
++
++
++def _claim_owner() -> str:
++    return f"{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(4)}"
++
++
++def _metadata_json(metadata: Optional[Mapping[str, Any]]) -> str:
++    safe: dict[str, Any] = {}
++    for key, value in dict(metadata or {}).items():
++        if isinstance(value, (str, int, float, bool)) or value is None:
++            safe[str(key)] = value
++    return json.dumps(safe, ensure_ascii=False, sort_keys=True)
++
++
++def _metadata_value(raw: Any) -> dict[str, Any]:
++    if isinstance(raw, Mapping):
++        return dict(raw)
++    try:
++        value = json.loads(str(raw or "{}"))
++    except (TypeError, json.JSONDecodeError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _board_segment(board: str) -> str:
++    normalized = kb._normalize_board_slug(board)
++    if normalized is None:
++        raise MissionGatewayError("board slug is required")
++    return base64.urlsafe_b64encode(normalized.encode("utf-8")).decode("ascii").rstrip("=")
++
++
++def _decode_token(token: str) -> tuple[str, str]:
++    parts = str(token or "").split(".")
++    if len(parts) != 3 or parts[0] != TOKEN_PREFIX or not TOKEN_SECRET_RE.fullmatch(parts[2]):
++        raise MissionGatewayError("invalid or malformed mission action token")
++    try:
++        padded = parts[1] + "=" * (-len(parts[1]) % 4)
++        board = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
++    except (ValueError, UnicodeDecodeError) as exc:
++        raise MissionGatewayError("invalid mission action board token") from exc
++    try:
++        normalized = kb._normalize_board_slug(board)
++    except ValueError as exc:
++        raise MissionGatewayError("invalid mission action board") from exc
++    if normalized is None or normalized != board:
++        raise MissionGatewayError("invalid mission action board")
++    return normalized, parts[2]
++
++
++def _hash_token(token: str) -> str:
++    return hashlib.sha256(token.encode("utf-8")).hexdigest()
++
++
++def action_options_for_mission(mission: mdb.Mission) -> list[tuple[str, str, str]]:
++    if mission.status == "awaiting_approval":
++        return [
++            ("approve", "Approve commit gate", "primary"),
++            ("deny", "Deny commit", "danger"),
++        ]
++    if mission.status == "blocked":
++        return [
++            ("retry", "Retry safely", "primary"),
++            ("reconcile", "Reconcile state", "secondary"),
++        ]
++    if mission.status == "waiting_for_user":
++        return [
++            ("resume", "Resume mission", "primary"),
++            ("cancel", "Cancel mission", "danger"),
++        ]
++    if mission.status == "committing":
++        return [
++            ("commit", "Commit locally", "primary"),
++            ("cancel", "Cancel mission", "danger"),
++        ]
++    return []
++
++
++def add_subscription(
++    conn,
++    mission_id: str,
++    identity: GatewayIdentity,
++    *,
++    notifier_profile: Optional[str] = None,
++    delivery_metadata: Optional[Mapping[str, Any]] = None,
++    reset_prompt: bool = False,
++) -> None:
++    identity = identity.validated()
++    mdb.ensure_schema(conn)
++    if mdb.get_mission(conn, mission_id) is None:
++        raise KeyError(mission_id)
++    now = int(time.time())
++    metadata_json = _metadata_json(delivery_metadata)
++    with kb.write_txn(conn):
++        conn.execute(
++            """
++            INSERT INTO mission_gateway_subscriptions(
++                mission_id, platform, chat_id, chat_type, thread_id,
++                principal_id, scope_id, notifier_profile,
++                delivery_metadata_json, created_at, updated_at
++            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++            ON CONFLICT(mission_id, platform, chat_id, thread_id, principal_id)
++            DO UPDATE SET
++                chat_type=excluded.chat_type,
++                scope_id=excluded.scope_id,
++                notifier_profile=excluded.notifier_profile,
++                delivery_metadata_json=excluded.delivery_metadata_json,
++                updated_at=excluded.updated_at
++            """,
++            (
++                mission_id,
++                identity.platform,
++                identity.chat_id,
++                identity.chat_type,
++                identity.thread_id,
++                identity.principal_id,
++                identity.scope_id,
++                str(notifier_profile or ""),
++                metadata_json,
++                now,
++                now,
++            ),
++        )
++        if reset_prompt:
++            conn.execute(
++                """
++                UPDATE mission_gateway_subscriptions
++                   SET prompt_claim_owner=NULL, prompt_claimed_at=NULL,
++                       last_prompted_status=NULL, last_prompted_updated_at=NULL
++                 WHERE mission_id=? AND platform=? AND chat_id=?
++                   AND thread_id=? AND principal_id=?
++                """,
++                (
++                    mission_id,
++                    identity.platform,
++                    identity.chat_id,
++                    identity.thread_id,
++                    identity.principal_id,
++                ),
++            )
++
++
++def remove_subscription(conn, mission_id: str, identity: GatewayIdentity) -> bool:
++    identity = identity.validated()
++    mdb.ensure_schema(conn)
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            """DELETE FROM mission_gateway_subscriptions
++                 WHERE mission_id=? AND platform=? AND chat_id=?
++                   AND thread_id=? AND principal_id=?""",
++            (
++                mission_id,
++                identity.platform,
++                identity.chat_id,
++                identity.thread_id,
++                identity.principal_id,
++            ),
++        )
++    return cur.rowcount == 1
++
++
++def list_subscriptions(conn, mission_id: Optional[str] = None) -> list[dict[str, Any]]:
++    mdb.ensure_schema(conn)
++    if mission_id:
++        rows = conn.execute(
++            "SELECT * FROM mission_gateway_subscriptions WHERE mission_id=?",
++            (mission_id,),
++        ).fetchall()
++    else:
++        rows = conn.execute("SELECT * FROM mission_gateway_subscriptions").fetchall()
++    return [
++        dict(row) | {"delivery_metadata": _metadata_value(row["delivery_metadata_json"])}
++        for row in rows
++    ]
++
++
++def claim_prompt_candidates(conn, board: str, *, limit: int = 50) -> list[PromptCandidate]:
++    """Claim actionable, not-yet-delivered mission prompts with stale recovery."""
++    mdb.ensure_schema(conn)
++    board = kb._normalize_board_slug(board) or kb.DEFAULT_BOARD
++    now = int(time.time())
++    stale_before = now - PROMPT_CLAIM_STALE_SECONDS
++    owner = _claim_owner()
++    candidates: list[PromptCandidate] = []
++    rows = conn.execute(
++        """
++        SELECT s.*
++          FROM mission_gateway_subscriptions s
++          JOIN missions m ON m.id=s.mission_id
++         WHERE m.status IN ('awaiting_approval','blocked','waiting_for_user','committing')
++           AND (
++                s.last_prompted_status IS NULL
++                OR s.last_prompted_status != m.status
++                OR COALESCE(s.last_prompted_updated_at, -1) != m.updated_at
++           )
++           AND (s.prompt_claimed_at IS NULL OR s.prompt_claimed_at < ?)
++         ORDER BY m.updated_at, s.created_at
++         LIMIT ?
++        """,
++        (stale_before, max(1, min(int(limit), 500))),
++    ).fetchall()
++    for row in rows:
++        mission = mdb.get_mission(conn, row["mission_id"])
++        if mission is None or not action_options_for_mission(mission):
++            continue
++        claim = f"{owner}:{len(candidates)}"
++        with kb.write_txn(conn):
++            cur = conn.execute(
++                """
++                UPDATE mission_gateway_subscriptions
++                   SET prompt_claim_owner=?, prompt_claimed_at=?
++                 WHERE mission_id=? AND platform=? AND chat_id=?
++                   AND thread_id=? AND principal_id=?
++                   AND (prompt_claimed_at IS NULL OR prompt_claimed_at < ?)
++                   AND (
++                        last_prompted_status IS NULL
++                        OR last_prompted_status != ?
++                        OR COALESCE(last_prompted_updated_at, -1) != ?
++                   )
++                   AND EXISTS (
++                        SELECT 1 FROM missions m
++                         WHERE m.id=mission_gateway_subscriptions.mission_id
++                           AND m.status=? AND m.updated_at=?
++                   )
++                """,
++                (
++                    claim,
++                    now,
++                    row["mission_id"],
++                    row["platform"],
++                    row["chat_id"],
++                    row["thread_id"],
++                    row["principal_id"],
++                    stale_before,
++                    mission.status,
++                    mission.updated_at,
++                    mission.status,
++                    mission.updated_at,
++                ),
++            )
++        if cur.rowcount != 1:
++            continue
++        candidates.append(
++            PromptCandidate(
++                board=board,
++                mission=mission,
++                identity=GatewayIdentity(
++                    platform=row["platform"],
++                    chat_id=row["chat_id"],
++                    chat_type=row["chat_type"],
++                    thread_id=row["thread_id"],
++                    principal_id=row["principal_id"],
++                    scope_id=row["scope_id"],
++                ),
++                notifier_profile=str(row["notifier_profile"] or ""),
++                delivery_metadata=_metadata_value(row["delivery_metadata_json"]),
++                claim_owner=claim,
++            )
++        )
++    return candidates
++
++
++def complete_prompt(conn, candidate: PromptCandidate) -> bool:
++    now = int(time.time())
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            """
++            UPDATE mission_gateway_subscriptions
++               SET prompt_claim_owner=NULL, prompt_claimed_at=NULL,
++                   last_prompted_status=?, last_prompted_updated_at=?,
++                   last_prompted_at=?, updated_at=?
++             WHERE mission_id=? AND platform=? AND chat_id=?
++               AND thread_id=? AND principal_id=? AND prompt_claim_owner=?
++            """,
++            (
++                candidate.mission.status,
++                candidate.mission.updated_at,
++                now,
++                now,
++                candidate.mission.id,
++                candidate.identity.platform,
++                candidate.identity.chat_id,
++                candidate.identity.thread_id,
++                candidate.identity.principal_id,
++                candidate.claim_owner,
++            ),
++        )
++    return cur.rowcount == 1
++
++
++def release_prompt(conn, candidate: PromptCandidate) -> bool:
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            """
++            UPDATE mission_gateway_subscriptions
++               SET prompt_claim_owner=NULL, prompt_claimed_at=NULL
++             WHERE mission_id=? AND platform=? AND chat_id=?
++               AND thread_id=? AND principal_id=? AND prompt_claim_owner=?
++            """,
++            (
++                candidate.mission.id,
++                candidate.identity.platform,
++                candidate.identity.chat_id,
++                candidate.identity.thread_id,
++                candidate.identity.principal_id,
++                candidate.claim_owner,
++            ),
++        )
++    return cur.rowcount == 1
++
++
++def issue_action_tokens(
++    conn,
++    board: str,
++    mission: mdb.Mission,
++    identity: GatewayIdentity,
++    *,
++    ttl_seconds: int = ACTION_TOKEN_TTL_SECONDS,
++) -> list[MissionActionToken]:
++    identity = identity.validated()
++    options = action_options_for_mission(mission)
++    if not options:
++        return []
++    board_segment = _board_segment(board)
++    now = int(time.time())
++    expires_at = now + max(30, min(int(ttl_seconds), 24 * 60 * 60))
++    created: list[MissionActionToken] = []
++    with kb.write_txn(conn):
++        conn.execute(
++            """
++            UPDATE mission_gateway_actions
++               SET status='superseded', completed_at=?
++             WHERE mission_id=? AND platform=? AND chat_id=?
++               AND thread_id=? AND principal_id=? AND status='pending'
++            """,
++            (
++                now,
++                mission.id,
++                identity.platform,
++                identity.chat_id,
++                identity.thread_id,
++                identity.principal_id,
++            ),
++        )
++        for action, label, style in options:
++            if action not in SUPPORTED_ACTIONS:
++                raise MissionGatewayError(f"unsupported mission gateway action: {action}")
++            secret = secrets.token_urlsafe(18)
++            token = f"{TOKEN_PREFIX}.{board_segment}.{secret}"
++            conn.execute(
++                """
++                INSERT INTO mission_gateway_actions(
++                    token_hash, mission_id, action, platform, chat_id, chat_type,
++                    thread_id, principal_id, scope_id, status, expires_at, created_at
++                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
++                """,
++                (
++                    _hash_token(token),
++                    mission.id,
++                    action,
++                    identity.platform,
++                    identity.chat_id,
++                    identity.chat_type,
++                    identity.thread_id,
++                    identity.principal_id,
++                    identity.scope_id,
++                    expires_at,
++                    now,
++                ),
++            )
++            created.append(MissionActionToken(action=action, label=label, style=style, token=token))
++    return created
++
++
++def revoke_action_tokens(conn, tokens: list[MissionActionToken], *, reason: str = "delivery_failed") -> int:
++    if not tokens:
++        return 0
++    hashes = [_hash_token(token.token) for token in tokens]
++    now = int(time.time())
++    with kb.write_txn(conn):
++        placeholders = ",".join("?" for _ in hashes)
++        cur = conn.execute(
++            f"""UPDATE mission_gateway_actions
++                   SET status='revoked', completed_at=?, result_json=?
++                 WHERE token_hash IN ({placeholders})
++                   AND status='pending'""",
++            (now, json.dumps({"reason": reason}, sort_keys=True), *hashes),
++        )
++    return int(cur.rowcount)
++
++
++def _run_action(conn, mission_id: str, action: str):
++    from hermes_cli import mission_service as svc
++
++    mapping = {
++        "approve": svc.approve_commit,
++        "deny": svc.deny_mission,
++        "retry": svc.retry_mission,
++        "reconcile": svc.reconcile_mission,
++        "resume": svc.resume_mission,
++        "cancel": svc.cancel_mission,
++        "commit": svc.commit_mission,
++    }
++    handler = mapping.get(action)
++    if handler is None:
++        raise MissionGatewayError(f"unsupported mission gateway action: {action}")
++    return handler(conn, mission_id)
++
++
++def resolve_action_token(token: str, identity: GatewayIdentity) -> dict[str, Any]:
++    """Authorize and execute one durable mission action capability atomically."""
++    board, _secret = _decode_token(token)
++    identity = identity.validated()
++    token_hash = _hash_token(token)
++    now = int(time.time())
++    with kb.connect_closing(board=board) as conn:
++        mdb.ensure_schema(conn)
++        expired = False
++        with kb.write_txn(conn):
++            row = conn.execute(
++                "SELECT * FROM mission_gateway_actions WHERE token_hash=?",
++                (token_hash,),
++            ).fetchone()
++            if row is None:
++                raise MissionGatewayError("mission action token is unknown")
++            item = dict(row)
++            if item["status"] != "pending":
++                raise MissionGatewayError("mission action token was already used or revoked")
++            if int(item["expires_at"]) < now:
++                conn.execute(
++                    "UPDATE mission_gateway_actions SET status='expired', completed_at=? WHERE token_hash=?",
++                    (now, token_hash),
++                )
++                expired = True
++            elif not identity.matches_row(item):
++                raise MissionGatewayError("mission action token does not belong to this operator or conversation")
++            else:
++                cur = conn.execute(
++                    """UPDATE mission_gateway_actions
++                           SET status='claimed', claimed_at=?
++                         WHERE token_hash=? AND status='pending'""",
++                    (now, token_hash),
++                )
++                if cur.rowcount != 1:
++                    raise MissionGatewayError("mission action token was claimed concurrently")
++        if expired:
++            raise MissionGatewayError("mission action token expired")
++        try:
++            mission = _run_action(conn, item["mission_id"], item["action"])
++        except Exception as exc:
++            finished = int(time.time())
++            with kb.write_txn(conn):
++                conn.execute(
++                    """UPDATE mission_gateway_actions
++                           SET status='failed', completed_at=?, result_json=?
++                         WHERE token_hash=? AND status='claimed'""",
++                    (
++                        finished,
++                        json.dumps({"error": str(exc)}, ensure_ascii=False, sort_keys=True),
++                        token_hash,
++                    ),
++                )
++            try:
++                mdb.record_evidence(
++                    conn,
++                    item["mission_id"],
++                    kind="gateway_authorization",
++                    status="failed",
++                    metadata={
++                        "action": item["action"],
++                        "platform": identity.platform,
++                        "chat_id": identity.chat_id,
++                        "principal_id": identity.principal_id,
++                        "token_hash_prefix": token_hash[:12],
++                        "error": str(exc),
++                    },
++                )
++            except Exception:
++                pass
++            raise MissionGatewayError(str(exc)) from exc
++        finished = int(time.time())
++        result = {
++            "board": board,
++            "mission_id": mission.id,
++            "action": item["action"],
++            "status": mission.status,
++            "phase": mission.phase,
++        }
++        with kb.write_txn(conn):
++            conn.execute(
++                """UPDATE mission_gateway_actions
++                       SET status='succeeded', completed_at=?, result_json=?
++                     WHERE token_hash=? AND status='claimed'""",
++                (finished, json.dumps(result, sort_keys=True), token_hash),
++            )
++        mdb.record_evidence(
++            conn,
++            mission.id,
++            kind="gateway_authorization",
++            status="passed",
++            metadata={
++                "action": item["action"],
++                "platform": identity.platform,
++                "chat_id": identity.chat_id,
++                "principal_id": identity.principal_id,
++                "token_hash_prefix": token_hash[:12],
++                "result_status": mission.status,
++            },
++            cwd=mission.worktree_path,
++        )
++        return result
+diff --git a/hermes_cli/missions_db.py b/hermes_cli/missions_db.py
+index 329c941a0..9272a64b3 100644
+--- a/hermes_cli/missions_db.py
++++ b/hermes_cli/missions_db.py
+@@ -235,9 +235,51 @@ CREATE TABLE IF NOT EXISTS mission_task_manifest_cards (
+     PRIMARY KEY (mission_id, task_id)
+ );
+ 
++CREATE TABLE IF NOT EXISTS mission_gateway_subscriptions (
++    mission_id TEXT NOT NULL,
++    platform TEXT NOT NULL,
++    chat_id TEXT NOT NULL,
++    chat_type TEXT NOT NULL,
++    thread_id TEXT NOT NULL DEFAULT '',
++    principal_id TEXT NOT NULL,
++    scope_id TEXT NOT NULL DEFAULT '',
++    notifier_profile TEXT NOT NULL DEFAULT '',
++    delivery_metadata_json TEXT NOT NULL DEFAULT '{}',
++    created_at INTEGER NOT NULL,
++    updated_at INTEGER NOT NULL,
++    prompt_claim_owner TEXT,
++    prompt_claimed_at INTEGER,
++    last_prompted_status TEXT,
++    last_prompted_updated_at INTEGER,
++    last_prompted_at INTEGER,
++    PRIMARY KEY (mission_id, platform, chat_id, thread_id, principal_id)
++);
++
++CREATE TABLE IF NOT EXISTS mission_gateway_actions (
++    token_hash TEXT PRIMARY KEY,
++    mission_id TEXT NOT NULL,
++    action TEXT NOT NULL,
++    platform TEXT NOT NULL,
++    chat_id TEXT NOT NULL,
++    chat_type TEXT NOT NULL,
++    thread_id TEXT NOT NULL DEFAULT '',
++    principal_id TEXT NOT NULL,
++    scope_id TEXT NOT NULL DEFAULT '',
++    status TEXT NOT NULL,
++    expires_at INTEGER NOT NULL,
++    claimed_at INTEGER,
++    completed_at INTEGER,
++    result_json TEXT,
++    created_at INTEGER NOT NULL
++);
++
+ CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status, updated_at);
+ CREATE INDEX IF NOT EXISTS idx_mission_evidence_mission ON mission_evidence(mission_id, id);
+ CREATE INDEX IF NOT EXISTS idx_mission_intents_open ON mission_intents(mission_id, status);
++CREATE INDEX IF NOT EXISTS idx_mission_gateway_subs_pending
++    ON mission_gateway_subscriptions(last_prompted_status, last_prompted_updated_at);
++CREATE INDEX IF NOT EXISTS idx_mission_gateway_actions_pending
++    ON mission_gateway_actions(status, expires_at);
+ """
+ 
+ 
+diff --git a/plugins/kanban/dashboard/dist/index.js b/plugins/kanban/dashboard/dist/index.js
+index e0f3af464..701485a76 100644
+--- a/plugins/kanban/dashboard/dist/index.js
++++ b/plugins/kanban/dashboard/dist/index.js
+@@ -507,6 +507,9 @@
+   function MissionCenter(props) {
+     const [open, setOpen] = useState(false);
+     const [missions, setMissions] = useState([]);
++    const [selectedId, setSelectedId] = useState(null);
++    const [detail, setDetail] = useState(null);
++    const [detailLoading, setDetailLoading] = useState(false);
+     const [busy, setBusy] = useState(false);
+     const [error, setError] = useState(null);
+     const [form, setForm] = useState({
+@@ -514,11 +517,30 @@
+       paths: "", autonomy: "3", allowCommit: false,
+     });
+ 
++    const loadDetail = useCallback(function (id) {
++      if (!id) { setDetail(null); return Promise.resolve(); }
++      setDetailLoading(true);
++      return SDK.fetchJSON(withBoard(`${API}/missions/${encodeURIComponent(id)}`, props.board))
++        .then(function (data) { setDetail(data || null); })
++        .catch(function (err) { setError(parseApiErrorMessage(err)); })
++        .finally(function () { setDetailLoading(false); });
++    }, [props.board]);
++
+     const load = useCallback(function () {
+       return SDK.fetchJSON(withBoard(`${API}/missions`, props.board))
+-        .then(function (data) { setMissions((data && data.missions) || []); setError(null); })
++        .then(function (data) {
++          const rows = (data && data.missions) || [];
++          setMissions(rows);
++          setSelectedId(function (current) {
++            return current && rows.some(function (m) { return m.id === current; })
++              ? current
++              : (rows[0] && rows[0].id) || null;
++          });
++          setError(null);
++        })
+         .catch(function (err) { setError(parseApiErrorMessage(err)); });
+     }, [props.board]);
++
+     useEffect(function () {
+       if (!open) return undefined;
+       load();
+@@ -526,6 +548,13 @@
+       return function () { clearInterval(timer); };
+     }, [open, load]);
+ 
++    useEffect(function () {
++      if (!open || !selectedId) { setDetail(null); return undefined; }
++      loadDetail(selectedId);
++      const timer = setInterval(function () { loadDetail(selectedId); }, 3000);
++      return function () { clearInterval(timer); };
++    }, [open, selectedId, loadDetail]);
++
+     function field(name, placeholder, multiline) {
+       const tag = multiline ? "textarea" : "input";
+       return h(tag, {
+@@ -538,6 +567,7 @@
+         },
+       });
+     }
++
+     function create() {
+       if (busy) return;
+       setBusy(true); setError(null);
+@@ -555,12 +585,14 @@
+           project_id: form.project.trim(), repo_path: form.repo.trim(),
+         }),
+         headers: { "Content-Type": "application/json" },
+-      }).then(function () {
++      }).then(function (created) {
+         setForm({ objective: "", outcome: "", verification: "", project: form.project, repo: "", paths: "", autonomy: "3", allowCommit: false });
++        if (created && created.mission_id) setSelectedId(created.mission_id);
+         return load();
+       }).catch(function (err) { setError(parseApiErrorMessage(err)); })
+         .finally(function () { setBusy(false); });
+     }
++
+     function act(mission, action) {
+       const body = { action: action };
+       if (action === "plan_auto") {
+@@ -568,21 +600,22 @@
+         body.verifier = window.prompt("Verifier profile", "default") || "";
+         if (!body.executor || !body.verifier) return;
+       }
+-      setBusy(true); setError(null);
++      setBusy(true); setError(null); setSelectedId(mission.id);
+       SDK.fetchJSON(withBoard(`${API}/missions/${mission.id}/actions`, props.board), {
+         method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" },
+       }).then(function () {
+         SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, props.board), {
+           method: "POST", body: "{}", headers: { "Content-Type": "application/json" },
+         }).catch(function () { /* periodic refresh + gateway tick are fallbacks */ });
+-        return load();
++        return Promise.all([load(), loadDetail(mission.id)]);
+       }).catch(function (err) { setError(parseApiErrorMessage(err)); })
+         .finally(function () { setBusy(false); });
+     }
++
+     function buttons(m) {
+       const out = [];
+       function add(action, label) {
+-        out.push(h(Button, { key: action, size: "sm", disabled: busy, onClick: function () { act(m, action); } }, label));
++        out.push(h(Button, { key: action, size: "sm", disabled: busy, onClick: function (event) { event.stopPropagation(); act(m, action); } }, label));
+       }
+       if (m.status === "draft" && m.autonomy_level >= 1) add("inspect", "Inspect");
+       if (m.status === "draft" && m.autonomy_level >= 2) add("prepare", "Prepare");
+@@ -599,11 +632,90 @@
+       return out;
+     }
+ 
++    function detailPanel(report) {
++      if (detailLoading && !report) {
++        return h("div", { className: "hermes-kanban-mission-detail hermes-kanban-mission-empty" }, "Loading mission detail…");
++      }
++      if (!report || !report.mission) {
++        return h("div", { className: "hermes-kanban-mission-detail hermes-kanban-mission-empty" }, "Select a mission to inspect its graph, evidence, and recovery state.");
++      }
++      const mission = report.mission;
++      const contract = mission.contract || {};
++      const boundaries = contract.boundaries || {};
++      const links = report.links || [];
++      const parents = {};
++      links.forEach(function (link) {
++        parents[link.child_id] = (parents[link.child_id] || []).concat([link.parent_id]);
++      });
++      const evidence = (report.evidence || []).slice().reverse();
++      const intents = report.open_intents || [];
++      return h("div", { className: "hermes-kanban-mission-detail" },
++        h("div", { className: "hermes-kanban-mission-detail-head" },
++          h("div", null,
++            h("strong", null, "Mission detail"),
++            h("div", { className: "text-xs" }, mission.objective),
++            h("div", { className: "text-xs text-muted-foreground" }, mission.status + " · " + mission.phase + " · L" + mission.autonomy_level + " · risk " + mission.risk_level)),
++          h("code", null, mission.id)),
++        mission.blocked_reason ? h("div", { className: "text-xs text-destructive" }, mission.blocked_reason) : null,
++
++        h("section", { className: "hermes-kanban-mission-section" },
++          h("strong", null, "Outcome and boundaries"),
++          h("p", { className: "text-xs" }, contract.outcome || "—"),
++          h("dl", { className: "hermes-kanban-mission-kv" },
++            h("dt", null, "Project"), h("dd", null, mission.project_id || "—"),
++            h("dt", null, "Repository"), h("dd", null, mission.repo_path || "—"),
++            h("dt", null, "Worktree"), h("dd", null, mission.worktree_path || "not prepared"),
++            h("dt", null, "Branch"), h("dd", null, mission.branch_name || "—"),
++            h("dt", null, "Base"), h("dd", null, (mission.base_commit || "—").slice(0, 12)),
++            h("dt", null, "Rollback ref"), h("dd", null, mission.rollback_ref || "—"),
++            h("dt", null, "Verified commit"), h("dd", null, (mission.verified_commit || "—").slice(0, 12))),
++          h("div", { className: "hermes-kanban-mission-subhead" }, "Verification commands"),
++          (contract.verification || []).map(function (command) { return h("code", { key: command, className: "hermes-kanban-mission-code" }, command); }),
++          h("div", { className: "hermes-kanban-mission-subhead" }, "Allowed scope"),
++          h("div", { className: "text-xs text-muted-foreground" },
++            "roots: " + ((boundaries.allowed_roots || []).join(", ") || "—"), h("br"),
++            "paths: " + ((boundaries.allowed_paths || []).join(", ") || "—"), h("br"),
++            "network: " + ((boundaries.network_destinations || []).join(", ") || "offline only"))),
++
++        h("section", { className: "hermes-kanban-mission-section" },
++          h("div", { className: "hermes-kanban-mission-section-title" },
++            h("strong", null, "Task dependency graph"),
++            h("span", null, (report.tasks || []).length + " tasks · " + links.length + " links")),
++          (report.tasks || []).length ? (report.tasks || []).map(function (task) {
++            return h("div", { className: "hermes-kanban-mission-task", key: task.id },
++              h("div", null, h("strong", null, task.title), h("span", null, task.status + " · " + (task.mission_role || "task"))),
++              h("code", null, task.id + (parents[task.id] && parents[task.id].length ? " ← " + parents[task.id].join(", ") : " · root")));
++          }) : h("span", { className: "text-xs text-muted-foreground" }, "No task graph has been planned.")),
++
++        h("section", { className: "hermes-kanban-mission-section" },
++          h("div", { className: "hermes-kanban-mission-section-title" },
++            h("strong", null, "Evidence ledger"),
++            h("span", { className: report.evidence_chain_valid ? "hermes-kanban-good" : "text-destructive" },
++              (report.evidence_chain_valid ? "hash chain valid" : "HASH CHAIN INVALID") + " · " + evidence.length + " records")),
++          h("div", { className: "hermes-kanban-mission-evidence" },
++            evidence.length ? evidence.map(function (item) {
++              return h("div", { className: "hermes-kanban-mission-evidence-row", key: item.id },
++                h("div", null, h("strong", null, item.kind), h("span", null, item.status), h("code", null, (item.record_hash || "").slice(0, 10))),
++                item.command ? h("code", null, item.command + (item.exit_code == null ? "" : " · exit " + item.exit_code)) : null,
++                item.task_id ? h("span", { className: "text-muted-foreground" }, "task " + item.task_id) : null);
++            }) : h("span", { className: "text-xs text-muted-foreground" }, "No evidence recorded."))),
++
++        h("section", { className: "hermes-kanban-mission-section" },
++          h("div", { className: "hermes-kanban-mission-section-title" },
++            h("strong", null, "Recovery state"),
++            h("span", { className: intents.length ? "text-destructive" : "hermes-kanban-good" },
++              intents.length ? intents.length + " unresolved mutation intents" : "no unresolved mutation intents")),
++          intents.length ? intents.map(function (intent) {
++            return h("div", { className: "hermes-kanban-mission-intent", key: intent.id },
++              h("strong", null, intent.action), " · task " + intent.task_id + " · intent " + intent.id,
++              intent.checkpoint_ref ? h("code", null, "checkpoint " + intent.checkpoint_ref) : null);
++          }) : h("p", { className: "text-xs text-muted-foreground" }, "Reconcile is safe after a restart; rollback remains isolated to the mission worktree.")));
++    }
++
+     return h("section", { className: "hermes-kanban-missions" },
+       h("div", { className: "hermes-kanban-missions-head" },
+         h("div", null, h("strong", null, "Project Autopilot"), h("span", null, " Evidence-gated repository missions")),
+-        h(Button, { size: "sm", onClick: function () { setOpen(function (v) { return !v; }); } }, open ? "Hide missions" : "Missions"),
+-      ),
++        h(Button, { size: "sm", onClick: function () { setOpen(function (v) { return !v; }); } }, open ? "Hide missions" : "Missions")),
+       open ? h("div", { className: "hermes-kanban-missions-grid" },
+         h("div", { className: "hermes-kanban-mission-create" },
+           h("strong", null, "Create mission"),
+@@ -616,21 +728,21 @@
+           form.autonomy === "4" ? h("label", { className: "text-xs" },
+             h("input", { type: "checkbox", checked: Boolean(form.allowCommit), onChange: function (e) { setForm(Object.assign({}, form, { allowCommit: e.target.checked })); } }),
+             " Permit a verified local commit") : null,
+-          h(Button, { disabled: busy, onClick: create }, busy ? "Working…" : "Create draft"),
+-        ),
++          h(Button, { disabled: busy, onClick: create }, busy ? "Working…" : "Create mission")),
+         h("div", { className: "hermes-kanban-mission-list" },
+           missions.length ? missions.map(function (m) {
+-            return h("article", { key: m.id, className: "hermes-kanban-mission-card" },
++            return h("article", {
++              key: m.id,
++              className: "hermes-kanban-mission-card" + (m.id === selectedId ? " hermes-kanban-mission-card--selected" : ""),
++              onClick: function () { setSelectedId(m.id); },
++            },
+               h("div", { className: "hermes-kanban-mission-title" }, h("strong", null, m.objective), h(Badge, null, m.status + " · L" + m.autonomy_level)),
+               m.blocked_reason ? h("div", { className: "text-xs text-destructive" }, m.blocked_reason) : null,
+               m.verified_commit ? h("code", null, m.verified_commit.slice(0, 12)) : null,
+-              h("div", { className: "hermes-kanban-mission-actions" }, buttons(m)),
+-            );
+-          }) : h("span", { className: "text-xs text-muted-foreground" }, "No missions on this board."),
+-        ),
+-        error ? h("div", { className: "text-xs text-destructive" }, error) : null,
+-      ) : null,
+-    );
++              h("div", { className: "hermes-kanban-mission-actions" }, buttons(m)));
++          }) : h("span", { className: "text-xs text-muted-foreground" }, "No missions on this board.")),
++        detailPanel(detail),
++        error ? h("div", { className: "text-xs text-destructive hermes-kanban-mission-error" }, error) : null) : null);
+   }
+ 
+   function KanbanPage() {
+diff --git a/plugins/kanban/dashboard/dist/style.css b/plugins/kanban/dashboard/dist/style.css
+index 85b555d72..f388e0331 100644
+--- a/plugins/kanban/dashboard/dist/style.css
++++ b/plugins/kanban/dashboard/dist/style.css
+@@ -1609,7 +1609,7 @@
+ .hermes-kanban-missions-head span { margin-left: 0.5rem; color: var(--color-muted-foreground); font-size: 0.75rem; }
+ .hermes-kanban-missions-grid {
+   display: grid;
+-  grid-template-columns: minmax(15rem, 0.8fr) minmax(18rem, 1.2fr);
++  grid-template-columns: minmax(14rem, 0.65fr) minmax(18rem, 0.85fr) minmax(24rem, 1.5fr);
+   gap: 0.75rem;
+   margin-top: 0.75rem;
+ }
+@@ -1635,6 +1635,57 @@ textarea.hermes-kanban-mission-input { min-height: 4rem; resize: vertical; }
+ }
+ .hermes-kanban-mission-title { justify-content: space-between; font-size: 0.75rem; }
+ .hermes-kanban-mission-actions { flex-wrap: wrap; }
++.hermes-kanban-mission-card { cursor: pointer; transition: border-color 120ms ease, background 120ms ease; }
++.hermes-kanban-mission-card:hover { background: color-mix(in srgb, var(--color-primary) 4%, transparent); }
++.hermes-kanban-mission-card--selected {
++  border-color: var(--color-ring, var(--color-primary));
++  background: color-mix(in srgb, var(--color-primary) 7%, transparent);
++}
++.hermes-kanban-mission-detail {
++  min-height: 26rem;
++  max-height: 68vh;
++  overflow: auto;
++  display: flex;
++  flex-direction: column;
++  gap: 0.65rem;
++  border: 1px solid var(--color-border);
++  border-radius: calc(var(--radius) - 2px);
++  padding: 0.7rem;
++}
++.hermes-kanban-mission-empty { align-items: center; justify-content: center; color: var(--color-muted-foreground); font-size: 0.75rem; }
++.hermes-kanban-mission-detail-head,
++.hermes-kanban-mission-section-title,
++.hermes-kanban-mission-task > div,
++.hermes-kanban-mission-evidence-row > div {
++  display: flex;
++  align-items: center;
++  gap: 0.45rem;
++  justify-content: space-between;
++}
++.hermes-kanban-mission-detail-head code { font-size: 0.65rem; }
++.hermes-kanban-mission-section {
++  border: 1px solid var(--color-border);
++  border-radius: calc(var(--radius) - 3px);
++  padding: 0.6rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.4rem;
++}
++.hermes-kanban-mission-section-title span { color: var(--color-muted-foreground); font-size: 0.65rem; }
++.hermes-kanban-mission-kv { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: 0.2rem 0.5rem; font-size: 0.65rem; }
++.hermes-kanban-mission-kv dt { color: var(--color-muted-foreground); }
++.hermes-kanban-mission-kv dd { margin: 0; overflow-wrap: anywhere; }
++.hermes-kanban-mission-subhead { margin-top: 0.3rem; font-size: 0.65rem; font-weight: 600; }
++.hermes-kanban-mission-code { display: block; font-size: 0.65rem; overflow-wrap: anywhere; }
++.hermes-kanban-mission-task { border-radius: 4px; background: color-mix(in srgb, var(--color-primary) 4%, transparent); padding: 0.4rem 0.5rem; font-size: 0.65rem; }
++.hermes-kanban-mission-task code { color: var(--color-muted-foreground); font-size: 0.6rem; }
++.hermes-kanban-mission-evidence { max-height: 15rem; overflow: auto; display: flex; flex-direction: column; gap: 0.35rem; }
++.hermes-kanban-mission-evidence-row { border-left: 2px solid var(--color-border); padding-left: 0.45rem; font-size: 0.65rem; display: flex; flex-direction: column; gap: 0.15rem; }
++.hermes-kanban-mission-evidence-row code { overflow-wrap: anywhere; }
++.hermes-kanban-mission-intent { border-radius: 4px; background: color-mix(in srgb, var(--color-destructive) 6%, transparent); padding: 0.45rem; font-size: 0.65rem; }
++.hermes-kanban-mission-intent code { display: block; margin-top: 0.2rem; }
++.hermes-kanban-good { color: #22a06b; }
++.hermes-kanban-mission-error { grid-column: 1 / -1; }
+ @media (max-width: 760px) {
+   .hermes-kanban-missions-grid { grid-template-columns: 1fr; }
+   .hermes-kanban-missions-head span { display: none; }
+diff --git a/scripts/evaluate_project_autopilot.py b/scripts/evaluate_project_autopilot.py
+index feb8a5925..cc056161f 100755
+--- a/scripts/evaluate_project_autopilot.py
++++ b/scripts/evaluate_project_autopilot.py
+@@ -30,22 +30,32 @@ SCENARIOS = (
+     ("graph_mutation_prevention", "tests/hermes_cli/test_mission_graph_integrity.py::test_generic_kanban_structural_mutators_reject_mission_cards", True, 0),
+     ("sandbox_escape_prevention", "tests/tools/test_mission_docker_scope.py::test_mission_config_scrubs_profile_docker_escape_vectors", True, 0),
+     ("network_scope_prevention", "tests/hermes_cli/test_missions.py::test_execution_rejects_unenforceable_network_scope", True, 0),
++    ("gateway_action_replay_prevention", "tests/hermes_cli/test_mission_gateway.py::test_authorized_action_is_one_use_and_records_evidence", True, 1),
++    ("gateway_operator_binding", "tests/hermes_cli/test_mission_gateway.py::test_cross_identity_rejection_does_not_consume_token", True, 0),
++    ("gateway_expiry_fail_closed", "tests/hermes_cli/test_mission_gateway.py::test_expired_and_malformed_tokens_fail_closed", True, 0),
++    ("mission_detail_surface_contract", "tests/plugins/test_kanban_missions.py::test_create_list_and_lifecycle_actions", False, 0),
+ )
+ 
+ 
+ def main() -> int:
++    root = Path(__file__).resolve().parents[1]
++    default_python = root / "venv" / "bin" / "python"
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--output", type=Path, help="Write the JSON report to this path")
+-    parser.add_argument("--pytest", default=sys.executable, help="Python executable containing pytest")
++    parser.add_argument(
++        "--pytest",
++        type=Path,
++        default=default_python if default_python.is_file() else Path(sys.executable),
++        help="Python executable containing pytest (defaults to the repository venv)",
++    )
+     args = parser.parse_args()
+ 
+-    root = Path(__file__).resolve().parents[1]
+     results: list[dict[str, object]] = []
+     started = time.monotonic()
+     for name, nodeid, safety_critical, human_interventions in SCENARIOS:
+         scenario_started = time.monotonic()
+         proc = subprocess.run(
+-            [args.pytest, "-m", "pytest", "-q", nodeid],
++            [str(args.pytest), "-m", "pytest", "-q", nodeid],
+             cwd=root,
+             text=True,
+             stdout=subprocess.PIPE,
+@@ -70,6 +80,7 @@ def main() -> int:
+     report = {
+         "suite": "Hermes Project Autopilot v1",
+         "schema_version": 1,
++        "python_executable": str(args.pytest),
+         "scenario_count": len(results),
+         "passed": len(results) - len(failed),
+         "failed": len(failed),
+diff --git a/tests/gateway/test_mission_gateway_actions.py b/tests/gateway/test_mission_gateway_actions.py
+new file mode 100644
+index 000000000..d65438663
+--- /dev/null
++++ b/tests/gateway/test_mission_gateway_actions.py
+@@ -0,0 +1,147 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.config import Platform, PlatformConfig
++from gateway.platforms.base import MessageEvent
++from gateway.relay.adapter import RelayAdapter
++from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
++from gateway.session import SessionSource
++from hermes_cli.mission_gateway import MissionActionToken
++from tests.gateway.relay.stub_connector import StubConnector
++
++
++def _mission(status: str = "awaiting_approval"):
++    return SimpleNamespace(
++        id="m_123456789abc",
++        status=status,
++        autonomy_level=3,
++        objective="Approve the verified local commit",
++        blocked_reason=None,
++        updated_at=100,
++    )
++
++
++def _actions():
++    return [
++        MissionActionToken("approve", "Approve commit gate", "primary", "ma1.ZGVmYXVsdA.secretsecretsecretsecret"),
++        MissionActionToken("deny", "Deny commit", "danger", "ma1.ZGVmYXVsdA.othersecretsecretsecret"),
++    ]
++
++
++def _relay():
++    descriptor = CapabilityDescriptor(
++        contract_version=CONTRACT_VERSION,
++        platform="telegram",
++        label="Telegram",
++        max_message_length=4096,
++        supports_draft_streaming=False,
++        supports_edit=True,
++        supports_threads=True,
++        markdown_dialect="markdown_v2",
++        len_unit="utf16",
++        supported_ops=("send", "prompt"),
++    )
++    stub = StubConnector(descriptor)
++    return RelayAdapter(PlatformConfig(), descriptor, transport=stub), stub
++
++
++@pytest.mark.asyncio
++async def test_relay_mission_actions_use_durable_tokens_without_memory_registry():
++    adapter, stub = _relay()
++    result = await adapter.send_mission_actions("chat-1", _mission(), _actions())
++
++    assert result.success
++    prompt = stub.sent[-1]
++    assert prompt["op"] == "prompt"
++    assert prompt["prompt_kind"] == "approval"
++    assert [option["id"] for option in prompt["options"]] == [item.token for item in _actions()]
++    assert prompt["prompt_id"].startswith("mission-")
++    assert prompt["prompt_id"] not in adapter._pending_prompts
++
++
++@pytest.mark.asyncio
++async def test_relay_mission_callback_consumes_durable_token(monkeypatch):
++    adapter, stub = _relay()
++    calls = []
++
++    def resolve(token, identity):
++        calls.append((token, identity))
++        return {
++            "mission_id": "m_123456789abc",
++            "action": "approve",
++            "status": "committing",
++        }
++
++    monkeypatch.setattr("hermes_cli.mission_gateway.resolve_action_token", resolve)
++    event = MessageEvent(
++        text="Approve",
++        source=SessionSource(
++            platform=Platform.TELEGRAM,
++            chat_id="chat-1",
++            chat_type="dm",
++            user_id="user-1",
++        ),
++        prompt_response={"prompt_id": "mission-abc", "option_id": _actions()[0].token},
++    )
++
++    assert await adapter._consume_prompt_response(event) is True
++    assert calls[0][0] == _actions()[0].token
++    assert calls[0][1].principal_id == "user-1"
++    assert stub.sent[-1]["op"] == "send"
++    assert "committing" in stub.sent[-1]["content"]
++
++
++def test_qq_mission_keyboard_uses_opaque_token_payloads():
++    from gateway.platforms.qqbot.keyboards import (
++        build_mission_action_keyboard,
++        parse_mission_action_button_data,
++    )
++
++    keyboard = build_mission_action_keyboard(_actions()).to_dict()
++    buttons = keyboard["content"]["rows"][0]["buttons"]
++    assert len(buttons) == 2
++    payload = buttons[0]["action"]["data"]
++    assert parse_mission_action_button_data(payload) == _actions()[0].token
++    assert parse_mission_action_button_data("approve:session:allow-once") is None
++
++
++@pytest.mark.asyncio
++async def test_gateway_mission_action_command_resolves_current_operator(monkeypatch):
++    from gateway.run import GatewayRunner
++
++    runner = object.__new__(GatewayRunner)
++    runner._active_profile_name = lambda: "default"
++    runner._thread_metadata_for_source = lambda *_args: {}
++    runner._reply_anchor_for_event = lambda _event: None
++    resolved = []
++
++    def resolve(token, identity):
++        resolved.append((token, identity))
++        return {
++            "mission_id": "m_123456789abc",
++            "action": "deny",
++            "status": "blocked",
++        }
++
++    monkeypatch.setattr("hermes_cli.mission_gateway.resolve_action_token", resolve)
++    event = MessageEvent(
++        text="/mission action ma1.ZGVmYXVsdA.secretsecretsecretsecret",
++        source=SessionSource(
++            platform=Platform.SLACK,
++            chat_id="channel-1",
++            chat_type="group",
++            thread_id="thread-1",
++            user_id="operator-1",
++            scope_id="workspace-1",
++        ),
++    )
++
++    output = await runner._handle_mission_command(event)
++    assert "deny accepted" in output
++    assert resolved[0][1].chat_id == "channel-1"
++    assert resolved[0][1].thread_id == "thread-1"
++    assert resolved[0][1].principal_id == "operator-1"
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index a83d05bb9..46513e1d0 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -1222,3 +1222,37 @@ class TestReadEventsClosedWsGuard:
+         with pytest.raises(RuntimeError):
+             asyncio.run(adapter._read_events())
+ 
++
++
++class TestMissionActionInteraction:
++    @pytest.mark.asyncio
++    async def test_mission_button_resolves_with_group_operator_identity(self, monkeypatch):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++        from gateway.platforms.qqbot.keyboards import parse_interaction_event
++
++        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
++        calls = []
++
++        def resolve(token, identity):
++            calls.append((token, identity))
++            return {"mission_id": "m_123456789abc", "action": "approve", "status": "committing"}
++
++        monkeypatch.setattr("hermes_cli.mission_gateway.resolve_action_token", resolve)
++        event = parse_interaction_event({
++            "id": "interaction-1",
++            "chat_type": 1,
++            "group_openid": "group-1",
++            "group_member_openid": "operator-1",
++            "data": {
++                "resolved": {
++                    "button_data": "mission_action:ma1.ZGVmYXVsdA.secretsecretsecretsecret",
++                },
++            },
++        })
++
++        await adapter._default_interaction_dispatch(event)
++
++        assert calls[0][0].startswith("ma1.")
++        assert calls[0][1].chat_id == "group-1"
++        assert calls[0][1].principal_id == "operator-1"
++        assert calls[0][1].chat_type == "group"
+diff --git a/tests/gateway/test_whatsapp_cloud.py b/tests/gateway/test_whatsapp_cloud.py
+index 5e46c6341..a52e1ef0f 100644
+--- a/tests/gateway/test_whatsapp_cloud.py
++++ b/tests/gateway/test_whatsapp_cloud.py
+@@ -14,6 +14,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import json
++from types import SimpleNamespace
+ from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
+@@ -1400,3 +1401,64 @@ class TestReplyContextResolution:
+         assert event.reply_to_text is None
+         assert event.reply_to_is_own_message is False
+ 
++
++
++class TestMissionActionButtons:
++    @pytest.mark.asyncio
++    async def test_outbound_mission_actions_use_durable_tokens(self):
++        from hermes_cli.mission_gateway import MissionActionToken
++
++        adapter = _make_adapter()
++        adapter._http_client = MagicMock()
++        adapter._http_client.post = AsyncMock(
++            return_value=_mock_httpx_response(200, {"messages": [{"id": "wamid.m1"}]})
++        )
++        mission = SimpleNamespace(
++            id="m_123456789abc",
++            status="awaiting_approval",
++            autonomy_level=3,
++            objective="Approve verified commit",
++            blocked_reason=None,
++        )
++        actions = [
++            MissionActionToken("approve", "Approve commit gate", "primary", "ma1.ZGVmYXVsdA.secretsecretsecretsecret"),
++            MissionActionToken("deny", "Deny commit", "danger", "ma1.ZGVmYXVsdA.othersecretsecretsecret"),
++        ]
++
++        result = await adapter.send_mission_actions("15551234567", mission, actions)
++
++        assert result.success
++        payload = adapter._http_client.post.call_args.kwargs["json"]
++        ids = [button["reply"]["id"] for button in payload["interactive"]["action"]["buttons"]]
++        assert ids == [f"mact:{action.token}" for action in actions]
++
++    @pytest.mark.asyncio
++    async def test_inbound_mission_action_uses_sender_bound_identity(self, monkeypatch):
++        adapter = _make_adapter()
++        adapter._http_client = MagicMock()
++        adapter._http_client.post = AsyncMock(
++            return_value=_mock_httpx_response(200, {"messages": [{"id": "wamid.m2"}]})
++        )
++        calls = []
++
++        def resolve(token, identity):
++            calls.append((token, identity))
++            return {"mission_id": "m_123456789abc", "action": "deny", "status": "blocked"}
++
++        monkeypatch.setattr("hermes_cli.mission_gateway.resolve_action_token", resolve)
++        raw = {
++            "from": "15551234567",
++            "type": "interactive",
++            "interactive": {
++                "type": "button_reply",
++                "button_reply": {
++                    "id": "mact:ma1.ZGVmYXVsdA.secretsecretsecretsecret",
++                    "title": "Deny commit",
++                },
++            },
++        }
++
++        assert await adapter._dispatch_interactive_reply(raw, {}) is True
++        assert calls[0][0].startswith("ma1.")
++        assert calls[0][1].chat_id == "15551234567"
++        assert calls[0][1].principal_id == "15551234567"
+diff --git a/tests/hermes_cli/test_mission_gateway.py b/tests/hermes_cli/test_mission_gateway.py
+new file mode 100644
+index 000000000..14295af34
+--- /dev/null
++++ b/tests/hermes_cli/test_mission_gateway.py
+@@ -0,0 +1,255 @@
++from __future__ import annotations
++
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import mission_gateway as mg
++from hermes_cli import mission_service as service
++from hermes_cli import missions_db as mdb
++
++
++@pytest.fixture
++def gateway_mission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    hermes_home = tmp_path / "hermes"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_home / "kanban"))
++    repo = tmp_path / "project"
++    repo.mkdir()
++    contract = mdb.MissionContract(
++        outcome="Ship a verified change",
++        verification=["true"],
++        constraints=["stay in scope"],
++        boundaries={
++            "allowed_roots": [str(repo)],
++            "allowed_paths": ["app.py"],
++            "network_destinations": [],
++        },
++        stop_when=["scope cannot be enforced"],
++        allow_local_commit=False,
++    )
++    with kb.connect_closing(board="default") as conn:
++        mission_id = mdb.create_mission(
++            conn,
++            objective="Gateway approval test",
++            contract=contract,
++            autonomy_level=3,
++            repo_path=str(repo),
++            board="default",
++        )
++        for status, phase in (
++            ("planning", "planning"),
++            ("ready", "planning"),
++            ("running", "execution"),
++            ("verifying", "verification"),
++            ("awaiting_approval", "approval"),
++        ):
++            mdb.transition_mission(conn, mission_id, status, phase=phase)
++        yield conn, mission_id
++
++
++def _identity(
++    *,
++    platform: str = "telegram",
++    chat_id: str = "chat-1",
++    principal_id: str = "user-1",
++    thread_id: str = "thread-1",
++) -> mg.GatewayIdentity:
++    return mg.GatewayIdentity(
++        platform=platform,
++        chat_id=chat_id,
++        chat_type="group",
++        thread_id=thread_id,
++        principal_id=principal_id,
++        scope_id="workspace-1",
++    )
++
++
++def test_gateway_identity_refuses_anonymous_group_operator():
++    with pytest.raises(mg.MissionGatewayError, match="stable operator identity"):
++        mg.GatewayIdentity(
++            platform="slack",
++            chat_id="channel-1",
++            chat_type="group",
++            principal_id="",
++        ).validated()
++
++
++def test_prompt_claim_is_single_owner_and_redelivers_after_status_change(gateway_mission):
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mg.add_subscription(
++        conn,
++        mission_id,
++        identity,
++        notifier_profile="default",
++        delivery_metadata={"reply_to_message_id": "message-1"},
++    )
++
++    claimed = mg.claim_prompt_candidates(conn, "default")
++    assert len(claimed) == 1
++    assert claimed[0].mission.id == mission_id
++    assert claimed[0].delivery_metadata["reply_to_message_id"] == "message-1"
++    assert mg.claim_prompt_candidates(conn, "default") == []
++
++    assert mg.release_prompt(conn, claimed[0])
++    reclaimed = mg.claim_prompt_candidates(conn, "default")
++    assert len(reclaimed) == 1
++    assert mg.complete_prompt(conn, reclaimed[0])
++    assert mg.claim_prompt_candidates(conn, "default") == []
++
++    service.deny_mission(conn, mission_id)
++    changed = mg.claim_prompt_candidates(conn, "default")
++    assert len(changed) == 1
++    assert changed[0].mission.status == "blocked"
++
++
++def test_authorized_action_is_one_use_and_records_evidence(gateway_mission):
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    tokens = mg.issue_action_tokens(conn, "default", mission, identity)
++    approve = next(item for item in tokens if item.action == "approve")
++
++    result = mg.resolve_action_token(approve.token, identity)
++    assert result == {
++        "board": "default",
++        "mission_id": mission_id,
++        "action": "approve",
++        "status": "committing",
++        "phase": "commit",
++    }
++    assert mdb.get_mission(conn, mission_id).status == "committing"
++    assert any(
++        row["kind"] == "gateway_authorization"
++        and row["status"] == "passed"
++        and row["metadata"]["action"] == "approve"
++        for row in mdb.list_evidence(conn, mission_id)
++    )
++
++    with pytest.raises(mg.MissionGatewayError, match="already used"):
++        mg.resolve_action_token(approve.token, identity)
++
++
++def test_cross_identity_rejection_does_not_consume_token(gateway_mission):
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    approve = next(
++        item
++        for item in mg.issue_action_tokens(conn, "default", mission, identity)
++        if item.action == "approve"
++    )
++
++    with pytest.raises(mg.MissionGatewayError, match="does not belong"):
++        mg.resolve_action_token(approve.token, _identity(principal_id="attacker"))
++    with pytest.raises(mg.MissionGatewayError, match="does not belong"):
++        mg.resolve_action_token(approve.token, _identity(chat_id="other-chat"))
++
++    assert mg.resolve_action_token(approve.token, identity)["status"] == "committing"
++
++
++def test_expired_and_malformed_tokens_fail_closed(gateway_mission):
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    approve = next(
++        item
++        for item in mg.issue_action_tokens(conn, "default", mission, identity)
++        if item.action == "approve"
++    )
++    conn.execute(
++        "UPDATE mission_gateway_actions SET expires_at=? WHERE token_hash=?",
++        (int(time.time()) - 1, mg._hash_token(approve.token)),
++    )
++    conn.commit()
++
++    with pytest.raises(mg.MissionGatewayError, match="expired"):
++        mg.resolve_action_token(approve.token, identity)
++    row = conn.execute(
++        "SELECT status FROM mission_gateway_actions WHERE token_hash=?",
++        (mg._hash_token(approve.token),),
++    ).fetchone()
++    assert row["status"] == "expired"
++
++    for token in ("", "ma1.bad", "ma1.Li4.secretsecretsecretsecret", "ma1.ZGVmYXVsdA.short"):
++        with pytest.raises(mg.MissionGatewayError):
++            mg.resolve_action_token(token, identity)
++
++
++def test_failed_action_consumes_token_and_records_failure(gateway_mission):
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    approve = next(
++        item
++        for item in mg.issue_action_tokens(conn, "default", mission, identity)
++        if item.action == "approve"
++    )
++    service.deny_mission(conn, mission_id)
++
++    with pytest.raises(mg.MissionGatewayError, match="not awaiting"):
++        mg.resolve_action_token(approve.token, identity)
++    row = conn.execute(
++        "SELECT status FROM mission_gateway_actions WHERE token_hash=?",
++        (mg._hash_token(approve.token),),
++    ).fetchone()
++    assert row["status"] == "failed"
++    assert any(
++        evidence["kind"] == "gateway_authorization"
++        and evidence["status"] == "failed"
++        for evidence in mdb.list_evidence(conn, mission_id)
++    )
++
++
++def test_revoke_pending_tokens_after_failed_delivery(gateway_mission):
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    tokens = mg.issue_action_tokens(conn, "default", mission, identity)
++    assert mg.revoke_action_tokens(conn, tokens) == len(tokens)
++    statuses = {
++        row["status"]
++        for row in conn.execute("SELECT status FROM mission_gateway_actions").fetchall()
++    }
++    assert statuses == {"revoked"}
++
++
++def test_watcher_issues_tokens_only_for_exact_claimed_mission_version(gateway_mission):
++    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
++
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mg.add_subscription(conn, mission_id, identity)
++    candidate = mg.claim_prompt_candidates(conn, "default")[0]
++
++    fresh, tokens = GatewayKanbanWatchersMixin._mission_issue_tokens(candidate)
++    assert fresh is not None
++    assert fresh.id == mission_id
++    assert {token.action for token in tokens} == {"approve", "deny"}
++    assert mg.revoke_action_tokens(conn, tokens) == 2
++
++
++def test_watcher_releases_claim_when_mission_changed_before_delivery(gateway_mission):
++    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
++
++    conn, mission_id = gateway_mission
++    identity = _identity()
++    mg.add_subscription(conn, mission_id, identity)
++    candidate = mg.claim_prompt_candidates(conn, "default")[0]
++    service.deny_mission(conn, mission_id)
++
++    fresh, tokens = GatewayKanbanWatchersMixin._mission_issue_tokens(candidate)
++    assert fresh is None
++    assert tokens == []
++    subscription = mg.list_subscriptions(conn, mission_id)[0]
++    assert subscription["prompt_claim_owner"] is None
++    assert mg.claim_prompt_candidates(conn, "default")[0].mission.status == "blocked"
+diff --git a/tests/plugins/test_kanban_missions.py b/tests/plugins/test_kanban_missions.py
+index 6e44f462e..c4b0de20d 100644
+--- a/tests/plugins/test_kanban_missions.py
++++ b/tests/plugins/test_kanban_missions.py
+@@ -60,6 +60,14 @@ def test_create_list_and_lifecycle_actions(api):
+     mid = created.json()["mission_id"]
+     listed = client.get("/api/plugins/kanban/missions").json()["missions"]
+     assert listed[0]["id"] == mid
++    detail = client.get(f"/api/plugins/kanban/missions/{mid}")
++    assert detail.status_code == 200
++    report = detail.json()
++    assert report["mission"]["id"] == mid
++    assert report["mission"]["contract"]["outcome"] == "Value updated"
++    assert report["evidence_chain_valid"] is True
++    assert report["tasks"]
++    assert {"links", "evidence", "open_intents"} <= report.keys()
+     prepared = client.post(
+         f"/api/plugins/kanban/missions/{mid}/actions", json={"action": "prepare"},
+     )
+diff --git a/website/docs/user-guide/features/project-autopilot.md b/website/docs/user-guide/features/project-autopilot.md
+index 300c0f490..09d87ca3b 100644
+--- a/website/docs/user-guide/features/project-autopilot.md
++++ b/website/docs/user-guide/features/project-autopilot.md
+@@ -62,4 +62,32 @@ The command returns success only when every acceptance scenario passes and the r
+ 
+ ## Gateway action routing
+ 
+-Text commands are available on every gateway platform through `/mission …`. Native chat buttons are intentionally not enabled until a mission records an authenticated originating chat and operator. Without that durable route, a callback cannot prove which user and conversation are authorized to approve a commit after a gateway restart. This remains a release item rather than using an in-memory or unsigned callback shortcut.
++Running a gateway `/mission` command for one mission automatically subscribes the exact requesting platform, chat, thread, and operator to that mission. Use `/mission watch <mission-id>` to subscribe explicitly and `/mission unwatch <mission-id>` to remove the route.
++
++When the mission reaches `awaiting_approval`, `blocked`, `waiting_for_user`, or `committing`, the gateway sends the actions that are valid for that state. Relay-based Telegram, Discord, Slack, Matrix, and Feishu connectors, WhatsApp Cloud, and QQ render native buttons. Other adapters receive a text fallback containing the same one-use action capabilities.
++
++Each action capability:
++
++- is random and opaque;
++- is stored only as a SHA-256 hash in the board database;
++- is bound to the board, mission, action, platform, chat, thread, workspace or guild scope, and exact operator identity;
++- expires after 15 minutes;
++- can be claimed once through an atomic database update;
++- rejects replay, stale, cross-user, cross-chat, and cross-thread use;
++- records only a short token-hash prefix in mission evidence.
++
++The public fallback command is `/mission action <button-token>`. Copying that command to another user or conversation does not transfer authority because the resolver rechecks the current message source against the durable binding.
++
++## Detailed mission surfaces
++
++The native terminal Mission Center (`/missions`), desktop Mission Center, and browser Kanban dashboard all consume the same mission report. The desktop and browser detail panels show:
++
++- the mission contract, verification commands, and enforceable roots, paths, and network scope;
++- repository, isolated worktree, branch, base commit, rollback ref, and verified commit;
++- every controller, planner, executor, and verifier task plus dependency edges;
++- the complete evidence ledger with status, command exit code, task association, and record-hash prefix;
++- evidence-chain validity as a first-class pass/fail signal;
++- unresolved mutation intents and their checkpoint anchors;
++- current blockers and the same shared lifecycle/recovery actions used by CLI and TUI.
++
++Clients never implement mission policy locally. They call the existing detail and action endpoints, while the mission service remains the only state-transition authority.

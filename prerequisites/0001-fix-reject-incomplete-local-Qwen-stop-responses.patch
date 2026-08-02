@@ -1,0 +1,1179 @@
+From d8de415491a4935ad54021d10b2cc18f2c3d356b Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 14:19:30 -0700
+Subject: [PATCH] fix: reject incomplete local Qwen stop responses
+
+---
+ agent/chat_completion_helpers.py              |  25 +-
+ agent/conversation_loop.py                    |  97 ++++++-
+ agent/transports/chat_completions.py          |  16 +
+ agent/turn_context.py                         |   1 +
+ .../hooks/use-message-stream/gateway-event.ts |   7 +
+ .../session/hooks/use-message-stream/index.ts |  36 +++
+ .../use-message-stream/stream-flush.test.tsx  |  34 +++
+ apps/desktop/src/lib/chat-messages.ts         |   2 +
+ apps/desktop/src/lib/gateway-events.ts        |   1 +
+ apps/shared/src/json-rpc-gateway.ts           |   1 +
+ cli.py                                        |  16 +
+ gateway/platforms/api_server.py               |  27 +-
+ run_agent.py                                  | 118 ++++++--
+ tests/cli/test_tool_progress_scrollback.py    |  27 ++
+ tests/gateway/test_message_reset_control.py   |  39 +++
+ .../test_incomplete_stop_recovery.py          | 274 ++++++++++++++++++
+ tests/test_tui_gateway_server.py              |  25 ++
+ tui_gateway/server.py                         |   7 +
+ ui-tui/README.md                              |   1 +
+ .../createGatewayEventHandler.test.ts         |  22 ++
+ ui-tui/src/app/createGatewayEventHandler.ts   |   6 +
+ ui-tui/src/app/turnController.ts              |  21 ++
+ ui-tui/src/gatewayTypes.ts                    |   1 +
+ 23 files changed, 781 insertions(+), 23 deletions(-)
+ create mode 100644 tests/gateway/test_message_reset_control.py
+ create mode 100644 tests/run_agent/test_incomplete_stop_recovery.py
+
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 1c49a59e2..6967c803b 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -3022,6 +3022,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+         _last_id_at_idx: dict = {}      # raw_index -> last seen non-empty id
+         _active_slot_by_idx: dict = {}  # raw_index -> current slot in tool_calls_acc
+         finish_reason = None
++        stop_reason = None
++        last_token_id = None
+         model_name = None
+         role = "assistant"
+         reasoning_parts: list = []
+@@ -3108,6 +3110,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                             "tool_calls": tool_calls or None,
+                         },
+                         "finish_reason": finish_reason or "stop",
++                        "stop_reason": stop_reason,
++                        "token_ids": [last_token_id] if last_token_id is not None else None,
+                     }
+                 ],
+                 "usage": usage_obj,
+@@ -3312,8 +3316,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                         # discarding the attempted action.
+                         result["partial_tool_names"].append(name)
+ 
+-            if chunk.choices[0].finish_reason:
+-                finish_reason = chunk.choices[0].finish_reason
++            _choice = chunk.choices[0]
++            if _choice.finish_reason:
++                finish_reason = _choice.finish_reason
++            _choice_extra = getattr(_choice, "model_extra", None) or {}
++            _stop_reason = getattr(_choice, "stop_reason", None)
++            if _stop_reason is None and isinstance(_choice_extra, dict):
++                _stop_reason = _choice_extra.get("stop_reason")
++            if _stop_reason is not None:
++                stop_reason = _stop_reason
++            _token_ids = getattr(_choice, "token_ids", None)
++            if _token_ids is None and isinstance(_choice_extra, dict):
++                _token_ids = _choice_extra.get("token_ids")
++            if isinstance(_token_ids, (list, tuple)) and _token_ids:
++                last_token_id = _token_ids[-1]
++            elif _token_ids is not None and not isinstance(_token_ids, (list, tuple)):
++                last_token_id = _token_ids
+ 
+             # Usage in the final chunk
+             if hasattr(chunk, "usage") and chunk.usage:
+@@ -3486,12 +3504,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+             index=0,
+             message=mock_message,
+             finish_reason=effective_finish_reason,
++            stop_reason=stop_reason,
++            token_ids=[last_token_id] if last_token_id is not None else None,
+         )
+         return SimpleNamespace(
+             id="stream-" + str(uuid.uuid4()),
+             model=model_name,
+             choices=[mock_choice],
+             usage=usage_obj,
++            _stream_chunk_count=int(_diag.get("chunks", 0) or 0),
+         )
+ 
+     def _call_anthropic(request_client):
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 3ca96898c..0b0d30c1e 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2639,11 +2639,104 @@ def run_conversation(
+                     _finish_result = _cc_fr.normalize_response(response)
+                     finish_reason = _finish_result.finish_reason
+                     assistant_message = _finish_result
+-                    if agent._should_treat_stop_as_truncated(
++                    _stop_anomaly = agent._classify_suspicious_stop_response(
+                         finish_reason,
+                         assistant_message,
+                         messages,
+-                    ):
++                    )
++                    if _stop_anomaly == "local_qwen_incomplete_stop":
++                        _stop_provider_data = (
++                            getattr(assistant_message, "provider_data", None) or {}
++                        )
++                        from agent.redact import redact_sensitive_text
++
++                        _stop_preview = redact_sensitive_text(
++                            (getattr(assistant_message, "content", None) or "")[-240:],
++                            force=True,
++                        )
++                        if agent._incomplete_stop_retries < 1:
++                            agent._incomplete_stop_retries += 1
++                            logger.warning(
++                                "Rejected suspicious local Qwen stop; retrying once "
++                                "without persisting partial text "
++                                "(stop_reason=%r last_token_id=%r chunks=%r preview=%r)",
++                                _stop_provider_data.get("stop_reason"),
++                                _stop_provider_data.get("last_token_id"),
++                                _stop_provider_data.get("stream_chunk_count"),
++                                _stop_preview,
++                            )
++                            if agent.tool_progress_callback:
++                                try:
++                                    agent.tool_progress_callback(
++                                        "message.reset",
++                                        None,
++                                        None,
++                                        None,
++                                        reason="incomplete_stop_retry",
++                                    )
++                                except Exception:
++                                    logger.debug(
++                                        "Failed to emit message.reset for incomplete-stop retry",
++                                        exc_info=True,
++                                    )
++                            agent._emit_status(
++                                "↻ Local model stopped mid-response — retrying once "
++                                "with a fresh connection."
++                            )
++                            agent._close_cached_request_openai_client(
++                                reason="incomplete_stop_retry"
++                            )
++                            continue
++
++                        logger.error(
++                            "Local Qwen returned a second suspicious stop; "
++                            "rejecting partial output "
++                            "(stop_reason=%r last_token_id=%r chunks=%r preview=%r)",
++                            _stop_provider_data.get("stop_reason"),
++                            _stop_provider_data.get("last_token_id"),
++                            _stop_provider_data.get("stream_chunk_count"),
++                            _stop_preview,
++                        )
++                        if agent._has_pending_fallback():
++                            agent._buffer_status(
++                                "⚠️ Local model stopped mid-response twice — "
++                                "switching to fallback..."
++                            )
++                        if agent._try_activate_fallback():
++                            active_system_prompt = _sync_failover_system_message(
++                                agent, api_messages, active_system_prompt
++                            )
++                            agent._incomplete_stop_retries = 0
++                            retry_count = 0
++                            compression_attempts = 0
++                            _retry.primary_recovery_attempted = False
++                            continue
++
++                        _failure_text = (
++                            "⚠️ Hermes rejected two incomplete local-model "
++                            "responses. The partial text was not saved or used "
++                            "as conversation history. Retry in a fresh turn or "
++                            "configure a fallback model."
++                        )
++                        messages.append(
++                            {
++                                "role": "assistant",
++                                "content": _failure_text,
++                                "finish_reason": "incomplete_stop_rejected",
++                                "_provider_failure_sentinel": True,
++                            }
++                        )
++                        agent._cleanup_task_resources(effective_task_id)
++                        agent._persist_session(messages, conversation_history)
++                        return {
++                            "final_response": _failure_text,
++                            "messages": messages,
++                            "api_calls": api_call_count,
++                            "completed": False,
++                            "partial": True,
++                            "error": "repeated_incomplete_stop",
++                        }
++                    elif _stop_anomaly == "ollama_glm_stop_misreport":
+                         agent._vprint(
+                             f"{agent.log_prefix}⚠️  Treating suspicious Ollama/GLM stop response as truncated",
+                             force=True,
+diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
+index 07f767367..34891f119 100644
+--- a/agent/transports/chat_completions.py
++++ b/agent/transports/chat_completions.py
+@@ -717,6 +717,22 @@ class ChatCompletionsTransport(ProviderTransport):
+                 reasoning_content = model_extra["reasoning_content"]
+ 
+         provider_data: Dict[str, Any] = {}
++        _choice_extra = getattr(choice, "model_extra", None) or {}
++        stop_reason = getattr(choice, "stop_reason", None)
++        if stop_reason is None and isinstance(_choice_extra, dict):
++            stop_reason = _choice_extra.get("stop_reason")
++        if stop_reason is not None:
++            provider_data["stop_reason"] = stop_reason
++        token_ids = getattr(choice, "token_ids", None)
++        if token_ids is None and isinstance(_choice_extra, dict):
++            token_ids = _choice_extra.get("token_ids")
++        if isinstance(token_ids, (list, tuple)) and token_ids:
++            provider_data["last_token_id"] = token_ids[-1]
++        elif token_ids is not None and not isinstance(token_ids, (list, tuple)):
++            provider_data["last_token_id"] = token_ids
++        stream_chunk_count = getattr(response, "_stream_chunk_count", None)
++        if stream_chunk_count is not None:
++            provider_data["stream_chunk_count"] = stream_chunk_count
+         if reasoning_content is not None:
+             provider_data["reasoning_content"] = reasoning_content
+         rd = getattr(msg, "reasoning_details", None)
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index e080d6a5d..781619f31 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -457,6 +457,7 @@ def build_turn_context(
+     agent._invalid_json_retries = 0
+     agent._empty_content_retries = 0
+     agent._incomplete_scratchpad_retries = 0
++    agent._incomplete_stop_retries = 0
+     agent._codex_incomplete_retries = 0
+     agent._thinking_prefill_retries = 0
+     agent._post_tool_empty_retried = False
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts
+index 5970b8a07..c4a01d995 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts
+@@ -175,6 +175,7 @@ interface GatewayEventDeps {
+   finalizeInterimAssistantMessage: (sessionId: string, text: string) => void
+   queryClient: QueryClient
+   refreshHermesConfig: () => Promise<void>
++  resetAssistantDraft: (sessionId: string) => void
+   sessionInterrupted: (sessionId: string) => boolean
+   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
+   updateSessionState: (
+@@ -206,6 +207,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
+     finalizeInterimAssistantMessage,
+     queryClient,
+     refreshHermesConfig,
++    resetAssistantDraft,
+     sessionInterrupted,
+     sessionStateByRuntimeIdRef,
+     updateSessionState,
+@@ -548,6 +550,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
+         if (isActiveEvent) {
+           setTurnStartedAt(Date.now())
+         }
++      } else if (event.type === 'message.reset') {
++        if (sessionId) {
++          resetAssistantDraft(sessionId)
++        }
+       } else if (event.type === 'message.delta') {
+         if (sessionId) {
+           appendAssistantDelta(sessionId, coerceGatewayText(payload?.text))
+@@ -1180,6 +1186,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
+       nativeSubagentSessionsRef,
+       queryClient,
+       scheduleConfigRefresh,
++      resetAssistantDraft,
+       sessionInterrupted,
+       sessionStateByRuntimeIdRef,
+       updateSessionState,
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+index 7aa89a8cf..170a498c2 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+@@ -316,6 +316,41 @@ export function useMessageStream({
+     [flushQueuedDeltas]
+   )
+ 
++  const resetAssistantDraft = useCallback(
++    (sessionId: string) => {
++      // A rejected provider attempt may have deltas waiting in the coalescing
++      // queue as well as text already rendered in the pending stream message.
++      // Delete both, but preserve tool/image parts and sealed interim bubbles.
++      queuedDeltasRef.current.delete(sessionId)
++
++      updateSessionState(sessionId, state => {
++        const streamId = state.streamId
++
++        if (!streamId) {
++          return { ...state, sawAssistantPayload: false }
++        }
++
++        const messages = state.messages.flatMap(message => {
++          if (message.id !== streamId || !message.pending) {
++            return [message]
++          }
++
++          const parts = message.parts.filter(part => part.type !== 'text' && part.type !== 'reasoning')
++
++          return parts.length ? [{ ...message, parts }] : []
++        })
++
++        return {
++          ...state,
++          messages,
++          sawAssistantPayload: false,
++          interimBoundaryPending: false
++        }
++      })
++    },
++    [updateSessionState]
++  )
++
+   const appendAssistantDelta = useCallback(
+     (sessionId: string, delta: string) => {
+       if (!delta) {
+@@ -680,6 +715,7 @@ export function useMessageStream({
+     finalizeInterimAssistantMessage,
+     queryClient,
+     refreshHermesConfig,
++    resetAssistantDraft,
+     sessionInterrupted,
+     sessionStateByRuntimeIdRef,
+     updateSessionState,
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/stream-flush.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/stream-flush.test.tsx
+index 427e62cf8..0e4bb5752 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/stream-flush.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/stream-flush.test.tsx
+@@ -57,6 +57,40 @@ describe('stream delta delivery', () => {
+     vi.restoreAllMocks()
+   })
+ 
++  it('drops a rejected assistant draft before accepting retry deltas', async () => {
++    vi.useFakeTimers()
++    render(<Harness />)
++    await act(async () => {
++      await Promise.resolve()
++    })
++
++    act(() =>
++      handleEvent?.({ payload: { text: 'Step 2. Now let me build th' }, session_id: SID, type: 'message.delta' })
++    )
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(STREAM_DELTA_FLUSH_MS)
++    })
++    expect(states.get(SID)?.messages.at(-1)?.parts).toEqual([{ type: 'text', text: 'Step 2. Now let me build th' }])
++
++    act(() =>
++      handleEvent?.({
++        payload: { reason: 'incomplete_stop_retry' },
++        session_id: SID,
++        type: 'message.reset'
++      } as RpcEvent)
++    )
++    expect(states.get(SID)?.messages.some(message => message.parts.some(part => part.type === 'text'))).toBe(false)
++
++    act(() =>
++      handleEvent?.({ payload: { text: 'The verified bridge is ready.' }, session_id: SID, type: 'message.delta' })
++    )
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(STREAM_DELTA_FLUSH_MS)
++    })
++
++    expect(states.get(SID)?.messages.at(-1)?.parts).toEqual([{ type: 'text', text: 'The verified bridge is ready.' }])
++  })
++
+   it('delivers a delta while animation frames are parked', async () => {
+     // An Electron renderer the compositor has parked: rAF accepts the callback
+     // but never runs it. A frame-gated flush strands the answer here until some
+diff --git a/apps/desktop/src/lib/chat-messages.ts b/apps/desktop/src/lib/chat-messages.ts
+index f50f4ed55..2a833db19 100644
+--- a/apps/desktop/src/lib/chat-messages.ts
++++ b/apps/desktop/src/lib/chat-messages.ts
+@@ -122,6 +122,8 @@ export type GatewayEventPayload = {
+   // with FailoverReason.billing (shape mirrors @hermes/shared BillingBlock).
+   billing?: BillingBlock
+   failure_reason?: string
++  // message.reset — presentation-only discard of a rejected provider draft.
++  reason?: string
+ }
+ 
+ export function textPart(text: string): ChatMessagePart {
+diff --git a/apps/desktop/src/lib/gateway-events.ts b/apps/desktop/src/lib/gateway-events.ts
+index 005e79705..3152a8365 100644
+--- a/apps/desktop/src/lib/gateway-events.ts
++++ b/apps/desktop/src/lib/gateway-events.ts
+@@ -23,6 +23,7 @@ const UNSCOPED_STREAM_EVENT_TYPES = new Set([
+   'clarify.request',
+   'error',
+   'message.complete',
++  'message.reset',
+   'message.delta',
+   'message.interim',
+   'message.start',
+diff --git a/apps/shared/src/json-rpc-gateway.ts b/apps/shared/src/json-rpc-gateway.ts
+index 962ba1a9b..357340161 100644
+--- a/apps/shared/src/json-rpc-gateway.ts
++++ b/apps/shared/src/json-rpc-gateway.ts
+@@ -2,6 +2,7 @@ export type GatewayEventName =
+   | 'gateway.ready'
+   | 'session.info'
+   | 'message.start'
++  | 'message.reset'
+   | 'message.delta'
+   | 'message.interim'
+   | 'message.complete'
+diff --git a/cli.py b/cli.py
+index 2b86f9745..afbdd866b 100644
+--- a/cli.py
++++ b/cli.py
+@@ -11651,6 +11651,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+         stacked line to scrollback on tool.completed so users can see the
+         full history of tool calls (not just the current one in the spinner).
+         """
++        if event_type == "message.reset":
++            # Terminal scrollback cannot erase lines already printed. Close any
++            # open visual frame WITHOUT flushing the unfinished tail, reset all
++            # draft buffers, and label the prior draft as discarded so it cannot
++            # be mistaken for the successful retry.
++            if getattr(self, "_reasoning_box_opened", False):
++                w = self._scrollback_box_width()
++                _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
++            if getattr(self, "_stream_box_opened", False):
++                w = self._scrollback_box_width()
++                _cprint(f"{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
++            self._reset_stream_state()
++            _cprint(f"  {_DIM}↻ discarded incomplete provider draft · retrying{_RST}")
++            self._invalidate()
++            return
++
+         # MoA reference-model outputs: render each reference's answer as a
+         # labelled thinking-style block BEFORE the aggregator acts, so the user
+         # sees the mixture-of-agents process instead of a silent pause. These
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 62dff2878..903e6db6e 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -3552,7 +3552,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+ 
+         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
+-            if event_type == "reasoning.available":
++            if event_type == "message.reset":
++                _enqueue("message.reset", {
++                    "message_id": message_id,
++                    "reason": kwargs.get("reason") or "provider_retry",
++                })
++            elif event_type == "reasoning.available":
+                 _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
+             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
+                 event_name = event_type.replace("tool.", "tool.")
+@@ -3900,6 +3905,13 @@ class APIServerAdapter(BasePlatformAdapter):
+                     "status": "running",
+                 }))
+ 
++            def _on_stream_control(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
++                """Forward presentation-only stream controls without duplicating tool events."""
++                if event_type == "message.reset":
++                    _stream_q.put(("__stream_reset__", {
++                        "reason": kwargs.get("reason") or "provider_retry",
++                    }))
++
+             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+                 """Emit the matching ``status: completed`` event.
+ 
+@@ -3931,6 +3943,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 ephemeral_system_prompt=system_prompt,
+                 session_id=session_id,
+                 stream_delta_callback=_on_delta,
++                tool_progress_callback=_on_stream_control,
+                 tool_start_callback=_on_tool_start,
+                 tool_complete_callback=_on_tool_complete,
+                 agent_ref=agent_ref,
+@@ -4123,6 +4136,11 @@ class APIServerAdapter(BasePlatformAdapter):
+                     await response.write(
+                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                     )
++                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__stream_reset__":
++                    event_data = json.dumps(item[1])
++                    await response.write(
++                        f"event: hermes.message.reset\ndata: {event_data}\n\n".encode()
++                    )
+                 else:
+                     content_chunk = {
+                         "id": completion_id, "object": "chat.completion.chunk",
+@@ -6029,6 +6047,13 @@ class APIServerAdapter(BasePlatformAdapter):
+                     "timestamp": ts,
+                     "text": preview or "",
+                 })
++            elif event_type == "message.reset":
++                _push({
++                    "event": "message.reset",
++                    "run_id": run_id,
++                    "timestamp": ts,
++                    "reason": kwargs.get("reason") or "provider_retry",
++                })
+             elif event_type in {"subagent.start", "subagent.complete"}:
+                 event = {
+                     "event": event_type,
+diff --git a/run_agent.py b/run_agent.py
+index a240bb292..cbdcc4593 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1648,36 +1648,114 @@ class AIAgent:
+             return True
+         return provider_lower == "ollama"
+ 
+-    def _should_treat_stop_as_truncated(
++    @staticmethod
++    def _looks_like_incomplete_stop_text(content: str) -> bool:
++        """Return True only for strong evidence that ``stop`` ended mid-response.
++
++        This deliberately avoids a broad "missing punctuation means truncated"
++        rule. Valid answers can be headings, identifiers, paths, or one-word
++        replies. The detector fires only for structural breakage (an unclosed
++        code fence) or an execution-intent tail ending in a connector or tiny
++        word fragment, such as ``Step 2. Now let me build th``.
++        """
++        if not isinstance(content, str):
++            return False
++        stripped = content.rstrip()
++        if len(stripped) < 20 or not re.search(r"\s", stripped):
++            return False
++        if stripped.count("```") % 2:
++            return True
++        if AIAgent._has_natural_response_ending(stripped):
++            return False
++
++        tail = stripped[-360:].lower()
++        intent = re.search(
++            r"(?:\b(?:now\s+)?let\s+me\b|\bi(?:'ll| will)\b|"
++            r"\bnext(?:\s+step)?\b|\bstep\s+\d+\b)",
++            tail,
++        )
++        if not intent:
++            return False
++
++        if re.search(
++            r"\b(?:build|create|write|run|inspect|check|execute|implement|"
++            r"continue|finish|apply|fix|generate|update|verify|test)\s+"
++            r"(?:[a-z]{1,3})$",
++            tail,
++        ):
++            return True
++
++        return bool(
++            re.search(
++                r"\b(?:the|a|an|to|and|or|with|for|of|in|on|from|into|"
++                r"then|because|so)$",
++                tail,
++            )
++        )
++
++    def _is_local_qwen_vllm_backend(self) -> bool:
++        """Identify the narrow local Qwen/OpenAI-compatible recovery path."""
++        if "qwen" not in (self.model or "").lower():
++            return False
++        try:
++            from urllib.parse import urlparse
++
++            host = (urlparse(self.base_url or "").hostname or "").lower()
++        except Exception:
++            return False
++        return host in {"127.0.0.1", "localhost", "::1"}
++
++    def _classify_suspicious_stop_response(
+         self,
+         finish_reason: str,
+         assistant_message,
+         messages: Optional[list] = None,
+-    ) -> bool:
+-        """Detect conservative stop->length misreports for Ollama-hosted GLM models."""
++    ) -> Optional[str]:
++        """Classify a provider ``stop`` that should not be accepted as final."""
+         if finish_reason != "stop" or self.api_mode != "chat_completions":
+-            return False
+-        if not self._is_ollama_glm_backend():
+-            return False
+-        if not any(
+-            isinstance(msg, dict) and msg.get("role") == "tool"
+-            for msg in (messages or [])
+-        ):
+-            return False
++            return None
+         if assistant_message is None or getattr(assistant_message, "tool_calls", None):
+-            return False
++            return None
+ 
+         content = getattr(assistant_message, "content", None)
+         if not isinstance(content, str):
+-            return False
+-
++            return None
+         visible_text = self._strip_think_blocks(content).strip()
+         if not visible_text:
+-            return False
+-        if len(visible_text) < 20 or not re.search(r"\s", visible_text):
+-            return False
++            return None
+ 
+-        return not self._has_natural_response_ending(visible_text)
++        if self._is_ollama_glm_backend():
++            if not any(
++                isinstance(msg, dict) and msg.get("role") == "tool"
++                for msg in (messages or [])
++            ):
++                return None
++            if len(visible_text) < 20 or not re.search(r"\s", visible_text):
++                return None
++            if not self._has_natural_response_ending(visible_text):
++                return "ollama_glm_stop_misreport"
++            return None
++
++        if (
++            self._is_local_qwen_vllm_backend()
++            and self._looks_like_incomplete_stop_text(visible_text)
++        ):
++            return "local_qwen_incomplete_stop"
++        return None
++
++    def _should_treat_stop_as_truncated(
++        self,
++        finish_reason: str,
++        assistant_message,
++        messages: Optional[list] = None,
++    ) -> bool:
++        """Backward-compatible boolean wrapper for the Ollama/GLM path."""
++        return (
++            self._classify_suspicious_stop_response(
++                finish_reason, assistant_message, messages
++            )
++            == "ollama_glm_stop_misreport"
++        )
+ 
+     def _looks_like_codex_intermediate_ack(
+         self,
+@@ -2730,6 +2808,10 @@ class AIAgent:
+                     "content": getattr(assistant_message, "content", None),
+                     "tool_calls": tool_calls,
+                 },
++                "provider_data": getattr(assistant_message, "provider_data", None),
++                "stream": {
++                    "chunk_count": getattr(response, "_stream_chunk_count", None),
++                },
+                 "usage": self._usage_summary_for_api_request_hook(response),
+             }
+         )
+diff --git a/tests/cli/test_tool_progress_scrollback.py b/tests/cli/test_tool_progress_scrollback.py
+index 45ef171bd..5f12ebf39 100644
+--- a/tests/cli/test_tool_progress_scrollback.py
++++ b/tests/cli/test_tool_progress_scrollback.py
+@@ -195,3 +195,30 @@ class TestMoAReferenceBlocks:
+         assert "aggregating" in cli._spinner_text
+         # aggregating is a spinner-only transition; no committed scrollback line.
+         mock_print.assert_not_called()
++
++
++class TestIncompleteStopMessageReset:
++    def test_reset_discards_unflushed_tail_and_marks_printed_draft(self):
++        cli = _make_cli(tool_progress="off")
++        cli._stream_box_opened = True
++        cli._stream_started = True
++        cli._stream_buf = "Now let me build th"
++        cli._stream_prefilt = "partial-tag"
++        cli._reasoning_buf = "private draft"
++
++        with patch.object(_cli_mod, "_cprint") as mock_print:
++            cli._on_tool_progress(
++                "message.reset",
++                None,
++                None,
++                None,
++                reason="incomplete_stop_retry",
++            )
++
++        rendered = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
++        assert "discarded incomplete provider draft" in rendered
++        assert "Now let me build th" not in rendered
++        assert cli._stream_buf == ""
++        assert cli._stream_prefilt == ""
++        assert cli._reasoning_buf == ""
++        assert cli._stream_box_opened is False
+diff --git a/tests/gateway/test_message_reset_control.py b/tests/gateway/test_message_reset_control.py
+new file mode 100644
+index 000000000..108b8954b
+--- /dev/null
++++ b/tests/gateway/test_message_reset_control.py
+@@ -0,0 +1,39 @@
++"""Presentation-control regression tests for incomplete-stop retries."""
++
++from pathlib import Path
++from unittest.mock import MagicMock
++
++from gateway.config import PlatformConfig
++from gateway.platforms.api_server import APIServerAdapter
++
++
++def test_runs_api_forwards_message_reset_control_event():
++    adapter = APIServerAdapter(PlatformConfig(enabled=True))
++    run_id = "run-reset"
++    queue = MagicMock()
++    adapter._run_streams[run_id] = queue
++
++    loop = MagicMock()
++    loop.call_soon_threadsafe.side_effect = lambda fn, value: fn(value)
++    callback = adapter._make_run_event_callback(run_id, loop)
++
++    callback("message.reset", reason="incomplete_stop_retry")
++
++    event = queue.put_nowait.call_args.args[0]
++    assert event["event"] == "message.reset"
++    assert event["run_id"] == run_id
++    assert event["reason"] == "incomplete_stop_retry"
++
++
++def test_chat_completion_sse_defines_non_persistent_reset_event():
++    source = (
++        Path(__file__).resolve().parents[2]
++        / "gateway"
++        / "platforms"
++        / "api_server.py"
++    ).read_text(encoding="utf-8")
++
++    assert 'tool_progress_callback=_on_stream_control' in source
++    assert '("__stream_reset__", {' in source
++    assert 'event: hermes.message.reset' in source
++    assert 'elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__stream_reset__"' in source
+diff --git a/tests/run_agent/test_incomplete_stop_recovery.py b/tests/run_agent/test_incomplete_stop_recovery.py
+new file mode 100644
+index 000000000..5fed6b95f
+--- /dev/null
++++ b/tests/run_agent/test_incomplete_stop_recovery.py
+@@ -0,0 +1,274 @@
++"""Regression coverage for explicit ``stop`` responses that end mid-sentence.
++
++The live failure this pins was a local Qwen/vLLM completion persisted as a
++normal stop even though it ended with ``Step 2. Now let me build th``.
++"""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++def _assistant(content: str, tool_calls=None):
++    return SimpleNamespace(content=content, tool_calls=tool_calls)
++
++
++def _response(
++    content: str,
++    *,
++    finish_reason: str = "stop",
++    stop_reason=None,
++    token_ids=None,
++    chunk_count=None,
++):
++    choice = SimpleNamespace(
++        message=_assistant(content),
++        finish_reason=finish_reason,
++        stop_reason=stop_reason,
++        token_ids=token_ids,
++    )
++    response = SimpleNamespace(
++        choices=[choice],
++        model="qwen3.6-35b-a3b-nvfp4-multimodal",
++        usage=None,
++    )
++    if chunk_count is not None:
++        response._stream_chunk_count = chunk_count
++    return response
++
++
++def _local_agent():
++    from run_agent import AIAgent
++
++    with (
++        patch("run_agent.get_tool_definitions", return_value=[]),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("run_agent.OpenAI"),
++    ):
++        agent = AIAgent(
++            api_key="test-key-1234567890",
++            base_url="http://127.0.0.1:8003/v1",
++            model="qwen3.6-35b-a3b-nvfp4-multimodal",
++            provider="custom",
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++    agent.client = MagicMock()
++    agent.api_mode = "chat_completions"
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.compression_enabled = False
++    agent.save_trajectories = False
++    return agent
++
++
++class TestIncompleteStopClassifier:
++    @pytest.mark.parametrize(
++        "text",
++        [
++            "Step 2. Now let me build th",
++            "I will now create the",
++            "Next step: let me run the",
++            "```python\nprint('unfinished')",
++        ],
++    )
++    def test_strong_local_qwen_incomplete_shapes_are_rejected(self, text):
++        agent = _local_agent()
++        reason = agent._classify_suspicious_stop_response(
++            "stop", _assistant(text), []
++        )
++        assert reason == "local_qwen_incomplete_stop"
++
++    @pytest.mark.parametrize(
++        "text",
++        [
++            "C",
++            "Done.",
++            "Phase 1",
++            "/home/payam-adloo/Work",
++            "The selected model is qwen3.6-35b-a3b-nvfp4-multimodal",
++            "I checked the repository and found no uncommitted changes",
++        ],
++    )
++    def test_valid_short_or_unpunctuated_answers_are_not_rejected(self, text):
++        agent = _local_agent()
++        assert (
++            agent._classify_suspicious_stop_response(
++                "stop", _assistant(text), []
++            )
++            is None
++        )
++
++    def test_remote_qwen_is_not_subject_to_local_recovery_heuristic(self):
++        agent = _local_agent()
++        agent.base_url = "https://example.com/v1"
++        reason = agent._classify_suspicious_stop_response(
++            "stop", _assistant("Step 2. Now let me build th"), []
++        )
++        assert reason is None
++
++    def test_tool_call_response_is_never_reclassified(self):
++        agent = _local_agent()
++        reason = agent._classify_suspicious_stop_response(
++            "stop",
++            _assistant(
++                "Step 2. Now let me build th",
++                tool_calls=[SimpleNamespace(id="call_1")],
++            ),
++            [],
++        )
++        assert reason is None
++
++    def test_existing_ollama_glm_detector_contract_is_preserved(self):
++        agent = _local_agent()
++        agent.model = "glm-5.1"
++        agent.provider = "ollama"
++        agent.base_url = "http://127.0.0.1:11434/v1"
++        reason = agent._classify_suspicious_stop_response(
++            "stop",
++            _assistant("I inspected the tool result and will continue with the"),
++            [{"role": "tool", "content": "ok"}],
++        )
++        assert reason == "ollama_glm_stop_misreport"
++        assert agent._should_treat_stop_as_truncated(
++            "stop",
++            _assistant("I inspected the tool result and will continue with the"),
++            [{"role": "tool", "content": "ok"}],
++        )
++
++
++class TestStreamingTerminationTelemetry:
++    @patch("run_agent.AIAgent._create_request_openai_client")
++    @patch("run_agent.AIAgent._close_request_openai_client")
++    def test_stream_preserves_vllm_stop_reason_token_ids_and_chunk_count(
++        self, _mock_close, mock_create
++    ):
++        agent = _local_agent()
++
++        def chunk(content=None, finish_reason=None, stop_reason=None, token_ids=None):
++            delta = SimpleNamespace(
++                content=content,
++                tool_calls=None,
++                reasoning_content=None,
++                reasoning=None,
++            )
++            choice = SimpleNamespace(
++                index=0,
++                delta=delta,
++                finish_reason=finish_reason,
++                stop_reason=stop_reason,
++                token_ids=token_ids,
++            )
++            return SimpleNamespace(choices=[choice], model="qwen-local", usage=None)
++
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = iter(
++            [
++                chunk(content="Complete answer."),
++                chunk(finish_reason="stop", stop_reason=151643, token_ids=[10, 20]),
++            ]
++        )
++        mock_create.return_value = mock_client
++
++        response = agent._interruptible_streaming_api_call({})
++        choice = response.choices[0]
++        assert choice.finish_reason == "stop"
++        assert choice.stop_reason == 151643
++        assert choice.token_ids == [20]
++        assert response._stream_chunk_count == 2
++
++        normalized = agent._get_transport().normalize_response(response)
++        assert normalized.provider_data == {
++            "stop_reason": 151643,
++            "last_token_id": 20,
++            "stream_chunk_count": 2,
++        }
++
++        hook_payload = agent._api_response_payload_for_hook(
++            response, normalized, finish_reason=normalized.finish_reason
++        )
++        assert hook_payload["provider_data"]["stop_reason"] == 151643
++        assert hook_payload["stream"]["chunk_count"] == 2
++
++
++class TestConversationRecovery:
++    def _run(self, agent, responses):
++        agent.client.chat.completions.create.side_effect = responses
++        agent.tool_progress_callback = MagicMock()
++        with (
++            patch.object(agent, "_persist_session"),
++            patch.object(agent, "_save_trajectory"),
++            patch.object(agent, "_cleanup_task_resources"),
++            patch.object(agent, "_close_cached_request_openai_client") as close_cache,
++        ):
++            result = agent.run_conversation("Build the OMSCS bridge")
++        return result, close_cache
++
++    def test_first_bad_stop_retries_fresh_without_replaying_partial_text(self):
++        agent = _local_agent()
++        bad = _response(
++            "Phase 1 complete. Step 2. Now let me build th",
++            stop_reason=151643,
++            token_ids=[1, 2],
++            chunk_count=9,
++        )
++        good = _response("Phase 1 is complete. The verified artifacts are ready.")
++
++        result, close_cache = self._run(agent, [bad, good])
++
++        assert agent.client.chat.completions.create.call_count == 2
++        close_cache.assert_called_once_with(reason="incomplete_stop_retry")
++        agent.tool_progress_callback.assert_any_call(
++            "message.reset",
++            None,
++            None,
++            None,
++            reason="incomplete_stop_retry",
++        )
++        assert result["completed"] is True
++        assert result["final_response"] == good.choices[0].message.content
++        assert all(
++            "Now let me build th" not in (m.get("content") or "")
++            for m in result["messages"]
++            if isinstance(m, dict)
++        )
++
++        second = agent.client.chat.completions.create.call_args_list[1]
++        sent = second.kwargs.get("messages") or second.args[0].get("messages")
++        assert all(
++            "Now let me build th" not in (m.get("content") or "")
++            for m in sent
++            if isinstance(m, dict)
++        )
++
++    def test_second_bad_stop_fails_closed_without_persisting_bad_text(self):
++        agent = _local_agent()
++        bad1 = _response("Phase 1. Step 2. Now let me build th")
++        bad2 = _response("Retrying now. Let me create the")
++
++        result, close_cache = self._run(agent, [bad1, bad2])
++
++        assert agent.client.chat.completions.create.call_count == 2
++        close_cache.assert_called_once_with(reason="incomplete_stop_retry")
++        agent.tool_progress_callback.assert_any_call(
++            "message.reset",
++            None,
++            None,
++            None,
++            reason="incomplete_stop_retry",
++        )
++        assert result["completed"] is False
++        assert result["partial"] is True
++        assert result["error"] == "repeated_incomplete_stop"
++        assert "rejected two incomplete" in result["final_response"]
++        assert all(
++            "Now let me build th" not in (m.get("content") or "")
++            and "Let me create the" not in (m.get("content") or "")
++            for m in result["messages"]
++            if isinstance(m, dict)
++        )
++        assert result["messages"][-1]["_provider_failure_sentinel"] is True
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 24f1b72de..c10dcbb9c 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -15280,3 +15280,28 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
+         assert captured.get("persist_user_message") == "hi"
+     finally:
+         server._sessions.pop("sid", None)
++
++
++
++def test_tui_message_reset_emits_when_tool_progress_off(monkeypatch):
++    events: list[tuple[str, str, dict]] = []
++    monkeypatch.setattr(
++        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
++    )
++    monkeypatch.setitem(
++        server._sessions,
++        "reset-off-test",
++        {"tool_progress_mode": "off"},
++    )
++
++    server._on_tool_progress(
++        "reset-off-test",
++        "message.reset",
++        reason="incomplete_stop_retry",
++    )
++
++    assert events == [(
++        "message.reset",
++        "reset-off-test",
++        {"reason": "incomplete_stop_retry"},
++    )]
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 327ae0f71..d64a15cac 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -5096,6 +5096,13 @@ def _on_tool_progress(
+     _args: dict | None = None,
+     **_kwargs,
+ ):
++    if event_type == "message.reset":
++        _emit(
++            "message.reset",
++            sid,
++            {"reason": str(_kwargs.get("reason") or "provider_retry")},
++        )
++        return
+     if not _tool_progress_enabled(sid):
+         return
+     if event_type == "tool.started" and name:
+diff --git a/ui-tui/README.md b/ui-tui/README.md
+index ac1d612f7..6dd467070 100644
+--- a/ui-tui/README.md
++++ b/ui-tui/README.md
+@@ -272,6 +272,7 @@ Primary event types the client handles today:
+ | `skin.changed`             | `{ skin }`                                                                  |
+ | `session.info`             | session metadata for banner + tool/skill panels                             |
+ | `message.start`            | start assistant streaming                                                   |
++| `message.reset`            | `{ reason? }`; discard only the current uncommitted provider draft          |
+ | `message.delta`            | `{ text, rendered? }`                                                       |
+ | `message.complete`         | `{ text, rendered?, usage, status }`                                        |
+ | `thinking.delta`           | `{ text }`                                                                  |
+diff --git a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+index 404aac386..78d465486 100644
+--- a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
++++ b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+@@ -66,6 +66,28 @@ describe('createGatewayEventHandler', () => {
+     patchUiState({ showReasoning: true })
+   })
+ 
++  it('discards only the active provider draft on message.reset', () => {
++    const appended: Msg[] = []
++    const onEvent = createGatewayEventHandler(buildCtx(appended))
++
++    onEvent({ payload: {}, type: 'message.start' } as any)
++    onEvent({ payload: { text: 'Step 2. Now let me build th' }, type: 'message.delta' } as any)
++    turnController.hydrateStreamingText('Step 2. Now let me build th')
++    expect(getTurnState().streaming).toContain('Step 2')
++
++    onEvent({ payload: { reason: 'incomplete_stop_retry' }, type: 'message.reset' } as any)
++
++    expect(getTurnState().streaming).toBe('')
++    expect(getTurnState().reasoning).toBe('')
++    expect(getTurnState().activity.at(-1)?.text).toContain('discarded incomplete draft')
++
++    onEvent({ payload: { text: 'The verified bridge is ready.' }, type: 'message.delta' } as any)
++    onEvent({ payload: { text: 'The verified bridge is ready.' }, type: 'message.complete' } as any)
++
++    expect(appended.some(msg => msg.text.includes('Now let me build th'))).toBe(false)
++    expect(appended.some(msg => msg.text === 'The verified bridge is ready.')).toBe(true)
++  })
++
+   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
+     const appended: Msg[] = []
+ 
+diff --git a/ui-tui/src/app/createGatewayEventHandler.ts b/ui-tui/src/app/createGatewayEventHandler.ts
+index 55a31f97d..7f5bd8f6c 100644
+--- a/ui-tui/src/app/createGatewayEventHandler.ts
++++ b/ui-tui/src/app/createGatewayEventHandler.ts
+@@ -1328,6 +1328,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+ 
+         return
+ 
++      case 'message.reset':
++        turnController.discardStreamingDraft()
++        turnController.pushActivity('discarded incomplete draft · retrying', 'info', 'provider retry')
++
++        return
++
+       case 'message.delta':
+         turnController.recordMessageDelta(ev.payload ?? {})
+ 
+diff --git a/ui-tui/src/app/turnController.ts b/ui-tui/src/app/turnController.ts
+index 913804664..4a864c94e 100644
+--- a/ui-tui/src/app/turnController.ts
++++ b/ui-tui/src/app/turnController.ts
+@@ -666,6 +666,27 @@ class TurnController {
+     return { finalMessages, finalText, wasInterrupted }
+   }
+ 
++  discardStreamingDraft() {
++    if (this.interrupted) {
++      return
++    }
++
++    this.streamTimer = clear(this.streamTimer)
++    this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer)
++    this.reasoningTimer = clear(this.reasoningTimer)
++    this.bufRef = ''
++    this.activeReasoningText = ''
++    this.reasoningText = ''
++    this.reasoningSegmentIndex = null
++    patchTurnState({
++      reasoning: '',
++      reasoningActive: false,
++      reasoningStreaming: false,
++      reasoningTokens: 0,
++      streaming: ''
++    })
++  }
++
+   recordMessageDelta({ text }: { rendered?: string; text?: string }) {
+     if (this.interrupted || !text) {
+       return
+diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
+index c5bb9ff0d..96310b8b3 100644
+--- a/ui-tui/src/gatewayTypes.ts
++++ b/ui-tui/src/gatewayTypes.ts
+@@ -719,6 +719,7 @@ export type GatewayEvent =
+   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.tool' }
+   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.progress' }
+   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.complete' }
++  | { payload?: { reason?: string }; session_id?: string; type: 'message.reset' }
+   | { payload: { rendered?: string; text?: string }; session_id?: string; type: 'message.delta' }
+   | {
+       payload: { already_streamed?: boolean; text: string }

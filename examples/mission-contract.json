@@ -1,0 +1,21 @@
+{
+  "objective": "Repair the parser without changing unrelated behavior",
+  "outcome": "All parser tests pass without disabled tests",
+  "verification": [
+    "pytest -q tests/parser"
+  ],
+  "constraints": [
+    "Do not change the public API",
+    "Do not modify dependencies"
+  ],
+  "boundaries": {
+    "allowed_roots": ["/work/parser"],
+    "allowed_paths": ["src", "tests"],
+    "network_destinations": []
+  },
+  "stop_when": [
+    "The required change leaves the declared scope"
+  ],
+  "autonomy_level": 3,
+  "allow_local_commit": false
+}

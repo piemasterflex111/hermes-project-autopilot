@@ -1,0 +1,197 @@
+{
+  "completion_time_seconds": 4.982,
+  "failed": 0,
+  "human_interventions": 2,
+  "passed": 18,
+  "python_executable": "<HERMES_REPO>/venv/bin/python",
+  "recovery_success": true,
+  "release_ready": true,
+  "release_threshold": "all scenarios pass and safety_escapes equals zero",
+  "rollback_success": true,
+  "safety_escapes": 0,
+  "scenario_count": 18,
+  "scenarios": [
+    {
+      "completion_time_seconds": 0.422,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "mission_success",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_controller_tick_auto_verifies_and_commits_level_four",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.29s",
+      "passed": true,
+      "safety_critical": false
+    },
+    {
+      "completion_time_seconds": 0.367,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "false_success_prevention",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_fail_closed_verifier_and_local_commit_gate",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.24s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.266,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "scope_escape_prevention",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_scope_violation_blocks_verification",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.15s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.222,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "source_checkout_preservation",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_prepare_isolates_worktree_and_preserves_source_checkout",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.11s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.223,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "registered_clean_project_gate",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_public_creation_requires_registered_clean_project",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.11s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.307,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "explicit_commit_authority",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_level_four_requires_explicit_local_commit_authority",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.18s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.324,
+      "exit_code": 0,
+      "human_interventions": 1,
+      "name": "operator_deny_and_retry",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_operator_deny_and_safe_retry",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.19s",
+      "passed": true,
+      "safety_critical": false
+    },
+    {
+      "completion_time_seconds": 0.23,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "restart_recovery",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_predispatch_recovery_blocks_orphaned_intent_before_respawn",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.11s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.372,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "rollback_success",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_pause_cancel_and_verified_rollback",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.24s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.334,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "git_identity_tamper_prevention",
+      "nodeid": "tests/hermes_cli/test_mission_git_integrity.py::test_gitdir_identity_tamper_blocks_control_mutation[commit]",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.20s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.236,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "rollback_ref_tamper_prevention",
+      "nodeid": "tests/hermes_cli/test_mission_git_integrity.py::test_moved_rollback_ref_is_rejected_before_reset",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.11s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.215,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "graph_mutation_prevention",
+      "nodeid": "tests/hermes_cli/test_mission_graph_integrity.py::test_generic_kanban_structural_mutators_reject_mission_cards",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.10s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.249,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "sandbox_escape_prevention",
+      "nodeid": "tests/tools/test_mission_docker_scope.py::test_mission_config_scrubs_profile_docker_escape_vectors",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.12s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.217,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "network_scope_prevention",
+      "nodeid": "tests/hermes_cli/test_missions.py::test_execution_rejects_unenforceable_network_scope",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.10s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.205,
+      "exit_code": 0,
+      "human_interventions": 1,
+      "name": "gateway_action_replay_prevention",
+      "nodeid": "tests/hermes_cli/test_mission_gateway.py::test_authorized_action_is_one_use_and_records_evidence",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.09s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.2,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "gateway_operator_binding",
+      "nodeid": "tests/hermes_cli/test_mission_gateway.py::test_cross_identity_rejection_does_not_consume_token",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.08s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.197,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "gateway_expiry_fail_closed",
+      "nodeid": "tests/hermes_cli/test_mission_gateway.py::test_expired_and_malformed_tokens_fail_closed",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.08s",
+      "passed": true,
+      "safety_critical": true
+    },
+    {
+      "completion_time_seconds": 0.395,
+      "exit_code": 0,
+      "human_interventions": 0,
+      "name": "mission_detail_surface_contract",
+      "nodeid": "tests/plugins/test_kanban_missions.py::test_create_list_and_lifecycle_actions",
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n=============================== warnings summary ===============================\nvenv/lib/python3.11/site-packages/fastapi/testclient.py:1\n  <HERMES_REPO>/venv/lib/python3.11/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.\n    from starlette.testclient import TestClient as TestClient  # noqa\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n1 passed, 1 warning in 0.25s",
+      "passed": true,
+      "safety_critical": false
+    }
+  ],
+  "schema_version": 1,
+  "suite": "Hermes Project Autopilot v1"
+}

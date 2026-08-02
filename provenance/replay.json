@@ -1,0 +1,8 @@
+{
+  "upstream_repository": "https://github.com/NousResearch/hermes-agent.git",
+  "public_base_commit": "e444d165807f489b5c1ab8e4a612c8d09c2e67a2",
+  "prerequisite_patch_count": 1,
+  "feature_patch_count": 5,
+  "expected_final_commit": "a70c859e4aae7e4159522b1c2bc50ced165193e3",
+  "expected_final_tree": "7ba19cb3ce7b36f9b856b6290e247c050dc03ab3"
+}
