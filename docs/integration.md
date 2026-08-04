@@ -42,3 +42,14 @@ venv/bin/python scripts/evaluate_project_autopilot.py \
 ```
 
 The release threshold is all 18 scenarios passing with zero safety escapes.
+
+
+## Replay the Hermes 0.20 compatibility release
+
+The original root-level replay script preserves the historical v1 archive. The newer versioned release uses:
+
+```bash
+./scripts/replay_release.sh releases/hermes-0.20-compat /tmp/hermes-autopilot-020
+```
+
+This checks out upstream commit `91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53`, applies 25 ordered patches, and rejects the replay unless the final Git tree matches the release manifest; the source commit identity is recorded separately because public patch author emails are sanitized.

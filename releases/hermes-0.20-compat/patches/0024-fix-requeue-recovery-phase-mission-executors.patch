@@ -1,0 +1,83 @@
+From de5b4f558430c1d3f0519bfa27ffd2d498eec1ce Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 21:45:15 -0700
+Subject: [PATCH 24/25] fix: requeue recovery-phase mission executors
+
+---
+ hermes_cli/mission_service.py     |  6 ++++-
+ tests/hermes_cli/test_missions.py | 42 +++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index a5a8f7a1e..f8750a681 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -2926,7 +2926,11 @@ def retry_mission(conn, mission_id: str) -> mdb.Mission:
+         retried_tasks: list[str] = []
+         if target == "running":
+             validate_mission_task_graph(conn, mission_id, boundary="retry")
+-            if mission.phase == "execution":
++            if mission.phase in {"execution", "recovery"}:
++                # Reconcile intentionally moves interrupted execution into the
++                # recovery phase. A subsequent explicit Retry safely must still
++                # release circuit-broken executor cards after quiescence,
++                # intent, graph, worktree, and scope checks all pass.
+                 _validate_start_scope(mission)
+                 _prepare_approved_parent_directories(conn, mission)
+                 _validate_start_scope(mission)
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index b4a84ed28..02488babb 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -1607,6 +1607,48 @@ def test_reconcile_clears_stale_ambiguous_blocker_after_quiescence(
+     assert retried.status == "running"
+ 
+ 
++def test_recovery_phase_retry_requeues_circuit_broken_executor(mission_env):
++    conn, repo = mission_env
++    mid = _created(conn, repo, autonomy=3)
++    service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Repair assessment tests", body="Fix tests", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    assert kb.block_task(
++        conn,
++        executor,
++        reason="iteration budget exhausted twice",
++        kind="capability",
++    )
++    mdb.transition_mission(
++        conn,
++        mid,
++        "blocked",
++        phase="recovery",
++        blocked_reason="recovery_ambiguous: unresolved mutation intent",
++    )
++
++    reconciled = service.reconcile_mission(conn, mid)
++    assert reconciled.status == "blocked"
++    assert reconciled.phase == "recovery"
++    assert reconciled.blocked_reason is None
++    assert kb.get_task(conn, executor).status == "blocked"
++
++    retried = service.retry_mission(conn, mid)
++
++    assert retried.status == "running"
++    assert retried.phase == "execution"
++    task = kb.get_task(conn, executor)
++    assert task is not None and task.status == "ready"
++    retry = next(
++        row for row in reversed(mdb.list_evidence(conn, mid))
++        if row["metadata"].get("action") == "retry"
++    )
++    assert retry["metadata"]["retried_tasks"] == [executor]
++
++
+ def test_controller_runs_missing_exact_verification_before_model(
+     mission_env, monkeypatch
+ ):
+-- 
+2.53.0
+

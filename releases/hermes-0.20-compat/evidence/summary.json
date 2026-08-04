@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-03T22:00:00-07:00",
+  "source_head_commit": "30550647352814d934204d113dec6f742f9627b8",
+  "focused_tests": {
+    "passed": 215,
+    "failed": 0,
+    "warnings": 6,
+    "evidence_file": "evidence/focused-tests.txt"
+  },
+  "scale_runs": [
+    {
+      "name": "1000-executor-task",
+      "evidence_file": "evidence/scale-1000.json",
+      "database_bytes": 5369856,
+      "duplicate_claim_attempts": 48,
+      "duplicate_claim_winners": 1,
+      "evidence_rows": 2600,
+      "evidence_seconds": 0.1346,
+      "execution_seconds": 5.5928,
+      "executor_tasks": 1000,
+      "executor_tasks_per_second": 178.8,
+      "journal_mode": "wal",
+      "mission_count": 100,
+      "open_runs": 0,
+      "pass": true,
+      "persistence_seconds": 0.0063,
+      "setup_seconds": 2.4024,
+      "sqlite_integrity": "ok",
+      "tasks_per_mission": 10,
+      "total_seconds": 8.1802,
+      "total_task_rows": 1200,
+      "wal_bytes": 0,
+      "workers": 24
+    },
+    {
+      "name": "5000-executor-task",
+      "evidence_file": "evidence/scale-5000.json",
+      "database_bytes": 25976832,
+      "duplicate_claim_attempts": 96,
+      "duplicate_claim_winners": 1,
+      "evidence_rows": 13000,
+      "evidence_seconds": 0.6711,
+      "execution_seconds": 48.5252,
+      "executor_tasks": 5000,
+      "executor_tasks_per_second": 103.04,
+      "journal_mode": "wal",
+      "mission_count": 500,
+      "open_runs": 0,
+      "pass": true,
+      "persistence_seconds": 0.0338,
+      "setup_seconds": 16.0465,
+      "sqlite_integrity": "ok",
+      "tasks_per_mission": 10,
+      "total_seconds": 65.2903,
+      "total_task_rows": 6000,
+      "wal_bytes": 0,
+      "workers": 48
+    }
+  ],
+  "scope": {
+    "proves": [
+      "single-workstation controller persistence",
+      "bounded multi-mission task graphs",
+      "atomic claim contention",
+      "dependency promotion",
+      "evidence ledger growth",
+      "database reopen and SQLite integrity"
+    ],
+    "does_not_prove": [
+      "multi-machine distributed coordination",
+      "thousands of simultaneous model workers",
+      "high availability or leader election",
+      "network partition tolerance"
+    ]
+  }
+}

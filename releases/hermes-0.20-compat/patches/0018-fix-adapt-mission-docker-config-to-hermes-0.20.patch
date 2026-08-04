@@ -1,0 +1,41 @@
+From 46392bc2254435a29020355fa942ab8e245ece7c Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 20:32:20 -0700
+Subject: [PATCH 18/25] fix: adapt mission docker config to hermes 0.20
+
+---
+ tools/environments/docker.py | 2 +-
+ tools/terminal_tool.py       | 4 ++++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/tools/environments/docker.py b/tools/environments/docker.py
+index 7bbd8a802..8f5b500ba 100644
+--- a/tools/environments/docker.py
++++ b/tools/environments/docker.py
+@@ -1598,7 +1598,7 @@ class DockerEnvironment(BaseEnvironment):
+     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
+         """Return forwarded values and scoped names that must be unset."""
+         exec_env: dict[str, str] = {}
+-        explicit_forward_keys = set(self._forward_env)
++        explicit_forward_keys = set(getattr(self, "_forward_env", ()) or ())
+         passthrough_keys: set[str] = set()
+         resolve_passthrough_value = None
+         multiplex_active = False
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 34b9d94e3..9f0521a8a 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1499,6 +1499,10 @@ def _get_env_config() -> Dict[str, Any]:
+         container_memory = 5120
+         container_disk = 51200
+ 
++    # Shared-memory sizing is safe to parse in restricted mode and must always
++    # be initialized before the returned Docker configuration is assembled.
++    docker_shm_size = os.getenv("TERMINAL_DOCKER_SHM_SIZE", "1g")
++
+     if mission_restricted:
+         # Do not even parse profile-controlled JSON in mission mode.  Besides
+         # eliminating escape hatches, this prevents a malformed unrelated
+-- 
+2.53.0
+

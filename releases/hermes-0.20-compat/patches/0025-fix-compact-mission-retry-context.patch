@@ -1,0 +1,195 @@
+From 30550647352814d934204d113dec6f742f9627b8 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 21:56:22 -0700
+Subject: [PATCH 25/25] fix: compact mission retry context
+
+---
+ hermes_cli/kanban_db.py           | 32 +++++++++++++------
+ tests/hermes_cli/test_missions.py | 51 +++++++++++++++++++++++++++++++
+ tools/kanban_tools.py             | 28 ++++++++++++-----
+ 3 files changed, 94 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 2ddf6844e..5c84824d4 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -328,8 +328,14 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
+ # summaries). Values chosen to fit a typical 100k-char LLM prompt with
+ # plenty of headroom. Each constant is tuned independently so users
+ # who need to relax one don't have to relax all of them.
+-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+-_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
++_CTX_MAX_PRIOR_ATTEMPTS = 10      # ordinary task history
++_CTX_MAX_COMMENTS       = 30      # ordinary task comments
++# Mission retries need a smaller continuation context. Their startup prompt is
++# followed by a required kanban_show() call, so large repeated histories waste
++# the bounded model/tool budget and can drown the newest controller correction.
++_CTX_MISSION_MAX_PRIOR_ATTEMPTS = 2
++_CTX_MISSION_MAX_COMMENTS = 5
++_CTX_MISSION_MAX_EVENTS = 20
+ _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
+ _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
+ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+@@ -9773,9 +9779,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     # more exist without bloating the prompt.
+     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+     # list_runs returns ascending by started_at; "most recent" = last N
+-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
+-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
+-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
++    prior_attempt_limit = (
++        _CTX_MISSION_MAX_PRIOR_ATTEMPTS if task.mission_id
++        else _CTX_MAX_PRIOR_ATTEMPTS
++    )
++    if len(all_prior) > prior_attempt_limit:
++        omitted = len(all_prior) - prior_attempt_limit
++        shown = all_prior[-prior_attempt_limit:]
+         first_shown_idx = omitted + 1
+     else:
+         omitted = 0
+@@ -9871,7 +9881,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
+     # most recent 5 completed runs, excluding this task so the retry
+     # section above isn't duplicated. Safe on assignee=None (skipped).
+-    if task.assignee:
++    if task.assignee and not task.mission_id:
+         role_rows = conn.execute(
+             "SELECT t.id, t.title, r.summary, r.ended_at "
+             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+@@ -9897,9 +9907,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     # comment-storm tasks don't blow out the worker's prompt. Older
+     # comments summarised in a one-line marker like prior attempts.
+     all_comments = list_comments(conn, task_id)
+-    if len(all_comments) > _CTX_MAX_COMMENTS:
+-        omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
+-        shown_c = all_comments[-_CTX_MAX_COMMENTS:]
++    comment_limit = (
++        _CTX_MISSION_MAX_COMMENTS if task.mission_id
++        else _CTX_MAX_COMMENTS
++    )
++    if len(all_comments) > comment_limit:
++        omitted_c = len(all_comments) - comment_limit
++        shown_c = all_comments[-comment_limit:]
+     else:
+         omitted_c = 0
+         shown_c = all_comments
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index 02488babb..89a36a1d7 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -1649,6 +1649,57 @@ def test_recovery_phase_retry_requeues_circuit_broken_executor(mission_env):
+     assert retry["metadata"]["retried_tasks"] == [executor]
+ 
+ 
++def test_mission_retry_context_is_compact_and_not_duplicated(
++    mission_env, monkeypatch,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo, autonomy=3)
++    service.prepare_mission(conn, mid)
++    task_id = service.add_execution_task(
++        conn, mid, title="Compact retry", body="Apply the latest correction", assignee="default",
++    )
++    now = int(time.time())
++    for index in range(6):
++        conn.execute(
++            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
++            "VALUES (?, 'default', 'timed_out', ?, ?, 'timed_out', ?)",
++            (task_id, now - 100 + index, now - 90 + index, f"attempt-summary-{index}"),
++        )
++    conn.commit()
++    for index in range(10):
++        kb.add_comment(conn, task_id, "controller", f"controller-comment-{index}")
++
++    context = kb.build_worker_context(conn, task_id)
++    assert "attempt-summary-0" not in context
++    assert "attempt-summary-3" not in context
++    assert "attempt-summary-4" in context
++    assert "attempt-summary-5" in context
++    assert "controller-comment-0" not in context
++    assert "controller-comment-4" not in context
++    for index in range(5, 10):
++        assert f"controller-comment-{index}" in context
++    assert "Recent work by" not in context
++
++    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv(
++        "HERMES_MISSION_POLICY",
++        json.dumps({"mission_id": mid, "task_id": task_id}),
++    )
++    from tools import kanban_tools as kt
++
++    payload = json.loads(kt._handle_show({}))
++    assert payload["context_injected"] is True
++    assert "worker_context" not in payload
++    assert len(payload["runs"]) == 2
++    assert len(payload["comments"]) == 5
++    assert len(payload["events"]) <= 20
++    assert payload["runs"][0]["summary"] == "attempt-summary-4"
++    assert payload["runs"][1]["summary"] == "attempt-summary-5"
++    assert payload["comments"][0]["body"] == "controller-comment-5"
++    assert payload["comments"][-1]["body"] == "controller-comment-9"
++
++
+ def test_controller_runs_missing_exact_verification_before_model(
+     mission_env, monkeypatch
+ ):
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index f15bb44ea..67d608ca8 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -549,6 +549,11 @@ def _handle_show(args: dict, **kw) -> str:
+             comments = kb.list_comments(conn, tid)
+             events = kb.list_events(conn, tid)
+             runs = kb.list_runs(conn, tid)
++            mission_scoped = bool(task.mission_id)
++            if mission_scoped:
++                comments = comments[-getattr(kb, "_CTX_MISSION_MAX_COMMENTS", 5):]
++                events = events[-getattr(kb, "_CTX_MISSION_MAX_EVENTS", 20):]
++                runs = runs[-getattr(kb, "_CTX_MISSION_MAX_PRIOR_ATTEMPTS", 2):]
+             parents = kb.parent_ids(conn, tid)
+             children = kb.child_ids(conn, tid)
+ 
+@@ -577,7 +582,7 @@ def _handle_show(args: dict, **kw) -> str:
+                     "started_at": r.started_at, "ended_at": r.ended_at,
+                 }
+ 
+-            return json.dumps({
++            payload = {
+                 "task": _task_dict(task),
+                 "parents": parents,
+                 "children": children,
+@@ -589,15 +594,22 @@ def _handle_show(args: dict, **kw) -> str:
+                 "events": [
+                     {"kind": e.kind, "payload": e.payload,
+                      "created_at": e.created_at, "run_id": e.run_id}
+-                    for e in events[-50:]   # cap; full log via CLI
++                    for e in events[-50:]   # ordinary cap; mission list pre-capped
+                 ],
+                 "runs": [_run_dict(r) for r in runs],
+-                # Also surface the worker's own context block so the
+-                # agent can include it directly if it wants. This is
+-                # the same string build_worker_context returns to the
+-                # dispatcher at spawn time.
+-                "worker_context": kb.build_worker_context(conn, tid),
+-            })
++            }
++            if mission_scoped:
++                # The dispatcher already injected build_worker_context() into
++                # this worker's startup prompt. Returning it again duplicates
++                # stale retry history and consumes the bounded iteration budget.
++                payload["context_injected"] = True
++                payload["context_note"] = (
++                    "Startup task context is already present; this response "
++                    "contains only the latest mission retry state."
++                )
++            else:
++                payload["worker_context"] = kb.build_worker_context(conn, tid)
++            return json.dumps(payload)
+         finally:
+             conn.close()
+     except ValueError as e:
+-- 
+2.53.0
+

@@ -45,10 +45,26 @@ class RepositoryIntegrityTests(unittest.TestCase):
         required = [
             "docs/architecture.md", "docs/lifecycle.md", "docs/security-model.md",
             "docs/gateway-authorization.md", "docs/integration.md",
-            "docs/release-evidence.md", "docs/provenance.md",
+            "docs/release-evidence.md", "docs/provenance.md", "docs/scalability.md",
         ]
         for rel in required:
             self.assertTrue((ROOT / rel).is_file(), rel)
+
+    def test_current_compatibility_release_is_consistent(self):
+        release_dir = ROOT / "releases/hermes-0.20-compat"
+        release = json.loads((release_dir / "release.json").read_text())
+        evidence = json.loads((release_dir / "evidence/summary.json").read_text())
+        self.assertEqual(25, release["patch_count"])
+        self.assertEqual(release["source_head_commit"], evidence["source_head_commit"])
+        self.assertEqual(215, evidence["focused_tests"]["passed"])
+        self.assertEqual(0, evidence["focused_tests"]["failed"])
+        scale = {item["executor_tasks"]: item for item in evidence["scale_runs"]}
+        self.assertEqual({1000, 5000}, set(scale))
+        for run in scale.values():
+            self.assertTrue(run["pass"])
+            self.assertEqual(1, run["duplicate_claim_winners"])
+            self.assertEqual(0, run["open_runs"])
+            self.assertEqual("ok", run["sqlite_integrity"])
 
 
 if __name__ == "__main__":

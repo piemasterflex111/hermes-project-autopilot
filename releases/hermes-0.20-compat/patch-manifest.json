@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "patch_count": 25,
+  "patches": [
+    {
+      "path": "patches/0001-feat-add-restart-safe-project-autopilot-missions.patch",
+      "bytes": 377327,
+      "sha256": "549b21f3017c8cf0461cbaeb63d3361bd1e6f8dc1f0f5e0c85c28d3831007729"
+    },
+    {
+      "path": "patches/0002-feat-complete-project-autopilot-v1-safety-gates.patch",
+      "bytes": 163481,
+      "sha256": "cf6bbf835e3abd3ff59a498635855502fe740fb8d4cc6d2702931df5d8b9153c"
+    },
+    {
+      "path": "patches/0003-feat-add-native-project-autopilot-mission-center.patch",
+      "bytes": 32477,
+      "sha256": "5a43dfc074748dc90dfbfb153838eb44c128cb41aebfcecabecf1f65ada39c8a"
+    },
+    {
+      "path": "patches/0004-feat-deliver-authenticated-mission-controls-and-deta.patch",
+      "bytes": 131565,
+      "sha256": "f915301160ab193f0b03304dade862f33fdf970d68f214320bd2648ce32469cf"
+    },
+    {
+      "path": "patches/0005-fix-requeue-blocked-executors-on-mission-retry.patch",
+      "bytes": 5023,
+      "sha256": "fa3f9be3422a5f47486979fa35757a73423597823fd5a1e8ca2bd57d9663adb9"
+    },
+    {
+      "path": "patches/0006-fix-preserve-mission-terminal-policy-in-CLI-workers.patch",
+      "bytes": 4046,
+      "sha256": "27c532a34032ca741795d4845c44ece136201568996c97ac14b8692b6f768068"
+    },
+    {
+      "path": "patches/0007-fix-enforce-Autopilot-mission-containment-gates.patch",
+      "bytes": 64700,
+      "sha256": "55ebd09c9464fe06894501968ab337435d27f20cb2356f33c647a1771acc2456"
+    },
+    {
+      "path": "patches/0008-fix-canonicalize-mission-Docker-workspace-paths.patch",
+      "bytes": 7676,
+      "sha256": "7730d02c3a69ca970952a953ac8c72a182eb08d45e7ab47431016f1a08c6c7e6"
+    },
+    {
+      "path": "patches/0009-fix-run-exact-contract-verification-in-controller.patch",
+      "bytes": 16572,
+      "sha256": "801b92ba435f198ca186eb14bd0a1ac4a012fecfe8f76daed59816105d1facc0"
+    },
+    {
+      "path": "patches/0010-fix-prepare-approved-mission-paths-before-Landlock.patch",
+      "bytes": 13789,
+      "sha256": "a2844b65f0229d4ef1971c7778a0e03119cc476984c0d2a0613c25c90ae3ef32"
+    },
+    {
+      "path": "patches/0011-fix-allow-explicit-retry-of-mission-triage-tasks.patch",
+      "bytes": 7531,
+      "sha256": "2a041509eb1de8062fb00f8a392e790906042049eed11041cfd6a87703106cdc"
+    },
+    {
+      "path": "patches/0012-fix-verify-missions-in-disposable-writable-clones.patch",
+      "bytes": 9861,
+      "sha256": "6d2a365cc9d4fa9c3983212f868d358f2f2f5eb4e5c0eae50f64358d77f5c2c0"
+    },
+    {
+      "path": "patches/0013-feat-configure-dedicated-mission-verification-image.patch",
+      "bytes": 1816,
+      "sha256": "696bd960b7f138cb257968ee155f25c1a7dc3e55c28f13dbc43e1ce6fa33b9b9"
+    },
+    {
+      "path": "patches/0014-fix-verify-only-current-mission-evidence.patch",
+      "bytes": 10473,
+      "sha256": "65b253f82f619b97da4cb9aa5400a56a205f4e47c93a71059e8224aa31eaee72"
+    },
+    {
+      "path": "patches/0015-fix-harden-mission-recovery-writes-and-verification.patch",
+      "bytes": 13030,
+      "sha256": "a9bc1107186b80e894101cd53938b3c62ca9b4c75fee413a2d052239618fe7a5"
+    },
+    {
+      "path": "patches/0016-fix-deliver-mission-inputs-and-harden-recovery.patch",
+      "bytes": 17455,
+      "sha256": "4ce619e6b5e230b0d255a2a2bfb4f90092f9ffa5bbc59cb51e676decfeda8cf7"
+    },
+    {
+      "path": "patches/0017-fix-keep-contained-policy-denials-retryable.patch",
+      "bytes": 14326,
+      "sha256": "22e7c36afe216f2184bc94634d8a628e3344dd14ef82a17c79f61bfb83b9631c"
+    },
+    {
+      "path": "patches/0018-fix-adapt-mission-docker-config-to-hermes-0.20.patch",
+      "bytes": 1771,
+      "sha256": "44b49a4e34348822bbc4e93957e049c21d82245c2b526a5fe835bd84ff46c42e"
+    },
+    {
+      "path": "patches/0019-test-add-project-autopilot-scale-benchmark.patch",
+      "bytes": 15195,
+      "sha256": "3f557f379303e26147089e672bce7e79fb661732a4bedd1fbf9ce97b8109f76b"
+    },
+    {
+      "path": "patches/0020-test-restore-Hermes-modules-after-isolated-CLI-reloa.patch",
+      "bytes": 3372,
+      "sha256": "c683e7cc7ae131ec043e608aea49c89ccaed5e67a62ec7e51cf0a6207a2100aa"
+    },
+    {
+      "path": "patches/0021-test-isolate-default-assignee-module-reloads.patch",
+      "bytes": 2965,
+      "sha256": "99596c7fbfc7f17e1ce63238d289f67ce64a0c254af43dc423bdce923e93eb46"
+    },
+    {
+      "path": "patches/0022-test-isolate-per-profile-Kanban-module-reloads.patch",
+      "bytes": 2862,
+      "sha256": "eb7434ad72e1147bb646fb9b325f1dc6d5fa9451e91f7b5054a3858f6983a4e8"
+    },
+    {
+      "path": "patches/0023-fix-authorize-mission-Docker-cwd-from-signed-policy.patch",
+      "bytes": 4131,
+      "sha256": "ad1cdd10f60ccc6ec7ad0eaf464d6b9c1195e7be1523bc456c2437ec9274edea"
+    },
+    {
+      "path": "patches/0024-fix-requeue-recovery-phase-mission-executors.patch",
+      "bytes": 3311,
+      "sha256": "4fc0f7c45ae65f8dbc8f4b9e2dea1731d257edb33cfdf9f1651f9130485eba11"
+    },
+    {
+      "path": "patches/0025-fix-compact-mission-retry-context.patch",
+      "bytes": 9153,
+      "sha256": "81151d714e4cafc922ec7b50cddd3ea4ce6f42928a6fb28afc4dd10e66f723be"
+    }
+  ]
+}

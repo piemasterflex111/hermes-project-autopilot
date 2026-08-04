@@ -1,0 +1,159 @@
+From 1badc8647c7c3488b1d7ef6dad0c68cd796000a3 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sun, 2 Aug 2026 13:49:36 -0700
+Subject: [PATCH 08/25] fix: canonicalize mission Docker workspace paths
+
+---
+ agent/mission_terminal_guard.py               | 14 ++++++++++++++
+ hermes_cli/mission_service.py                 | 19 +++++++++++++++++--
+ .../test_mission_plan_resumption.py           |  4 ++++
+ .../test_mission_terminal_containment.py      | 17 +++++++++++++++++
+ tools/terminal_tool.py                        | 15 +++++++++++++--
+ 5 files changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/agent/mission_terminal_guard.py b/agent/mission_terminal_guard.py
+index 2dcbd8f28..23c0c928c 100644
+--- a/agent/mission_terminal_guard.py
++++ b/agent/mission_terminal_guard.py
+@@ -44,6 +44,20 @@ def validate_command(command: str) -> None:
+             raise PermissionError(message)
+ 
+ 
++def canonicalize_command(command: str, policy: dict[str, Any]) -> str:
++    """Map the exact host mission worktree path to Docker's `/workspace`.
++
++    Mission cards retain the host worktree path for controller auditing. Models
++    may copy that path into a shell command, but it does not exist inside the
++    restricted container. The rewrite is exact and bounded to this mission's
++    worktree; arbitrary host paths are never translated or mounted.
++    """
++    validate_command(command)
++    root = str(_root(policy))
++    pattern = re.compile(re.escape(root) + r"""(?=$|[/\s'";:&|)])""")
++    return pattern.sub("/workspace", command)
++
++
+ def _root(policy: dict[str, Any]) -> Path:
+     raw = str(policy.get("worktree_path") or "").strip()
+     if not raw:
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index c83aa3e2c..502c9623f 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -601,7 +601,7 @@ def _add_execution_task_unlocked(
+     _validate_plan_scope(mission, [{"title": title, "body": body}])
+     with kb._trusted_mission_controller_mutation():
+         task_id = kb.create_task(
+-            conn, title=title, body=body, assignee=assignee,
++            conn, title=title, body=_mission_executor_body(body), assignee=assignee,
+             created_by="mission-planner", parents=dependencies,
+             workspace_kind="worktree", workspace_path=mission.worktree_path,
+             branch_name=mission.branch_name, project_id=mission.project_id,
+@@ -611,6 +611,21 @@ def _add_execution_task_unlocked(
+     return task_id
+ 
+ 
++_MISSION_EXECUTOR_RUNTIME_NOTE = (
++    "Mission runtime boundary: the existing repository root inside terminal "
++    "commands is /workspace. Never cd to or reference the host workspace_path. "
++    "Use repository-relative paths or /workspace paths. Create missing root "
++    "files with Hermes file tools rather than shell redirection."
++)
++
++
++def _mission_executor_body(body: str) -> str:
++    text = body.strip()
++    if _MISSION_EXECUTOR_RUNTIME_NOTE in text:
++        return text
++    return text + "\n\n" + _MISSION_EXECUTOR_RUNTIME_NOTE
++
++
+ _PLAN_VERIFIER_TITLE = "Independently verify mission acceptance criteria"
+ _PLAN_VERIFIER_BODY = (
+     "Read the mission contract, Git diff, and evidence. Do not trust executor "
+@@ -1126,7 +1141,7 @@ def _materialize_canonical_plan(
+             conn, mission,
+             role="executor",
+             title=item["title"],
+-            body=item["body"],
++            body=_mission_executor_body(item["body"]),
+             assignee=executor_assignee,
+             idempotency_key=_plan_task_key(
+                 mission.id, plan_hash, "executor", ordinal,
+diff --git a/tests/hermes_cli/test_mission_plan_resumption.py b/tests/hermes_cli/test_mission_plan_resumption.py
+index 2e727f8f1..4e1033e66 100644
+--- a/tests/hermes_cli/test_mission_plan_resumption.py
++++ b/tests/hermes_cli/test_mission_plan_resumption.py
+@@ -416,6 +416,10 @@ def test_planner_accepts_workspace_path_inside_contract(
+     assert json.loads(plan["payload_json"])["tasks"][0]["paths"] == [
+         "/workspace/app.py"
+     ]
++    executor_cards = _mission_cards(conn, mission_id, "executor")
++    assert len(executor_cards) == 1
++    assert "repository root inside terminal commands is /workspace" in executor_cards[0]["body"]
++    assert "Never cd to or reference the host workspace_path" in executor_cards[0]["body"]
+ 
+ 
+ def test_manual_task_rejects_body_path_outside_contract(prepared_mission):
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+index 540571394..69f3c88e8 100644
+--- a/tests/tools/test_mission_terminal_containment.py
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -459,3 +459,20 @@ def test_terminal_tool_blocks_mission_on_landlock_denial(
+     command_evidence = [item for item in evidence if item["kind"] == "command"]
+     assert command_evidence
+     assert command_evidence[-1]["metadata"]["containment"]["violations"] == []
++
++
++def test_command_maps_exact_host_worktree_to_container_root(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++    command = f"cd {repo} && python3 -m py_compile src/base.py && echo {repo}-backup"
++
++    canonical = guard.canonicalize_command(command, _policy(repo))
++
++    assert canonical.startswith("cd /workspace &&")
++    assert f"{repo}-backup" in canonical
++
++
++def test_command_without_host_worktree_is_unchanged(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++    command = "cd /workspace && python3 -m py_compile src/base.py"
++
++    assert guard.canonicalize_command(command, _policy(repo)) == command
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 6c2951409..514f71a23 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -3004,7 +3004,7 @@ def terminal_tool(
+                     require_terminal(command_cwd, env_type, background=False)
+                     if config.get("mission_restricted"):
+                         from agent.mission_terminal_guard import (
+-                            validate_command as _validate_mission_command,
++                            canonicalize_command as _canonicalize_mission_command,
+                             verify_clean_scope as _verify_mission_scope,
+                         )
+                         from agent.mission_scope import current_policy as _current_mission_policy
+@@ -3012,8 +3012,19 @@ def terminal_tool(
+                         _policy = _current_mission_policy()
+                         if _policy is None:
+                             raise PermissionError("mission terminal lost its scope policy")
+-                        _validate_mission_command(command)
++                        _original_command = command
++                        command = _canonicalize_mission_command(command, _policy)
+                         mission_guard_audit = {"before": _verify_mission_scope(_policy)}
++                        if command != _original_command:
++                            mission_guard_audit["command_path_rewrite"] = {
++                                "original_sha256": hashlib.sha256(
++                                    _original_command.encode("utf-8")
++                                ).hexdigest(),
++                                "executed_sha256": hashlib.sha256(
++                                    command.encode("utf-8")
++                                ).hexdigest(),
++                                "host_worktree_mapped_to": "/workspace",
++                            }
+                     execute_kwargs = {
+                         "timeout": effective_timeout,
+                         "cwd": command_cwd,
+-- 
+2.53.0
+

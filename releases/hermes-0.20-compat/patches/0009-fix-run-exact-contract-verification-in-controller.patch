@@ -1,0 +1,432 @@
+From 81de14948b81ca3810a8f0013f4ec7ca5e4c2614 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sun, 2 Aug 2026 14:01:03 -0700
+Subject: [PATCH 09/25] fix: run exact contract verification in controller
+
+---
+ agent/mission_terminal_guard.py               |  48 +++---
+ hermes_cli/mission_service.py                 | 140 ++++++++++++++++++
+ tests/hermes_cli/test_missions.py             | 102 +++++++++++++
+ .../test_mission_terminal_containment.py      |  75 ++++++++++
+ 4 files changed, 347 insertions(+), 18 deletions(-)
+
+diff --git a/agent/mission_terminal_guard.py b/agent/mission_terminal_guard.py
+index 23c0c928c..6d2792d65 100644
+--- a/agent/mission_terminal_guard.py
++++ b/agent/mission_terminal_guard.py
+@@ -383,20 +383,23 @@ def grant(path, rights):
+ for scratch in ("/tmp", "/root", "/home"):
+     grant(scratch, SCRATCH_WRITE_RIGHTS)
+ grant("/dev/null", FILE_RIGHTS)
+-allowed = json.loads(sys.argv[2])
+-for item in allowed:
+-    path = "/workspace/" + item.strip("/")
+-    if os.path.isdir(path):
+-        grant(path, WORKSPACE_WRITE_RIGHTS)
+-    elif os.path.isfile(path):
+-        grant(path, FILE_RIGHTS)
+-    else:
+-        # Landlock rules can only name existing filesystem objects. Missing
+-        # approved paths must be created through Hermes file tools, which
+-        # enforce the exact relative path before mutation.
+-        continue
+-if not allowed:
+-    grant("/workspace", WORKSPACE_WRITE_RIGHTS)
++spec = json.loads(sys.argv[2])
++allowed = spec["allowed_paths"]
++read_only_workspace = bool(spec["read_only_workspace"])
++if not read_only_workspace:
++    for item in allowed:
++        path = "/workspace/" + item.strip("/")
++        if os.path.isdir(path):
++            grant(path, WORKSPACE_WRITE_RIGHTS)
++        elif os.path.isfile(path):
++            grant(path, FILE_RIGHTS)
++        else:
++            # Landlock rules can only name existing filesystem objects. Missing
++            # approved paths must be created through Hermes file tools, which
++            # enforce the exact relative path before mutation.
++            continue
++    if not allowed:
++        grant("/workspace", WORKSPACE_WRITE_RIGHTS)
+ if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+     err = ctypes.get_errno()
+     raise OSError(err, os.strerror(err))
+@@ -433,10 +436,19 @@ os.execv("/bin/bash", ["bash", "-c", command])
+ """
+ 
+ 
+-def landlock_wrapped_command(command: str, policy: dict[str, Any]) -> list[str]:
++def landlock_wrapped_command(
++    command: str,
++    policy: dict[str, Any],
++    *,
++    read_only_workspace: bool = False,
++) -> list[str]:
+     """Return argv for a Landlock-confined bash command inside Docker."""
+     encoded_command = base64.b64encode(command.encode("utf-8")).decode("ascii")
+-    allowed_json = json.dumps(
+-        list(normalized_allowed_paths(policy)), separators=(",", ":")
++    spec = json.dumps(
++        {
++            "allowed_paths": list(normalized_allowed_paths(policy)),
++            "read_only_workspace": bool(read_only_workspace),
++        },
++        separators=(",", ":"),
+     )
+-    return ["python3", "-c", _LANDLOCK_LAUNCHER, encoded_command, allowed_json]
++    return ["python3", "-c", _LANDLOCK_LAUNCHER, encoded_command, spec]
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index 502c9623f..3c2e0adae 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -2104,6 +2104,133 @@ def _require_no_open_intents(conn, mission_id: str, *, action: str) -> None:
+         )
+ 
+ 
++def _configured_mission_docker_image() -> str:
++    from hermes_cli.config import load_config_readonly
++
++    config = load_config_readonly()
++    terminal = config.get("terminal") or {}
++    return str(
++        terminal.get("docker_image")
++        or "nikolaik/python-nodejs:python3.11-nodejs20"
++    )
++
++
++def _run_contract_verification_commands(
++    conn,
++    mission: mdb.Mission,
++    commands: list[str],
++) -> list[dict[str, Any]]:
++    """Run exact contract commands in a read-only offline mission container."""
++    if not commands:
++        return []
++    if not mission.worktree_path:
++        raise MissionError("verification requires a prepared mission worktree")
++    from agent.mission_terminal_guard import (
++        canonicalize_command,
++        landlock_wrapped_command,
++        verify_clean_scope,
++    )
++    from tools.environments.docker import find_docker
++
++    policy = _mission_runtime_policy(mission) | {"read_only": True}
++    verify_clean_scope(policy)
++    docker = find_docker()
++    if not docker:
++        raise MissionError("verification requires the Docker executable")
++    image = _configured_mission_docker_image()
++    root = Path(mission.worktree_path).resolve(strict=True)
++    results: list[dict[str, Any]] = []
++    for criterion in commands:
++        executed = canonicalize_command(criterion, policy)
++        argv = landlock_wrapped_command(
++            executed,
++            policy,
++            read_only_workspace=True,
++        )
++        started_at = int(time.time())
++        proc = subprocess.run(
++            [
++                docker,
++                "run",
++                "--rm",
++                "--network=none",
++                "--cap-drop=ALL",
++                "--security-opt=no-new-privileges",
++                "-v",
++                f"{root}:/workspace:ro",
++                "-w",
++                "/workspace",
++                image,
++                *argv,
++            ],
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            timeout=300,
++            check=False,
++            stdin=subprocess.DEVNULL,
++        )
++        finished_at = int(time.time())
++        containment = {
++            "controller_verification": True,
++            "network": "none",
++            "workspace_mount": "read-only",
++            "image": image,
++            "executed_command_sha256": hashlib.sha256(
++                executed.encode("utf-8")
++            ).hexdigest(),
++        }
++        evidence_id = record_command_result(
++            conn,
++            mission.id,
++            command=criterion,
++            cwd=str(root),
++            exit_code=int(proc.returncode),
++            stdout=proc.stdout,
++            started_at=started_at,
++            finished_at=finished_at,
++            containment=containment,
++        )
++        results.append(
++            {
++                "command": criterion,
++                "exit_code": int(proc.returncode),
++                "evidence_id": evidence_id,
++            }
++        )
++    verify_clean_scope(policy)
++    return results
++
++
++def _deterministic_failure_verdict(
++    mission: mdb.Mission,
++    report: dict[str, Any],
++) -> dict[str, Any]:
++    failed: list[str] = []
++    failed.extend(str(item) for item in report.get("missing_verification", []))
++    failed.extend(
++        f"scope violation: {item}" for item in report.get("scope_violations", [])
++    )
++    failed.extend(
++        f"unsupported path: {item}" for item in report.get("unsupported_paths", [])
++    )
++    if report.get("open_intent_count"):
++        failed.append("unresolved mutation intent")
++    if not report.get("evidence_chain_valid"):
++        failed.append("invalid evidence chain")
++    if not report.get("head_unchanged"):
++        failed.append("mission branch HEAD changed before controller commit")
++    if not report.get("changed_paths"):
++        failed.append("empty repository diff")
++    return {
++        "verdict": "fail",
++        "requirements_checked": max(1, len(mission.contract.verification)),
++        "requirements_failed": failed or ["deterministic verification failed"],
++        "evidence_missing": list(report.get("missing_verification", [])),
++        "recommended_action": "replan",
++    }
++
++
+ def deterministic_verification(
+     conn,
+     mission_id: str,
+@@ -2277,6 +2404,19 @@ def _verify_with_model_unlocked(conn, mission_id: str) -> mdb.Mission:
+     if mission.status == "running":
+         mission = mdb.transition_mission(conn, mission_id, "verifying", phase="verification")
+     deterministic = deterministic_verification(conn, mission_id)
++    if deterministic["missing_verification"]:
++        _run_contract_verification_commands(
++            conn,
++            mission,
++            list(deterministic["missing_verification"]),
++        )
++        deterministic = deterministic_verification(conn, mission_id)
++    if not deterministic["pass"]:
++        return _submit_verifier_verdict_unlocked(
++            conn,
++            mission_id,
++            _deterministic_failure_verdict(mission, deterministic),
++        )
+     diff = _run_git(Path(mission.worktree_path), "diff", "--no-ext-diff", mission.base_commit, "--")
+     evidence = [
+         {
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index e819a9b9d..d923d8ee7 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -1392,3 +1392,105 @@ def test_slash_and_cli_adapter_share_state(mission_env):
+ def shlex_quote(value: str) -> str:
+     import shlex
+     return shlex.quote(value)
++
++
++def test_controller_runs_missing_exact_verification_before_model(
++    mission_env, monkeypatch
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo, autonomy=3)
++    mission = service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Edit app.py", body="Set VALUE", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    worktree = Path(mission.worktree_path)
++    (worktree / "app.py").write_text("VALUE = 3\n")
++    assert kb.complete_task(conn, executor, result="implemented", summary="implemented")
++    observed = []
++
++    def exact_runner(run_conn, run_mission, commands):
++        observed.append(list(commands))
++        for command in commands:
++            service.record_command_result(
++                run_conn,
++                run_mission.id,
++                command=command,
++                cwd=str(worktree),
++                exit_code=0,
++                stdout="passed",
++                containment={
++                    "controller_verification": True,
++                    "workspace_mount": "read-only",
++                    "network": "none",
++                },
++            )
++        return [{"command": command, "exit_code": 0} for command in commands]
++
++    monkeypatch.setattr(service, "_run_contract_verification_commands", exact_runner)
++    monkeypatch.setattr(
++        "agent.auxiliary_client.call_llm",
++        lambda **kwargs: _passing_verifier_response(),
++    )
++
++    waiting = service.verify_with_model(conn, mid)
++
++    assert observed == [["verify-ok"]]
++    assert waiting.status == "awaiting_approval"
++    exact = [
++        row for row in mdb.list_evidence(conn, mid)
++        if row["kind"] == "command" and row["command"] == "verify-ok"
++    ]
++    assert exact and exact[-1]["status"] == "passed"
++    assert exact[-1]["metadata"]["containment"]["controller_verification"] is True
++
++
++def test_failed_exact_verification_skips_model(mission_env, monkeypatch):
++    conn, repo = mission_env
++    mid = _created(conn, repo, autonomy=3)
++    mission = service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn, mid, title="Edit app.py", body="Set VALUE", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    worktree = Path(mission.worktree_path)
++    (worktree / "app.py").write_text("VALUE = 3\n")
++    assert kb.complete_task(conn, executor, result="implemented", summary="implemented")
++    model_calls = []
++
++    def failing_runner(run_conn, run_mission, commands):
++        for command in commands:
++            service.record_command_result(
++                run_conn,
++                run_mission.id,
++                command=command,
++                cwd=str(worktree),
++                exit_code=1,
++                stdout="verification failed",
++                containment={
++                    "controller_verification": True,
++                    "workspace_mount": "read-only",
++                    "network": "none",
++                },
++            )
++        return [{"command": command, "exit_code": 1} for command in commands]
++
++    def model_must_not_run(**kwargs):
++        model_calls.append(kwargs)
++        raise AssertionError("semantic model ran after deterministic failure")
++
++    monkeypatch.setattr(service, "_run_contract_verification_commands", failing_runner)
++    monkeypatch.setattr("agent.auxiliary_client.call_llm", model_must_not_run)
++
++    blocked = service.verify_with_model(conn, mid)
++
++    assert blocked.status == "blocked"
++    assert blocked.phase == "verification"
++    assert model_calls == []
++    independent = [
++        row for row in mdb.list_evidence(conn, mid)
++        if row["kind"] == "independent_verifier"
++    ]
++    assert independent and independent[-1]["status"] == "failed"
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+index 69f3c88e8..be2c4ce92 100644
+--- a/tests/tools/test_mission_terminal_containment.py
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -476,3 +476,78 @@ def test_command_without_host_worktree_is_unchanged(tmp_path: Path) -> None:
+     command = "cd /workspace && python3 -m py_compile src/base.py"
+ 
+     assert guard.canonicalize_command(command, _policy(repo)) == command
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_controller_runs_exact_verification_in_read_only_container(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import mission_service as service
++    from hermes_cli import missions_db as mdb
++
++    hermes_home = tmp_path / "hermes-controller"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_home / "kanban"))
++    source = tmp_path / "controller-source"
++    source.mkdir()
++    source.chmod(0o755)
++    (source / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
++    _git(source, "init")
++    _git(source, "config", "user.email", "guard@example.test")
++    _git(source, "config", "user.name", "Guard Test")
++    _git(source, "add", "app.py")
++    _git(source, "commit", "-m", "base")
++    monkeypatch.setattr(
++        service,
++        "_configured_mission_docker_image",
++        lambda: MISSION_IMAGE,
++    )
++
++    with kb.connect_closing(board="default") as conn:
++        contract = mdb.MissionContract(
++            outcome="Update app.py",
++            verification=["python3 -m py_compile app.py"],
++            constraints=["Verification is read-only"],
++            boundaries={
++                "allowed_roots": [str(source)],
++                "allowed_paths": ["app.py"],
++                "network_destinations": [],
++            },
++        )
++        mission_id = mdb.create_mission(
++            conn,
++            objective="Prove controller verification isolation",
++            contract=contract,
++            autonomy_level=3,
++            repo_path=str(source),
++            board="default",
++        )
++        mission = service.prepare_mission(conn, mission_id)
++        worktree = Path(str(mission.worktree_path))
++        worktree.chmod(0o755)
++        (worktree / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
++
++        results = service._run_contract_verification_commands(
++            conn,
++            mission,
++            ["python3 -m py_compile app.py"],
++        )
++        evidence = mdb.list_evidence(conn, mission_id)
++
++    assert results == [
++        {
++            "command": "python3 -m py_compile app.py",
++            "exit_code": 0,
++            "evidence_id": results[0]["evidence_id"],
++        }
++    ]
++    exact = [row for row in evidence if row["kind"] == "command"]
++    assert exact and exact[-1]["command"] == "python3 -m py_compile app.py"
++    assert exact[-1]["exit_code"] == 0
++    assert exact[-1]["metadata"]["containment"]["workspace_mount"] == "read-only"
++    assert exact[-1]["metadata"]["containment"]["network"] == "none"
++    assert not (worktree / "__pycache__").exists()
++    assert not (worktree / ".pytest_cache").exists()
++    assert not (worktree / ".coverage").exists()
++    assert _git(worktree, "status", "--porcelain") == "M app.py"
+-- 
+2.53.0
+

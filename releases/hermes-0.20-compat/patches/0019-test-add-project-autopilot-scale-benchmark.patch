@@ -1,0 +1,365 @@
+From 4c6ba4a0ed2651a5ac1080b165c5084664ae9ad8 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 20:37:49 -0700
+Subject: [PATCH 19/25] test: add project autopilot scale benchmark
+
+---
+ scripts/benchmark_project_autopilot_scale.py | 295 +++++++++++++++++++
+ tests/hermes_cli/test_mission_scale.py       |  43 +++
+ 2 files changed, 338 insertions(+)
+ create mode 100755 scripts/benchmark_project_autopilot_scale.py
+ create mode 100644 tests/hermes_cli/test_mission_scale.py
+
+diff --git a/scripts/benchmark_project_autopilot_scale.py b/scripts/benchmark_project_autopilot_scale.py
+new file mode 100755
+index 000000000..ca62afb70
+--- /dev/null
++++ b/scripts/benchmark_project_autopilot_scale.py
+@@ -0,0 +1,295 @@
++#!/usr/bin/env python3
++"""Repeatable local scale benchmark for Hermes Project Autopilot.
++
++The benchmark uses an isolated temporary Git repository and isolated Kanban
++SQLite database. It creates many bounded missions instead of one unbounded
++plan, then exercises concurrent claims, sequential dependency promotion,
++evidence-chain growth, and restart persistence.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sqlite3
++import subprocess
++import tempfile
++import time
++from concurrent.futures import ThreadPoolExecutor, as_completed
++from pathlib import Path
++from typing import Any
++
++
++def _git(repo: Path, *args: str) -> str:
++    proc = subprocess.run(
++        ["git", "-C", str(repo), *args],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++    )
++    return proc.stdout.strip()
++
++
++def run_benchmark(*, mission_count: int, tasks_per_mission: int, workers: int,
++                  evidence_per_mission: int) -> dict[str, Any]:
++    if mission_count < 1:
++        raise ValueError("mission_count must be positive")
++    if not 1 <= tasks_per_mission <= 12:
++        raise ValueError("tasks_per_mission must be between 1 and 12")
++    if workers < 1:
++        raise ValueError("workers must be positive")
++    if evidence_per_mission < 0:
++        raise ValueError("evidence_per_mission cannot be negative")
++
++    started = time.perf_counter()
++    with tempfile.TemporaryDirectory(prefix="hermes-autopilot-scale-") as raw:
++        root = Path(raw)
++        hermes_home = root / "hermes"
++        os.environ["HERMES_HOME"] = str(hermes_home)
++        os.environ["HERMES_KANBAN_HOME"] = str(hermes_home / "kanban")
++        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
++
++        # Import only after the isolated environment is set.
++        from hermes_cli import kanban_db as kb
++        from hermes_cli import mission_service as service
++        from hermes_cli import missions_db as mdb
++
++        repo = root / "project"
++        repo.mkdir()
++        _git(repo, "init")
++        _git(repo, "config", "user.email", "scale@example.test")
++        _git(repo, "config", "user.name", "Autopilot Scale")
++        (repo / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
++        _git(repo, "add", "app.py")
++        _git(repo, "commit", "-m", "scale baseline")
++
++        # Scale tests exercise controller/database behavior without depending on
++        # the host's Docker daemon or pulling an image.
++        service._runtime_preflight = lambda mission: {
++            "docker": "/usr/bin/docker",
++            "docker_server": "scale-test",
++            "image": "scale-test-image",
++            "image_id": "sha256:scale",
++            "host_landlock_abi": 8,
++            "container_landlock_abi": 8,
++            "network": "none",
++            "workspace": mission.worktree_path,
++            "manifest": {"tracked": [], "untracked": [], "nested_git": []},
++        }
++
++        contract = mdb.MissionContract(
++            outcome="Update app.py through a bounded task chain",
++            verification=["python3 -m py_compile app.py"],
++            constraints=["Do not modify unrelated files"],
++            boundaries={
++                "allowed_roots": [str(repo)],
++                "allowed_paths": ["app.py"],
++                "network_destinations": [],
++            },
++            stop_when=["scope cannot be enforced"],
++            allow_local_commit=False,
++        )
++
++        mission_ids: list[str] = []
++        chains: list[list[str]] = []
++        setup_start = time.perf_counter()
++        with kb.connect_closing(board="scale") as conn:
++            db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
++            for mission_index in range(mission_count):
++                mission_id = mdb.create_mission(
++                    conn,
++                    objective=f"Scale mission {mission_index}",
++                    contract=contract,
++                    autonomy_level=3,
++                    repo_path=str(repo),
++                    board="scale",
++                )
++                service.prepare_mission(conn, mission_id)
++                chain: list[str] = []
++                for task_index in range(tasks_per_mission):
++                    task_id = service.add_execution_task(
++                        conn,
++                        mission_id,
++                        title=f"Mission {mission_index} step {task_index}",
++                        body="Inspect or update app.py and preserve the contract.",
++                        assignee="default",
++                    )
++                    chain.append(task_id)
++                service.finish_plan(conn, mission_id, verifier_assignee="default")
++                service.start_mission(conn, mission_id)
++                mission_ids.append(mission_id)
++                chains.append(chain)
++        setup_seconds = time.perf_counter() - setup_start
++
++        def claim(task_id: str, label: str) -> tuple[str, int] | None:
++            with kb.connect_closing(board="scale") as conn:
++                task = kb.claim_task(conn, task_id, claimer=label)
++                if task is None:
++                    return None
++                return task.id, int(task.current_run_id)
++
++        def complete(task_id: str, run_id: int) -> bool:
++            with kb.connect_closing(board="scale") as conn:
++                return kb.complete_task(
++                    conn,
++                    task_id,
++                    result="scale-step-complete",
++                    summary="scale-step-complete",
++                    expected_run_id=run_id,
++                )
++
++        execution_start = time.perf_counter()
++        duplicate_target = chains[0][0]
++        with ThreadPoolExecutor(max_workers=workers) as pool:
++            duplicate_results = list(
++                pool.map(
++                    lambda n: claim(duplicate_target, f"duplicate-{n}"),
++                    range(max(8, workers * 2)),
++                )
++            )
++        duplicate_winners = [item for item in duplicate_results if item is not None]
++        if len(duplicate_winners) != 1:
++            raise AssertionError(
++                f"expected one atomic claim winner, found {len(duplicate_winners)}"
++            )
++
++        completed_count = 0
++        for depth in range(tasks_per_mission):
++            claimed: dict[str, int] = {}
++            if depth == 0:
++                claimed[duplicate_winners[0][0]] = duplicate_winners[0][1]
++                targets = [chain[0] for chain in chains[1:]]
++            else:
++                targets = [chain[depth] for chain in chains]
++
++            with ThreadPoolExecutor(max_workers=workers) as pool:
++                futures = {
++                    pool.submit(claim, task_id, f"depth-{depth}-{idx}"): task_id
++                    for idx, task_id in enumerate(targets)
++                }
++                for future in as_completed(futures):
++                    result = future.result()
++                    if result is None:
++                        raise AssertionError(f"task was not claimable: {futures[future]}")
++                    claimed[result[0]] = result[1]
++
++            if len(claimed) != mission_count:
++                raise AssertionError(
++                    f"depth {depth}: expected {mission_count} claims, found {len(claimed)}"
++                )
++
++            with ThreadPoolExecutor(max_workers=workers) as pool:
++                completions = list(
++                    pool.map(lambda pair: complete(*pair), claimed.items())
++                )
++            if not all(completions):
++                raise AssertionError(f"depth {depth}: at least one completion failed")
++            completed_count += len(completions)
++            with kb.connect_closing(board="scale") as conn:
++                kb.recompute_ready(conn)
++
++        execution_seconds = time.perf_counter() - execution_start
++
++        evidence_start = time.perf_counter()
++        with kb.connect_closing(board="scale") as conn:
++            for mission_id in mission_ids:
++                mission = mdb.get_mission(conn, mission_id)
++                assert mission is not None and mission.worktree_path
++                for index in range(evidence_per_mission):
++                    mdb.record_evidence(
++                        conn,
++                        mission_id,
++                        kind="scale",
++                        status="passed",
++                        metadata={"index": index, "payload": "x" * 128},
++                        cwd=mission.worktree_path,
++                    )
++                if not mdb.verify_evidence_chain(conn, mission_id):
++                    raise AssertionError(f"evidence chain failed for {mission_id}")
++        evidence_seconds = time.perf_counter() - evidence_start
++
++        persistence_start = time.perf_counter()
++        with sqlite3.connect(db_path) as raw_conn:
++            raw_conn.row_factory = sqlite3.Row
++            integrity = raw_conn.execute("PRAGMA integrity_check").fetchone()[0]
++            journal_mode = raw_conn.execute("PRAGMA journal_mode").fetchone()[0]
++            counts = {
++                "missions": raw_conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0],
++                "tasks": raw_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
++                "executor_tasks": raw_conn.execute(
++                    "SELECT COUNT(*) FROM tasks WHERE mission_role='executor'"
++                ).fetchone()[0],
++                "done_executors": raw_conn.execute(
++                    "SELECT COUNT(*) FROM tasks WHERE mission_role='executor' AND status='done'"
++                ).fetchone()[0],
++                "evidence": raw_conn.execute(
++                    "SELECT COUNT(*) FROM mission_evidence"
++                ).fetchone()[0],
++                "open_runs": raw_conn.execute(
++                    "SELECT COUNT(*) FROM task_runs WHERE ended_at IS NULL"
++                ).fetchone()[0],
++            }
++        persistence_seconds = time.perf_counter() - persistence_start
++
++        expected_executors = mission_count * tasks_per_mission
++        if counts["missions"] != mission_count:
++            raise AssertionError(counts)
++        if counts["executor_tasks"] != expected_executors:
++            raise AssertionError(counts)
++        if counts["done_executors"] != expected_executors:
++            raise AssertionError(counts)
++        if completed_count != expected_executors:
++            raise AssertionError(completed_count)
++        if counts["open_runs"] != 0:
++            raise AssertionError(f"open task runs remain: {counts['open_runs']}")
++        if integrity != "ok":
++            raise AssertionError(f"SQLite integrity check: {integrity}")
++
++        db_bytes = db_path.stat().st_size
++        wal_path = Path(str(db_path) + "-wal")
++        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
++        total_seconds = time.perf_counter() - started
++        return {
++            "pass": True,
++            "mission_count": mission_count,
++            "tasks_per_mission": tasks_per_mission,
++            "executor_tasks": expected_executors,
++            "total_task_rows": counts["tasks"],
++            "evidence_rows": counts["evidence"],
++            "workers": workers,
++            "duplicate_claim_attempts": max(8, workers * 2),
++            "duplicate_claim_winners": len(duplicate_winners),
++            "setup_seconds": round(setup_seconds, 4),
++            "execution_seconds": round(execution_seconds, 4),
++            "evidence_seconds": round(evidence_seconds, 4),
++            "persistence_seconds": round(persistence_seconds, 4),
++            "total_seconds": round(total_seconds, 4),
++            "executor_tasks_per_second": round(expected_executors / execution_seconds, 2),
++            "database_bytes": db_bytes,
++            "wal_bytes": wal_bytes,
++            "journal_mode": journal_mode,
++            "sqlite_integrity": integrity,
++            "open_runs": counts["open_runs"],
++        }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--missions", type=int, default=100)
++    parser.add_argument("--tasks-per-mission", type=int, default=10)
++    parser.add_argument("--workers", type=int, default=24)
++    parser.add_argument("--evidence-per-mission", type=int, default=20)
++    args = parser.parse_args()
++    result = run_benchmark(
++        mission_count=args.missions,
++        tasks_per_mission=args.tasks_per_mission,
++        workers=args.workers,
++        evidence_per_mission=args.evidence_per_mission,
++    )
++    print(json.dumps(result, indent=2, sort_keys=True))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_mission_scale.py b/tests/hermes_cli/test_mission_scale.py
+new file mode 100644
+index 000000000..b3d24f8d7
+--- /dev/null
++++ b/tests/hermes_cli/test_mission_scale.py
+@@ -0,0 +1,43 @@
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++
++def _load_benchmark():
++    path = Path(__file__).parents[2] / "scripts" / "benchmark_project_autopilot_scale.py"
++    spec = importlib.util.spec_from_file_location("autopilot_scale_benchmark", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_bounded_multi_mission_scale_smoke():
++    benchmark = _load_benchmark()
++    result = benchmark.run_benchmark(
++        mission_count=6,
++        tasks_per_mission=4,
++        workers=8,
++        evidence_per_mission=3,
++    )
++    assert result["pass"] is True
++    assert result["executor_tasks"] == 24
++    assert result["duplicate_claim_winners"] == 1
++    assert result["sqlite_integrity"] == "ok"
++    assert result["open_runs"] == 0
++
++
++def test_scale_harness_rejects_unbounded_single_mission():
++    benchmark = _load_benchmark()
++    try:
++        benchmark.run_benchmark(
++            mission_count=1,
++            tasks_per_mission=13,
++            workers=1,
++            evidence_per_mission=0,
++        )
++    except ValueError as exc:
++        assert "between 1 and 12" in str(exc)
++    else:
++        raise AssertionError("unbounded mission should be rejected")
+-- 
+2.53.0
+

@@ -1,0 +1,40 @@
+From ec63be3f91902d7ca024984bcffccb10608570f1 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 14:30:18 -0700
+Subject: [PATCH 13/25] feat: configure dedicated mission verification image
+
+---
+ hermes_cli/config.py          | 1 +
+ hermes_cli/config_defaults.py | 4 ++++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index ff4629dac..78eab158f 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -3187,6 +3187,7 @@ TERMINAL_CONFIG_ENV_MAP = {
+     "timeout": "TERMINAL_TIMEOUT",
+     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
+     "docker_image": "TERMINAL_DOCKER_IMAGE",
++    "mission_verification_image": "TERMINAL_MISSION_VERIFICATION_IMAGE",
+     "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
+     "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
+     "modal_image": "TERMINAL_MODAL_IMAGE",
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 4ff18177a..128059334 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -305,6 +305,10 @@ DEFAULT_CONFIG = {
+         # non-interactively (e.g. one that hard-exits on TTY checks).
+         "auto_source_bashrc": True,
+         "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
++        # Dedicated image for controller-owned mission acceptance commands.
++        # Falls back to docker_image when unset, so ordinary terminal sessions
++        # can remain lightweight while verification adds project runtimes.
++        "mission_verification_image": None,
+         "docker_forward_env": [],
+         # Explicit environment variables to set inside Docker containers.
+         # Unlike docker_forward_env (which reads values from the host process),
+-- 
+2.53.0
+

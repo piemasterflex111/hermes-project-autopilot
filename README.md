@@ -73,6 +73,22 @@ flowchart LR
 
 See [Architecture](docs/architecture.md), [Lifecycle](docs/lifecycle.md), and [Security model](docs/security-model.md).
 
+## Current Hermes 0.20 compatibility release
+
+The original five-commit v1 archive below remains preserved. A newer, separately versioned compatibility release records the complete 25-commit port and hardening series ending at `305506473`, including recovery-phase retry, Docker policy authorization, scale benchmarking, and compact retry context.
+
+Fresh evidence for that release:
+
+- **215 focused mission integration tests passed**
+- **1,000 and 5,000 executor-task controller benchmarks passed**
+- **exactly one claim winner** under 48 and 96 simultaneous attempts
+- **zero leaked task runs**
+- **SQLite integrity `ok`**
+
+See [Hermes 0.20 compatibility release](releases/hermes-0.20-compat/README.md) and [Scalability](docs/scalability.md).
+
+The measured claim is a **scale-tested single-workstation controller**. It is not a claim of multi-machine distributed execution or thousands of simultaneous model workers.
+
 ## Release evidence
 
 Fresh verification against committed Hermes revision `a70c859e4`:
@@ -96,7 +112,7 @@ Artifacts:
 | Upstream | `https://github.com/NousResearch/hermes-agent.git` |
 | Public replay base | `e444d165807f489b5c1ab8e4a612c8d09c2e67a2` |
 | Required local prerequisite | `d8de415491a4935ad54021d10b2cc18f2c3d356b` |
-| Final implementation commit | `a70c859e4aae7e4159522b1c2bc50ced165193e3` |
+| Source implementation commit | `a70c859e4aae7e4159522b1c2bc50ced165193e3` |
 | Final Git tree | `7ba19cb3ce7b36f9b856b6290e247c050dc03ab3` |
 | Authored commits | 5 |
 | Exported integration files | 74 |

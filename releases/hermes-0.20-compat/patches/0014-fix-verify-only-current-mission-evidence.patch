@@ -1,0 +1,232 @@
+From a62c0b08dd8e42d4886b6c0563cf62e4c5a05bb2 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 14:42:03 -0700
+Subject: [PATCH 14/25] fix: verify only current mission evidence
+
+---
+ hermes_cli/mission_service.py     | 96 ++++++++++++++++++++++++++-----
+ tests/hermes_cli/test_missions.py | 73 +++++++++++++++++++++--
+ 2 files changed, 152 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index 23b041f30..ab4a3707b 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -2639,29 +2639,90 @@ def _verify_with_model_unlocked(conn, mission_id: str) -> mdb.Mission:
+             mission_id,
+             _deterministic_failure_verdict(mission, deterministic),
+         )
+-    diff = _run_git(Path(mission.worktree_path), "diff", "--no-ext-diff", mission.base_commit, "--")
++    root = Path(mission.worktree_path)
++    diff = _run_git(root, "diff", "--no-ext-diff", mission.base_commit, "--")
++
++    # Do not send the model the mission's unbounded historical evidence stream.
++    # Old failed attempts can swamp or contradict the current verified snapshot.
++    # Select only the latest passing record for each exact contract command whose
++    # workspace digest matches the deterministic verifier's current snapshot.
++    current_digest = str(
++        (deterministic.get("workspace_snapshot") or {}).get("digest") or ""
++    )
++    required_commands = set(mission.contract.verification)
++    current_command_evidence: dict[str, dict[str, Any]] = {}
++    latest_deterministic: Optional[dict[str, Any]] = None
++    for row in reversed(mdb.list_evidence(conn, mission_id)):
++        if latest_deterministic is None and row["kind"] == "deterministic_verifier":
++            latest_deterministic = {
++                "id": row["id"], "kind": row["kind"], "status": row["status"],
++                "metadata": row["metadata"],
++            }
++        command = row["command"]
++        metadata = row["metadata"] or {}
++        snapshot = metadata.get("workspace_snapshot") or {}
++        if (
++            row["kind"] == "command"
++            and row["status"] == "passed"
++            and command in required_commands
++            and command not in current_command_evidence
++            and str(snapshot.get("digest") or "") == current_digest
++        ):
++            containment = metadata.get("containment") or {}
++            current_command_evidence[str(command)] = {
++                "id": row["id"], "kind": row["kind"], "status": row["status"],
++                "command": command, "exit_code": row["exit_code"],
++                "blob_sha256": row["blob_sha256"],
++                "workspace_digest": snapshot.get("digest"),
++                "containment": containment,
++            }
++
+     evidence = [
+-        {
+-            "id": row["id"], "kind": row["kind"], "status": row["status"],
+-            "command": row["command"], "exit_code": row["exit_code"],
+-            "metadata": row["metadata"], "blob_sha256": row["blob_sha256"],
+-        }
+-        for row in mdb.list_evidence(conn, mission_id)
++        current_command_evidence[command]
++        for command in mission.contract.verification
++        if command in current_command_evidence
+     ]
++    if latest_deterministic is not None:
++        evidence.append(latest_deterministic)
++
++    # Embed the current text of changed artifacts so the independent verifier
++    # can inspect what exists instead of inferring content from filenames. Keep
++    # the payload bounded and fail closed on unsupported/binary artifacts.
++    artifact_contents: dict[str, str] = {}
++    artifact_budget = 96_000
++    for relative in deterministic.get("changed_paths", []):
++        path = root / str(relative)
++        if not path.is_file() or path.is_symlink():
++            continue
++        raw = path.read_bytes()
++        if b"\x00" in raw:
++            continue
++        text = raw.decode("utf-8", errors="replace")
++        if len(text) > artifact_budget:
++            text = text[:artifact_budget] + "\n...[truncated]"
++        artifact_contents[str(relative)] = text
++        artifact_budget -= min(len(text), artifact_budget)
++        if artifact_budget <= 0:
++            break
++
+     from agent.auxiliary_client import call_llm
+ 
+     system = (
+         "You are an independent verifier. You did not execute this work. Check the "
+-        "contract, diff, and evidence strictly. Reply with one JSON object containing "
+-        "exactly: verdict ('pass'|'fail'|'blocked'), requirements_checked (integer), "
+-        "requirements_failed (array), evidence_missing (array), recommended_action "
+-        "('commit' or 'replan'). Never accept executor claims without evidence."
++        "contract against the current artifact contents, diff, and current-snapshot "
++        "evidence only. The deterministic checker is controller-generated evidence, "
++        "not an executor claim. Do not request a file or command that is already "
++        "present in current_artifacts or current_evidence. Reply with one JSON object "
++        "containing exactly: verdict ('pass'|'fail'|'blocked'), requirements_checked "
++        "(integer), requirements_failed (array), evidence_missing (array), "
++        "recommended_action ('commit' or 'replan')."
+     )
+     payload = {
+         "contract": asdict(mission.contract),
+         "deterministic_checks": deterministic,
++        "current_artifacts": artifact_contents,
+         "diff": diff,
+-        "evidence": evidence,
++        "current_evidence": evidence,
+     }
+     response = call_llm(
+         task="mission_verifier",
+@@ -3246,7 +3307,16 @@ def _settle_verifier_task(conn, mission_id: str, *, passed: bool, reason: str) -
+     task = kb.get_task(conn, task_id)
+     if task is None or task.status == "done":
+         return
+-    if task.status not in {"ready", "running"}:
++    if task.status == "triage":
++        with kb._trusted_mission_controller_mutation():
++            retried = kb.retry_triage_task(
++                conn, task_id, actor="mission-controller",
++                reason="controller is executing a fresh independent verification",
++            )
++        if not retried:
++            return
++        task = kb.get_task(conn, task_id)
++    if task is not None and task.status not in {"ready", "running"}:
+         with kb._trusted_mission_controller_mutation():
+             promoted, _ = kb.promote_task(
+                 conn, task_id, actor="mission-controller",
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index 454414adf..809ed75ac 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -1602,16 +1602,39 @@ def test_controller_runs_missing_exact_verification_before_model(
+             )
+         return [{"command": command, "exit_code": 0} for command in commands]
+ 
+-    monkeypatch.setattr(service, "_run_contract_verification_commands", exact_runner)
+-    monkeypatch.setattr(
+-        "agent.auxiliary_client.call_llm",
+-        lambda **kwargs: _passing_verifier_response(),
++    service.record_command_result(
++        conn,
++        mid,
++        command="verify-ok",
++        cwd=str(worktree),
++        exit_code=1,
++        stdout="stale failed attempt",
++        containment={"controller_verification": True},
+     )
++    model_payloads = []
++
++    def passing_model(**kwargs):
++        model_payloads.append(json.loads(kwargs["messages"][1]["content"]))
++        return _passing_verifier_response()
++
++    monkeypatch.setattr(service, "_run_contract_verification_commands", exact_runner)
++    monkeypatch.setattr("agent.auxiliary_client.call_llm", passing_model)
+ 
+     waiting = service.verify_with_model(conn, mid)
+ 
+     assert observed == [["verify-ok"]]
+     assert waiting.status == "awaiting_approval"
++    assert len(model_payloads) == 1
++    verifier_payload = model_payloads[0]
++    assert verifier_payload["current_artifacts"]["app.py"] == "VALUE = 3\n"
++    command_rows = [
++        item for item in verifier_payload["current_evidence"]
++        if item.get("kind") == "command"
++    ]
++    assert len(command_rows) == 1
++    assert command_rows[0]["command"] == "verify-ok"
++    assert command_rows[0]["status"] == "passed"
++    assert command_rows[0]["exit_code"] == 0
+     exact = [
+         row for row in mdb.list_evidence(conn, mid)
+         if row["kind"] == "command" and row["command"] == "verify-ok"
+@@ -1668,3 +1691,45 @@ def test_failed_exact_verification_skips_model(mission_env, monkeypatch):
+         if row["kind"] == "independent_verifier"
+     ]
+     assert independent and independent[-1]["status"] == "failed"
++
++
++def test_settle_verifier_recovers_controller_owned_triage_card(mission_env):
++    conn, repo = mission_env
++    mid = _created(conn, repo, autonomy=3)
++    service.prepare_mission(conn, mid)
++    service.add_execution_task(
++        conn, mid, title="Edit app.py", body="Set VALUE", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    verifier = conn.execute(
++        "SELECT id FROM tasks WHERE mission_id=? AND mission_role='verifier'",
++        (mid,),
++    ).fetchone()["id"]
++
++    with kb._trusted_mission_controller_mutation():
++        promoted, reason = kb.promote_task(
++            conn, verifier, actor="test", reason="prepare verifier", force=True,
++        )
++    assert promoted, reason
++    assert kb.block_task(conn, verifier, reason="first failure", kind="needs_input")
++    with kb._trusted_mission_controller_mutation():
++        assert kb.unblock_task(conn, verifier)
++        promoted, reason = kb.promote_task(
++            conn, verifier, actor="test", reason="second verifier attempt", force=True,
++        )
++    assert promoted, reason
++    assert kb.block_task(conn, verifier, reason="same failure", kind="needs_input")
++    assert kb.get_task(conn, verifier).status == "triage"
++
++    service._settle_verifier_task(
++        conn, mid, passed=True, reason="Acceptance criteria passed.",
++    )
++
++    settled = kb.get_task(conn, verifier)
++    assert settled is not None
++    assert settled.status == "done"
++    assert settled.block_recurrences == 0
++    events = conn.execute(
++        "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (verifier,),
++    ).fetchall()
++    assert any(row["kind"] == "triage_retry_approved" for row in events)
+-- 
+2.53.0
+

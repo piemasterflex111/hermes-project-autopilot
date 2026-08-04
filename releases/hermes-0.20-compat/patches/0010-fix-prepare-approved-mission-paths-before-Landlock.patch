@@ -1,0 +1,366 @@
+From 0ce1569e73d161ae50f911df2d6727e48828428e Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 13:33:00 -0700
+Subject: [PATCH 10/25] fix: prepare approved mission paths before Landlock
+
+---
+ hermes_cli/mission_service.py                 | 135 ++++++++++++++++++
+ tests/hermes_cli/test_missions.py             | 129 +++++++++++++++++
+ .../test_mission_terminal_containment.py      |  41 ++++++
+ 3 files changed, 305 insertions(+)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index 3c2e0adae..c8089037b 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -506,6 +506,136 @@ def _validate_start_scope(mission: mdb.Mission) -> None:
+         raise MissionError(f"mission scope preflight failed: {exc}") from exc
+ 
+ 
++def _accepted_executor_path_hints(conn, mission: mdb.Mission) -> list[str]:
++    """Return normalized repository-relative paths from the accepted plan.
++
++    Automatic plans carry an immutable ``paths`` list. Manual plans predate
++    that structured field, so their accepted executor bodies are scanned with
++    the same conservative path grammar used during planning. The result is
++    only used to prepare parent directories; it never creates the leaf object.
++    """
++    hints: set[str] = set()
++    plan_row = mdb.get_plan(conn, mission.id)
++    if plan_row is not None:
++        tasks, _executor, _verifier = _load_canonical_plan(plan_row)
++        for index, task in enumerate(tasks, start=1):
++            for raw in task.get("paths") or []:
++                hints.add(_normalize_planned_path(mission, raw, task_index=index))
++            for match in _PLAN_PATH_RE.findall(str(task.get("body") or "")):
++                hints.add(_normalize_planned_path(mission, match, task_index=index))
++    else:
++        rows = conn.execute(
++            """SELECT body FROM tasks
++                 WHERE mission_id=? AND mission_role='executor'
++                 ORDER BY created_at,id""",
++            (mission.id,),
++        ).fetchall()
++        for index, row in enumerate(rows, start=1):
++            for match in _PLAN_PATH_RE.findall(str(row["body"] or "")):
++                hints.add(_normalize_planned_path(mission, match, task_index=index))
++    return sorted(hints, key=os.fsencode)
++
++
++def _path_is_inside_allowed_scope(relative: str, allowed: tuple[str, ...]) -> bool:
++    if not relative or relative == ".git" or relative.startswith(".git/"):
++        return False
++    if not allowed:
++        return True
++    return any(
++        relative == item
++        or relative.startswith(item + "/")
++        or item.startswith(relative + "/")
++        for item in allowed
++    )
++
++
++def _prepare_approved_parent_directories(conn, mission: mdb.Mission) -> dict[str, Any]:
++    """Materialize approved missing parents before Landlock is enforced.
++
++    Landlock path rules can only be attached to filesystem objects that already
++    exist. The trusted controller therefore creates the minimum parent
++    directory chain needed by accepted task outputs. Existing symlinks, files,
++    and any ``.git`` path fail closed. Leaf files and directories remain worker
++    outputs and are never created here.
++    """
++    if not mission.worktree_path:
++        raise MissionError("mission workspace preparation requires a worktree")
++    root = Path(mission.worktree_path).resolve(strict=True)
++    allowed = tuple(
++        sorted(
++            {
++                str(item).strip().strip("/")
++                for item in mission.contract.boundaries.get("allowed_paths", [])
++                if str(item).strip().strip("/")
++            },
++            key=os.fsencode,
++        )
++    )
++    hints = _accepted_executor_path_hints(conn, mission)
++    required: set[str] = set()
++    for hint in hints:
++        parts = Path(hint).parts
++        for depth in range(1, len(parts)):
++            relative = Path(*parts[:depth]).as_posix()
++            if not _path_is_inside_allowed_scope(relative, allowed):
++                raise MissionError(
++                    f"workspace preparation path is outside the mission contract: {relative}"
++                )
++            required.add(relative)
++
++    created: list[str] = []
++    existing: list[str] = []
++    for relative in sorted(required, key=lambda item: (item.count("/"), os.fsencode(item))):
++        target = root / relative
++        try:
++            target.lstat()
++        except FileNotFoundError:
++            parent = target.parent.resolve(strict=True)
++            if parent != root and root not in parent.parents:
++                raise MissionError(
++                    f"workspace preparation escaped the mission worktree: {relative}"
++                )
++            os.mkdir(target, mode=0o755)
++            created.append(relative)
++            continue
++        if target.is_symlink():
++            raise MissionError(
++                f"workspace preparation refuses symbolic-link parent: {relative}"
++            )
++        if not target.is_dir():
++            raise MissionError(
++                f"workspace preparation parent is not a directory: {relative}"
++            )
++        existing.append(relative)
++
++    report = {
++        "version": 1,
++        "worktree": str(root),
++        "path_hints": hints,
++        "required_directories": sorted(required, key=os.fsencode),
++        "created_directories": sorted(created, key=os.fsencode),
++        "existing_directories": sorted(existing, key=os.fsencode),
++    }
++    canonical = json.dumps(
++        report, ensure_ascii=False, sort_keys=True, separators=(",", ":")
++    )
++    report["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++    store_evidence_blob(
++        conn,
++        mission,
++        kind="workspace_preparation",
++        status="passed",
++        content=json.dumps(report, ensure_ascii=False, sort_keys=True),
++        metadata={
++            "sha256": report["sha256"],
++            "created_directories": report["created_directories"],
++            "required_directories": report["required_directories"],
++        },
++        cwd=str(root),
++    )
++    return report
++
++
+ def prepare_mission(conn, mission_id: str) -> mdb.Mission:
+     """Idempotently prepare one mission under its cross-process lock."""
+     with _mission_action_lock(conn, mission_id) as held:
+@@ -1382,6 +1512,8 @@ def _start_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+         mission, expected_head=mission.base_commit, require_clean=True,
+     )
+     _validate_start_scope(mission)
++    _prepare_approved_parent_directories(conn, mission)
++    _validate_start_scope(mission)
+     if not mission.root_task_id:
+         raise MissionError("mission has no controller task")
+     root = kb.get_task(conn, mission.root_task_id)
+@@ -2557,6 +2689,9 @@ def retry_mission(conn, mission_id: str) -> mdb.Mission:
+         if target == "running":
+             validate_mission_task_graph(conn, mission_id, boundary="retry")
+             if mission.phase == "execution":
++                _validate_start_scope(mission)
++                _prepare_approved_parent_directories(conn, mission)
++                _validate_start_scope(mission)
+                 retried_tasks = _requeue_blocked_execution_tasks(conn, mission_id)
+         mdb.record_evidence(
+             conn, mission_id, kind="lifecycle", status="passed",
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index d923d8ee7..e14036bd8 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -240,6 +240,135 @@ def test_prepare_adopts_exact_git_artifacts_after_crash(mission_env):
+     assert _git(worktree, "rev-parse", "HEAD") == base
+ 
+ 
++def test_start_prepares_missing_approved_parent_directory(mission_env):
++    conn, repo = mission_env
++    contract = _contract(repo, allowed_paths=["scripts"])
++    mid = mdb.create_mission(
++        conn,
++        objective="Create an integrity script",
++        contract=contract,
++        autonomy_level=4,
++        repo_path=str(repo),
++        board="default",
++    )
++    mission = service.prepare_mission(conn, mid)
++    service.add_execution_task(
++        conn,
++        mid,
++        title="Create integrity script",
++        body=(
++            "Create scripts/verify_integrity.sh and verify it with "
++            "bash scripts/verify_integrity.sh"
++        ),
++        assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    scripts = Path(mission.worktree_path) / "scripts"
++    assert not scripts.exists()
++
++    started = service.start_mission(conn, mid)
++
++    assert started.status == "running"
++    assert scripts.is_dir()
++    evidence = [
++        row for row in mdb.list_evidence(conn, mid)
++        if row["kind"] == "workspace_preparation"
++    ]
++    assert len(evidence) == 1
++    assert evidence[0]["status"] == "passed"
++    assert evidence[0]["metadata"]["created_directories"] == ["scripts"]
++    assert evidence[0]["metadata"]["required_directories"] == ["scripts"]
++    assert len(evidence[0]["metadata"]["sha256"]) == 64
++
++
++def test_start_rejects_symbolic_link_parent_for_approved_output(mission_env):
++    conn, repo = mission_env
++    contract = _contract(repo, allowed_paths=["scripts"])
++    mid = mdb.create_mission(
++        conn,
++        objective="Create an integrity script",
++        contract=contract,
++        autonomy_level=4,
++        repo_path=str(repo),
++        board="default",
++    )
++    mission = service.prepare_mission(conn, mid)
++    service.add_execution_task(
++        conn,
++        mid,
++        title="Create integrity script",
++        body="Create scripts/verify_integrity.sh",
++        assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    outside = repo.parent / "outside-scripts"
++    outside.mkdir()
++    (Path(mission.worktree_path) / "scripts").symlink_to(
++        outside, target_is_directory=True
++    )
++
++    current = mdb.get_mission(conn, mid)
++    assert current is not None
++    with pytest.raises(service.MissionError, match="symbolic-link parent"):
++        service._prepare_approved_parent_directories(conn, current)
++
++    assert mdb.get_mission(conn, mid).status == "ready"
++    assert not list(outside.iterdir())
++
++
++def test_retry_prepares_missing_approved_parent_without_recreating_mission(
++    mission_env,
++):
++    conn, repo = mission_env
++    contract = _contract(repo, allowed_paths=["scripts"])
++    mid = mdb.create_mission(
++        conn,
++        objective="Create an integrity script",
++        contract=contract,
++        autonomy_level=4,
++        repo_path=str(repo),
++        board="default",
++    )
++    mission = service.prepare_mission(conn, mid)
++    executor = service.add_execution_task(
++        conn,
++        mid,
++        title="Create integrity script",
++        body="Create scripts/verify_integrity.sh",
++        assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    scripts = Path(mission.worktree_path) / "scripts"
++    scripts.rmdir()
++    assert not scripts.exists()
++    assert kb.block_task(
++        conn,
++        executor,
++        reason="approved directory was not prepared",
++        kind="capability",
++    )
++    mdb.transition_mission(
++        conn,
++        mid,
++        "blocked",
++        phase="execution",
++        blocked_reason="approved directory was not prepared",
++    )
++
++    retried = service.retry_mission(conn, mid)
++
++    assert retried.status == "running"
++    assert scripts.is_dir()
++    assert kb.get_task(conn, executor).status in {"ready", "todo"}
++    preparation = [
++        row for row in mdb.list_evidence(conn, mid)
++        if row["kind"] == "workspace_preparation"
++    ]
++    assert len(preparation) == 2
++    assert preparation[-1]["metadata"]["created_directories"] == ["scripts"]
++
++
+ def test_explicit_start_gate_prevents_early_dispatch(mission_env):
+     conn, repo = mission_env
+     mid = _created(conn, repo)
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+index be2c4ce92..24134656c 100644
+--- a/tests/tools/test_mission_terminal_containment.py
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -185,6 +185,47 @@ def test_landlock_denies_forbidden_write_in_real_container(tmp_path: Path) -> No
+     assert not (repo / "forbidden.py").exists()
+ 
+ 
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_landlock_allows_write_under_prepared_approved_directory(
++    tmp_path: Path,
++) -> None:
++    repo = _repo(tmp_path)
++    (repo / "scripts").mkdir()
++    policy = _policy(repo, allowed=["scripts"])
++    argv = guard.landlock_wrapped_command(
++        "mkdir -p /workspace/scripts && "
++        "touch /workspace/scripts/check.sh",
++        policy,
++    )
++
++    proc = subprocess.run(
++        [
++            "docker",
++            "run",
++            "--rm",
++            "--network=none",
++            "--cap-drop=ALL",
++            "--cap-add=DAC_OVERRIDE",
++            "--security-opt=no-new-privileges",
++            "-v",
++            f"{repo}:/workspace",
++            "-w",
++            "/workspace",
++            MISSION_IMAGE,
++            *argv,
++        ],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        timeout=60,
++        check=False,
++    )
++
++    assert proc.returncode == 0, proc.stdout
++    assert (repo / "scripts" / "check.sh").is_file()
++    assert not (repo / "forbidden.py").exists()
++
++
+ @REQUIRES_LOCAL_MISSION_IMAGE
+ def test_runtime_preflight_proves_real_image_and_landlock(tmp_path: Path) -> None:
+     repo = _repo(tmp_path)
+-- 
+2.53.0
+
