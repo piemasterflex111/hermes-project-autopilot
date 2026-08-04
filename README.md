@@ -101,6 +101,29 @@ An eight-patch delta now records the August 4 runtime repair after source head `
 
 See [Hermes 0.20 runtime-repair r2](releases/hermes-0.20-runtime-repair-r2/README.md) and [Runtime containment modes](docs/runtime-containment-modes.md). The manual-plan runtime path is proven; end-to-end `plan-auto` acceptance remains pending.
 
+
+## `ha` one-command release r3
+
+The latest four-patch usability delta turns the audited mission engine into a
+single everyday command:
+
+```bash
+ha "describe the task"
+```
+
+The command automatically handles project registration, mission creation,
+dispatch, independent verification, verified local commit creation, and safe
+application back to the working tree. It supports dirty parent repositories,
+read-only repository inspection, normal change requests, and repositories with
+no first commit yet.
+
+- Deployed feature head: `d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4`
+- Exact final tree: `43bd0f96f5b44398a70dc5485614f4a6d3b49712`
+- 14 focused command tests and 100 mission regressions passed
+- Full replay count: 37 ordered patches from the compatibility base
+
+See [`ha` one-command release r3](releases/hermes-0.20-ha-one-command-r3/README.md).
+
 ### Operational acceptance evidence
 
 The current release also includes two higher-level gates:
