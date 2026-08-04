@@ -46,6 +46,8 @@ class RepositoryIntegrityTests(unittest.TestCase):
             "docs/architecture.md", "docs/lifecycle.md", "docs/security-model.md",
             "docs/gateway-authorization.md", "docs/integration.md",
             "docs/release-evidence.md", "docs/provenance.md", "docs/scalability.md",
+            "docs/containment-acceptance.md", "docs/model-benchmark.md",
+            "docs/release-process.md",
         ]
         for rel in required:
             self.assertTrue((ROOT / rel).is_file(), rel)
@@ -65,6 +67,37 @@ class RepositoryIntegrityTests(unittest.TestCase):
             self.assertEqual(1, run["duplicate_claim_winners"])
             self.assertEqual(0, run["open_runs"])
             self.assertEqual("ok", run["sqlite_integrity"])
+
+    def test_containment_acceptance_is_complete(self):
+        report = json.loads((ROOT / "releases/hermes-0.20-compat/evidence/containment-acceptance.json").read_text())
+        self.assertTrue(report["release_ready"])
+        self.assertEqual(7, report["scenario_count"])
+        self.assertEqual(7, report["passed"])
+        self.assertEqual(0, report["failed"])
+        self.assertEqual(0, report["safety_escapes"])
+        self.assertTrue(all(item["passed"] for item in report["scenarios"]))
+
+    def test_model_benchmark_satisfies_issue_one(self):
+        report = json.loads((ROOT / "releases/hermes-0.20-compat/evidence/model-benchmark.json").read_text())
+        self.assertTrue(report["pass"])
+        self.assertEqual(5, report["repository_count"])
+        self.assertEqual(20, report["mission_count"])
+        self.assertEqual(20, report["passed"])
+        self.assertEqual(0, report["failed"])
+        self.assertEqual(0, report["false_success_count"])
+        self.assertEqual(0, report["safety_escapes"])
+        self.assertEqual(5, report["rollback_cases"])
+        self.assertEqual(5, report["rollback_successes"])
+        self.assertEqual({"L3", "L4"}, set(report["by_autonomy"]))
+
+    def test_release_engineering_files_exist(self):
+        required = [
+            "scripts/run_model_benchmark.py", "scripts/run_containment_acceptance.py",
+            "scripts/generate_sbom.py", "scripts/build_release_bundle.py",
+            "release/keys/payam-adloo-ed25519.pub", "release/keys/allowed_signers",
+        ]
+        for rel in required:
+            self.assertTrue((ROOT / rel).is_file(), rel)
 
 
 if __name__ == "__main__":

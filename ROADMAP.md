@@ -21,13 +21,19 @@
 - [x] Atomic claim contention with exactly one winner
 - [x] Recovery-phase retry and compact retry-context regressions
 
+## Completed operational gates
+
+- [x] Terminal allowed-path containment acceptance gate: 7/7 scenarios, zero escapes
+- [x] Controller verifier rejects nested Git repositories
+- [x] Signed release and SBOM generation process
+
 ## Next engineering milestones
 
 - [ ] Destination-level egress enforcement for non-empty network allowlists
-- [ ] Model-driven multi-repository benchmark corpus
+- [x] Model-driven multi-repository benchmark corpus: 5 repositories, 20 missions, zero false successes and zero safety escapes
 - [x] Quantified single-workstation controller throughput, contention, persistence, and evidence growth
 - [ ] Quantified model context consumption, human intervention rate, retry count, and end-to-end completion latency
-- [ ] Signed release artifacts and software bill of materials
+- [x] Signed release bundle tooling and SPDX 2.3 software bill of materials
 - [ ] Upstream pull-request decomposition and review plan
 - [ ] Optional remote operations behind separate cryptographic and human approval gates
 

@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Build, checksum, sign, and verify Project Autopilot release assets."""
+from __future__ import annotations
+import argparse, hashlib, json, shutil, subprocess, sys
+from pathlib import Path
+
+def run(cmd, **kwargs):
+    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, **kwargs)
+def sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", type=Path, required=True); ap.add_argument("--tag", required=True)
+    ap.add_argument("--output-dir", type=Path, required=True); ap.add_argument("--signing-key", type=Path, required=True)
+    ap.add_argument("--identity", default="piemasterflex111"); args = ap.parse_args()
+    repo, out, tag = args.repo.resolve(), args.output_dir.resolve(), args.tag
+    out.mkdir(parents=True, exist_ok=True)
+    commit = run(["git", "-C", str(repo), "rev-parse", tag]).stdout.strip()
+    tree = run(["git", "-C", str(repo), "rev-parse", f"{tag}^{{tree}}"]).stdout.strip()
+    base = f"hermes-project-autopilot-{tag}"
+    archive = out / f"{base}.tar.gz"
+    with archive.open("wb") as fh:
+        subprocess.run(["git", "-C", str(repo), "archive", "--format=tar.gz", f"--prefix={base}/", tag], stdout=fh, check=True)
+    sbom = out / f"{base}.spdx.json"
+    run([sys.executable, str(repo / "scripts/generate_sbom.py"), "--repo", str(repo), "--ref", tag, "--output", str(sbom)])
+    manifest = out / f"{base}.manifest.json"
+    manifest.write_text(json.dumps({"schema_version": 1, "tag": tag, "commit": commit, "tree": tree, "artifacts": {archive.name: sha(archive), sbom.name: sha(sbom)}}, indent=2) + "\n")
+    sums = out / "SHA256SUMS"
+    sums.write_text("".join(f"{sha(p)}  {p.name}\n" for p in [archive, sbom, manifest]))
+    public = Path(str(args.signing_key) + ".pub") if Path(str(args.signing_key) + ".pub").exists() else repo / "release/keys/payam-adloo-ed25519.pub"
+    allowed = out / "allowed_signers"; allowed.write_text(args.identity + " " + public.read_text().strip() + "\n")
+    shutil.copy2(public, out / "release-signing-key.pub")
+    sig = Path(str(sums) + ".sig"); sig.unlink(missing_ok=True)
+    run(["ssh-keygen", "-Y", "sign", "-f", str(args.signing_key), "-n", "file", str(sums)])
+    verify = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(allowed), "-I", args.identity, "-n", "file", "-s", str(sig)], input=sums.read_text(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if verify.returncode:
+        raise SystemExit(verify.stdout)
+    (out / "VERIFY.txt").write_text(f"sha256sum -c SHA256SUMS\nssh-keygen -Y verify -f allowed_signers -I {args.identity} -n file -s SHA256SUMS.sig < SHA256SUMS\n")
+    print(json.dumps({"tag": tag, "commit": commit, "tree": tree, "signature_verified": True, "assets": sorted(p.name for p in out.iterdir())}, indent=2))
+    return 0
+if __name__ == "__main__":
+    raise SystemExit(main())

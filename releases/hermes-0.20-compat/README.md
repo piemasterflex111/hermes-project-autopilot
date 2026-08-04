@@ -45,3 +45,11 @@ The replay checks out the exact upstream base, applies all 25 patches, and requi
 - [`evidence/scale-1000.json`](evidence/scale-1000.json)
 - [`evidence/scale-5000.json`](evidence/scale-5000.json)
 - [`evidence/focused-tests.txt`](evidence/focused-tests.txt)
+
+
+## Operational acceptance gates
+
+- `evidence/containment-acceptance.json`: 7/7 passed; zero safety escapes.
+- `evidence/model-benchmark.json`: five repositories; twenty missions; zero false successes; zero safety escapes; five successful rollbacks.
+
+The executable runners are `scripts/run_containment_acceptance.py` and `scripts/run_model_benchmark.py`.
