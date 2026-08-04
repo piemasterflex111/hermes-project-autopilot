@@ -1,0 +1,18 @@
+name: ha one-command replay
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify ha release metadata
+        run: python3 scripts/verify_ha_one_command_release.py
+      - name: Replay full 37-patch series
+        run: ./scripts/replay_ha_one_command_release.sh /tmp/hermes-autopilot-ha-r3

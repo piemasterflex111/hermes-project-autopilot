@@ -1,0 +1,586 @@
+From 703a49e784b29ea7ded29d50e30a420f26f47e96 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 14:50:05 -0700
+Subject: [PATCH] fix(autopilot): support unborn repos and inspect mode
+
+---
+ hermes_cli/autopilot_cmd.py            | 322 +++++++++++++++++++++++--
+ tests/hermes_cli/test_autopilot_cmd.py |  83 +++++++
+ 2 files changed, 380 insertions(+), 25 deletions(-)
+
+diff --git a/hermes_cli/autopilot_cmd.py b/hermes_cli/autopilot_cmd.py
+index e903c59a7..b6f1b6773 100644
+--- a/hermes_cli/autopilot_cmd.py
++++ b/hermes_cli/autopilot_cmd.py
+@@ -31,6 +31,19 @@ from hermes_cli import projects_db as pdb
+ 
+ _TERMINAL_STATUSES = {"succeeded", "blocked", "failed", "cancelled"}
+ _SAFE_SEGMENT = re.compile(r"[^a-zA-Z0-9._-]+")
++_MUTATION_INTENT = re.compile(
++    r"\b(create|make|add|write|generate|build|fix|implement|update|edit|change|"
++    r"modify|remove|delete|rename|move|refactor|install|configure|setup|set up|"
++    r"document|save)\b",
++    re.IGNORECASE,
++)
++_INSPECTION_INTENT = re.compile(
++    r"\b(tell me|what (?:is|does|are)|explain|describe|summari[sz]e|analy[sz]e|"
++    r"inspect|review|list|show me|report)\b",
++    re.IGNORECASE,
++)
++_REPORT_NAME = "AUTOPILOT_REPORT.md"
++_CONTEXT_NAME = "AUTOPILOT_CONTEXT.json"
+ 
+ 
+ class AutopilotError(RuntimeError):
+@@ -45,6 +58,8 @@ class RepositoryContext:
+     source_repo: Path
+     shadow_path: Optional[Path]
+     dirty: bool
++    unborn: bool = False
++    baseline_commit: Optional[str] = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -97,6 +112,15 @@ def build_parser(parent_subparsers) -> argparse.ArgumentParser:
+             "When omitted, the selected folder itself is the scope."
+         ),
+     )
++    parser.add_argument(
++        "--mode",
++        choices=("auto", "change", "inspect"),
++        default="auto",
++        help=(
++            "auto detects whether the request should modify files or only answer a "
++            "repository question; change and inspect force the behavior."
++        ),
++    )
+     parser.add_argument("--profile", default="default")
+     parser.add_argument("--board", default=None)
+     parser.add_argument("--timeout", type=int, default=600)
+@@ -111,13 +135,20 @@ def build_parser(parent_subparsers) -> argparse.ArgumentParser:
+     return parser
+ 
+ 
+-def _git(repo: Path, *args: str, check: bool = True, binary: bool = False):
++def _git(
++    repo: Path,
++    *args: str,
++    check: bool = True,
++    binary: bool = False,
++    env: Optional[dict[str, str]] = None,
++):
+     proc = subprocess.run(
+         ["git", "-C", str(repo), *args],
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+         text=not binary,
+         check=False,
++        env=env,
+     )
+     if check and proc.returncode != 0:
+         stderr = proc.stderr.decode(errors="replace") if binary else proc.stderr
+@@ -130,6 +161,104 @@ def _safe_slug(value: str) -> str:
+     return slug[:48] or "task"
+ 
+ 
++def _detect_mode(objective: str, requested: str = "auto") -> str:
++    if requested in {"change", "inspect"}:
++        return requested
++    value = str(objective or "").strip()
++    if _MUTATION_INTENT.search(value):
++        return "change"
++    if _INSPECTION_INTENT.search(value):
++        return "inspect"
++    return "change"
++
++
++def _report_path(prefix: str) -> str:
++    return f"{prefix}/{_REPORT_NAME}".strip("/") if prefix else _REPORT_NAME
++
++
++def _context_path(prefix: str) -> str:
++    return f"{prefix}/{_CONTEXT_NAME}".strip("/") if prefix else _CONTEXT_NAME
++
++
++def _inspection_context(context: RepositoryContext) -> dict:
++    raw = _git(context.source_repo, "ls-files", "-z", binary=True).stdout
++    files: list[dict[str, object]] = []
++    prefix = context.scope_prefix.rstrip("/")
++    for item in raw.split(b"\0"):
++        if not item:
++            continue
++        repo_path = item.decode(errors="surrogateescape")
++        if repo_path in {_REPORT_NAME, _CONTEXT_NAME}:
++            continue
++        if prefix:
++            if repo_path == prefix:
++                display = Path(repo_path).name
++            elif repo_path.startswith(prefix + "/"):
++                display = repo_path[len(prefix) + 1 :]
++            else:
++                continue
++        else:
++            display = repo_path
++        if display in {_REPORT_NAME, _CONTEXT_NAME} or display.startswith(".git"):
++            continue
++        target = context.source_repo / repo_path
++        try:
++            data = target.read_bytes()
++        except OSError:
++            continue
++        entry: dict[str, object] = {"path": display, "bytes": len(data)}
++        if len(data) <= 20000 and b"\0" not in data:
++            entry["content"] = data.decode("utf-8", errors="replace")
++        else:
++            entry["content"] = None
++            entry["binary_or_large"] = True
++        files.append(entry)
++    return {
++        "scope": "." if not prefix else prefix,
++        "file_count": len(files),
++        "files": files,
++    }
++
++
++def _ensure_inspection_shadow(context: RepositoryContext) -> RepositoryContext:
++    if context.shadow_path is not None:
++        return context
++    shadow = _create_shadow(context.original_root, "HEAD")
++    return RepositoryContext(
++        original_root=context.original_root,
++        invocation_dir=context.invocation_dir,
++        scope_prefix=context.scope_prefix,
++        source_repo=shadow,
++        shadow_path=shadow,
++        dirty=context.dirty,
++        unborn=context.unborn,
++        baseline_commit=context.baseline_commit,
++    )
++
++
++def _commit_inspection_context(context: RepositoryContext, relative_path: str) -> None:
++    payload = _inspection_context(context)
++    target = context.source_repo / relative_path
++    target.parent.mkdir(parents=True, exist_ok=True)
++    target.write_text(
++        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
++        encoding="utf-8",
++    )
++    env = os.environ.copy()
++    env.setdefault("GIT_AUTHOR_NAME", "Hermes Autopilot")
++    env.setdefault("GIT_AUTHOR_EMAIL", "autopilot@local")
++    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
++    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
++    _git(context.source_repo, "add", "--", relative_path, env=env)
++    _git(
++        context.source_repo,
++        "commit",
++        "-m",
++        "chore: stage Autopilot inspection context",
++        env=env,
++    )
++
++
+ def _resolve_repository(start: str | Path) -> tuple[Path, Path, str]:
+     invocation = Path(start).expanduser().resolve()
+     if invocation.is_file():
+@@ -155,6 +284,36 @@ def _repo_dirty(repo: Path) -> bool:
+     return bool(_git(repo, "status", "--porcelain", "-z").stdout)
+ 
+ 
++def _has_head(repo: Path) -> bool:
++    return _git(repo, "rev-parse", "--verify", "HEAD", check=False).returncode == 0
++
++
++def _synthetic_baseline(repo: Path) -> str:
++    temp_root = Path.home() / ".hermes" / "autopilot" / "temporary-indexes"
++    temp_root.mkdir(parents=True, exist_ok=True)
++    index = temp_root / f"index-{int(time.time())}-{os.getpid()}"
++    env = os.environ.copy()
++    env["GIT_INDEX_FILE"] = str(index)
++    env.setdefault("GIT_AUTHOR_NAME", "Hermes Autopilot")
++    env.setdefault("GIT_AUTHOR_EMAIL", "autopilot@local")
++    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
++    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
++    try:
++        _git(repo, "read-tree", "--empty", env=env)
++        _git(repo, "add", "-A", "--", ".", env=env)
++        tree = _git(repo, "write-tree", env=env).stdout.strip()
++        return _git(
++            repo,
++            "commit-tree",
++            tree,
++            "-m",
++            "Autopilot synthetic baseline",
++            env=env,
++        ).stdout.strip()
++    finally:
++        index.unlink(missing_ok=True)
++
++
+ def _shadow_base(original_root: Path) -> Path:
+     digest = hashlib.sha256(str(original_root).encode()).hexdigest()[:12]
+     return Path.home() / ".hermes" / "autopilot" / "shadows" / (
+@@ -162,18 +321,20 @@ def _shadow_base(original_root: Path) -> Path:
+     )
+ 
+ 
+-def _create_shadow(original_root: Path) -> Path:
++def _create_shadow(original_root: Path, ref: str = "HEAD") -> Path:
+     base = _shadow_base(original_root)
+     base.mkdir(parents=True, exist_ok=True)
+     shadow = base / f"run-{int(time.time())}-{os.getpid()}"
+-    _git(original_root, "worktree", "add", "--detach", str(shadow), "HEAD")
++    _git(original_root, "worktree", "add", "--detach", str(shadow), ref)
+     return shadow.resolve()
+ 
+ 
+ def _prepare_repository(start: str | Path) -> RepositoryContext:
+     root, invocation, prefix = _resolve_repository(start)
++    unborn = not _has_head(root)
+     dirty = _repo_dirty(root)
+-    shadow = _create_shadow(root) if dirty else None
++    baseline = _synthetic_baseline(root) if unborn else None
++    shadow = _create_shadow(root, baseline or "HEAD") if (dirty or unborn) else None
+     return RepositoryContext(
+         original_root=root,
+         invocation_dir=invocation,
+@@ -181,6 +342,8 @@ def _prepare_repository(start: str | Path) -> RepositoryContext:
+         source_repo=shadow or root,
+         shadow_path=shadow,
+         dirty=dirty,
++        unborn=unborn,
++        baseline_commit=baseline,
+     )
+ 
+ 
+@@ -236,19 +399,44 @@ def _verification_commands(prefix: str, commands: Iterable[str]) -> list[str]:
+     return ['git diff --check && test -n "$(git status --porcelain)"']
+ 
+ 
+-def _task_body(objective: str, prefix: str) -> str:
++def _task_body(
++    objective: str,
++    prefix: str,
++    *,
++    mode: str = "change",
++    report_path: Optional[str] = None,
++    context_path: Optional[str] = None,
++) -> str:
+     target = f"/workspace/{prefix}" if prefix else "/workspace"
+-    return (
+-        f"Complete this objective: {objective.strip()}\n\n"
++    common = (
+         f"Target folder: {target}\n"
+         "The existing repository root is /workspace. Begin terminal work with "
+-        "cd /workspace, then edit the target folder from that root. Do not run "
+-        "any git command: the host controller owns Git inspection, verification, "
+-        "and commit. Never run git init, git clone, git worktree, or uv init. "
++        "cd /workspace. Do not run any git command: the host controller owns Git "
++        "inspection, verification, and commit. Never run git init, git clone, "
++        "git worktree, or uv init. Do not write outside /workspace."
++    )
++    if mode == "inspect":
++        if not report_path or not context_path:
++            raise AutopilotError("inspection mode requires context and report paths")
++        return (
++            f"Answer this repository question: {objective.strip()}\n\n"
++            f"{common}\n"
++            f"Use only the sanitized repository manifest at `/workspace/{context_path}` "
++            "as your source. Do not inspect any other filesystem path. Write a "
++            "concise, factual answer to "
++            f"`/workspace/{report_path}`. Start with '# Autopilot Report'. Include "
++            "what exists, what the repository currently does, and important "
++            "limitations supported by the manifest. Do not mention the manifest, "
++            "`.git`, Hermes, worktrees, mission branches, task IDs, or absolute host "
++            "paths. Do not recommend deleting or changing files unless the question "
++            "asks for a change. Do not invent functionality."
++        )
++    return (
++        f"Complete this objective: {objective.strip()}\n\n"
++        f"{common}\n"
+         "Use normal terminal and file tools. Perform the requested file change "
+-        "before any optional inspection. Make the smallest complete change that "
+-        "satisfies the objective. Do not create another repository or write "
+-        "outside /workspace. When finished, report the exact files changed."
++        "before optional inspection. Make the smallest complete change that "
++        "satisfies the objective. When finished, report the exact files changed."
+     )
+ 
+ 
+@@ -356,7 +544,27 @@ def _write_patch(
+     return patch_path, paths
+ 
+ 
+-def _local_conflicts(original_root: Path, changed_paths: Iterable[str]) -> tuple[str, ...]:
++def _working_path_matches_commit(repo: Path, path: str, commit: str) -> bool:
++    entry = _git(repo, "ls-tree", commit, "--", path, check=False).stdout.strip()
++    local = repo / path
++    if not entry:
++        return not local.exists() and not local.is_symlink()
++    if not local.is_file() or local.is_symlink():
++        return False
++    try:
++        oid = entry.split(None, 3)[2]
++    except IndexError:
++        return False
++    local_oid = _git(repo, "hash-object", "--", path, check=False).stdout.strip()
++    return bool(local_oid) and local_oid == oid
++
++
++def _local_conflicts(
++    original_root: Path,
++    changed_paths: Iterable[str],
++    *,
++    base_commit: Optional[str] = None,
++) -> tuple[str, ...]:
+     conflicts: list[str] = []
+     for path in changed_paths:
+         status = _git(
+@@ -367,8 +575,11 @@ def _local_conflicts(original_root: Path, changed_paths: Iterable[str]) -> tuple
+             "--",
+             path,
+         ).stdout
+-        if status.strip():
+-            conflicts.append(path)
++        if not status.strip():
++            continue
++        if base_commit and _working_path_matches_commit(original_root, path, base_commit):
++            continue
++        conflicts.append(path)
+     return tuple(conflicts)
+ 
+ 
+@@ -390,7 +601,11 @@ def _apply_verified_change(
+         return ApplyResult(False, patch_path, (), reason="verified commit has no changed files")
+     if not apply:
+         return ApplyResult(False, patch_path, changed_paths, reason="automatic apply disabled")
+-    conflicts = _local_conflicts(context.original_root, changed_paths)
++    conflicts = _local_conflicts(
++        context.original_root,
++        changed_paths,
++        base_commit=base_commit,
++    )
+     if conflicts:
+         return ApplyResult(
+             False,
+@@ -423,9 +638,18 @@ def _apply_verified_change(
+     return ApplyResult(True, patch_path, changed_paths)
+ 
+ 
+-def _result_payload(report: dict, context: RepositoryContext, applied: ApplyResult) -> dict:
++def _result_payload(
++    report: dict,
++    context: RepositoryContext,
++    applied: ApplyResult,
++    *,
++    mode: str = "change",
++    answer: Optional[str] = None,
++) -> dict:
+     mission = report["mission"]
+     return {
++        "mode": mode,
++        "answer": answer,
+         "mission_id": mission["id"],
+         "status": mission["status"],
+         "blocked_reason": mission.get("blocked_reason"),
+@@ -454,11 +678,23 @@ def autopilot_command(args: argparse.Namespace) -> int:
+     context: Optional[RepositoryContext] = None
+     try:
+         context = _prepare_repository(args.repo)
+-        allowed = _allowed_paths(context.scope_prefix, args.path)
+-        verification = _verification_commands(context.scope_prefix, args.verify)
++        mode = _detect_mode(objective, args.mode)
++        report_path = _report_path(context.scope_prefix) if mode == "inspect" else None
++        context_path = _context_path(context.scope_prefix) if mode == "inspect" else None
++        if mode == "inspect":
++            context = _ensure_inspection_shadow(context)
++            assert report_path is not None and context_path is not None
++            _commit_inspection_context(context, context_path)
++            allowed = [context_path, report_path]
++            verification = [f"test -s {shlex.quote(report_path)}"]
++            outcome = f"Write a factual answer to {report_path}"
++        else:
++            allowed = _allowed_paths(context.scope_prefix, args.path)
++            verification = _verification_commands(context.scope_prefix, args.verify)
++            outcome = (args.outcome or objective).strip()
+         project_id = _ensure_project(context, board)
+         contract = mdb.MissionContract(
+-            outcome=(args.outcome or objective).strip(),
++            outcome=outcome,
+             verification=verification,
+             constraints=[
+                 "Make the smallest complete change required by the objective.",
+@@ -489,7 +725,13 @@ def autopilot_command(args: argparse.Namespace) -> int:
+                 conn,
+                 mission.id,
+                 title=objective[:120],
+-                body=_task_body(objective, context.scope_prefix),
++                body=_task_body(
++                    objective,
++                    context.scope_prefix,
++                    mode=mode,
++                    report_path=report_path,
++                    context_path=context_path,
++                ),
+                 assignee=args.profile,
+                 parents=[],
+             )
+@@ -500,8 +742,11 @@ def autopilot_command(args: argparse.Namespace) -> int:
+             )
+             mission = mission_service.start_mission(conn, mission.id)
+         if not args.json:
+-            mode = "clean shadow" if context.shadow_path else "repository"
+-            print(f"Autopilot {mission.id}: working in {mode} for {context.invocation_dir}")
++            source_mode = "clean shadow" if context.shadow_path else "repository"
++            print(
++                f"Autopilot {mission.id}: working in {source_mode} "
++                f"for {context.invocation_dir}"
++            )
+         report = _wait_for_mission(
+             board,
+             mission.id,
+@@ -516,6 +761,7 @@ def autopilot_command(args: argparse.Namespace) -> int:
+                 report,
+                 context,
+                 ApplyResult(False, None, (), reason="mission did not succeed"),
++                mode=mode,
+             )
+             if args.json:
+                 print(json.dumps(payload, indent=2, default=str))
+@@ -529,6 +775,32 @@ def autopilot_command(args: argparse.Namespace) -> int:
+         base = str(current.get("base_commit") or "").strip()
+         if not verified or not base:
+             raise AutopilotError("mission succeeded without a verifiable commit identity")
++        if mode == "inspect":
++            assert report_path is not None
++            answer = _git(
++                context.source_repo,
++                "show",
++                f"{verified}:{report_path}",
++            ).stdout.strip()
++            applied = ApplyResult(
++                False,
++                None,
++                (),
++                reason="inspection mode does not modify the source checkout",
++            )
++            payload = _result_payload(
++                report,
++                context,
++                applied,
++                mode=mode,
++                answer=answer,
++            )
++            if args.json:
++                print(json.dumps(payload, indent=2, default=str))
++            else:
++                print(answer)
++                print(f"\nInspected and independently verified by mission {mission.id}.")
++            return 0
+         applied = _apply_verified_change(
+             context,
+             mission_id=mission.id,
+@@ -536,7 +808,7 @@ def autopilot_command(args: argparse.Namespace) -> int:
+             verified_commit=verified,
+             apply=not args.no_apply,
+         )
+-        payload = _result_payload(report, context, applied)
++        payload = _result_payload(report, context, applied, mode=mode)
+         if args.json:
+             print(json.dumps(payload, indent=2, default=str))
+         else:
+diff --git a/tests/hermes_cli/test_autopilot_cmd.py b/tests/hermes_cli/test_autopilot_cmd.py
+index 0a4f0fe73..177c942cd 100644
+--- a/tests/hermes_cli/test_autopilot_cmd.py
++++ b/tests/hermes_cli/test_autopilot_cmd.py
+@@ -172,3 +172,86 @@ def test_task_body_pins_existing_repository_root() -> None:
+     assert "Never run git init" in body
+     assert "controller owns Git inspection" in body
+     assert "Target folder: /workspace/nested" in body
++
++
++def test_detect_mode_prefers_mutation_for_combined_request() -> None:
++    assert ap._detect_mode("tell me what this repo has") == "inspect"
++    assert ap._detect_mode("tell me what this repo has and make a linux directory") == "change"
++    assert ap._detect_mode("explain this", "change") == "change"
++
++
++def test_inspection_task_writes_report_without_existing_file_edits() -> None:
++    report = ap._report_path("nested")
++    body = ap._task_body(
++        "tell me what this repo does",
++        "nested",
++        mode="inspect",
++        report_path=report,
++        context_path=ap._context_path("nested"),
++    )
++    assert report == "nested/AUTOPILOT_REPORT.md"
++    assert "Use only the sanitized repository manifest" in body
++    assert f"/workspace/{report}" in body
++    assert "Do not mention the manifest, `.git`" in body
++    assert "Do not recommend deleting" in body
++
++
++def test_unborn_repository_uses_synthetic_clean_shadow(tmp_path: Path, monkeypatch) -> None:
++    repo = tmp_path / "unborn"
++    repo.mkdir()
++    git(repo, "init", "-b", "main")
++    git(repo, "config", "user.name", "Test User")
++    git(repo, "config", "user.email", "test@example.com")
++    (repo / "README.md").write_text("unborn content\n", encoding="utf-8")
++    git(repo, "add", "README.md")
++    monkeypatch.setattr(ap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
++
++    context = ap._prepare_repository(repo)
++    try:
++        assert context.unborn is True
++        assert context.shadow_path is not None
++        assert context.baseline_commit
++        assert git(context.source_repo, "show", "HEAD:README.md") == "unborn content"
++        assert subprocess.run(
++            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            check=False,
++        ).returncode != 0
++    finally:
++        ap._cleanup_shadow(context)
++
++def test_inspection_task_delimits_report_path_for_plan_parser() -> None:
++    report = ap._report_path("")
++    body = ap._task_body(
++        "tell me what this repo does",
++        "",
++        mode="inspect",
++        report_path=report,
++        context_path=ap._context_path(""),
++    )
++    matches = ap.mission_service._PLAN_PATH_RE.findall(body)
++    assert "/workspace/AUTOPILOT_REPORT.md" in matches
++    assert "/workspace/AUTOPILOT_REPORT.md." not in matches
++
++
++def test_inspection_context_excludes_git_and_internal_files(tmp_path: Path) -> None:
++    repo = init_repo(tmp_path)
++    (repo / "AUTOPILOT_CONTEXT.json").write_text("internal\n", encoding="utf-8")
++    (repo / "AUTOPILOT_REPORT.md").write_text("internal\n", encoding="utf-8")
++    git(repo, "add", "AUTOPILOT_CONTEXT.json", "AUTOPILOT_REPORT.md")
++    git(repo, "commit", "-m", "internal files")
++    context = ap.RepositoryContext(
++        original_root=repo.resolve(),
++        invocation_dir=repo.resolve(),
++        scope_prefix="",
++        source_repo=repo.resolve(),
++        shadow_path=None,
++        dirty=False,
++    )
++    payload = ap._inspection_context(context)
++    paths = {item["path"] for item in payload["files"]}
++    assert "README.md" in paths
++    assert "AUTOPILOT_CONTEXT.json" not in paths
++    assert "AUTOPILOT_REPORT.md" not in paths
++    assert not any(path.startswith(".git") for path in paths)
+-- 
+2.53.0
+

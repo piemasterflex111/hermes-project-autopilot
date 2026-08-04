@@ -1,0 +1,43 @@
+{
+  "release_id": "hermes-0.20-ha-one-command-r3-2026-08-04",
+  "active_base_commit": "edf49e9b8c1287a501964119011d962529e58142",
+  "active_head_commit": "d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4",
+  "base_expected_tree": "3de433cb93ac980be1fdd96cb4006cffdb5d4943",
+  "expected_final_tree": "43bd0f96f5b44398a70dc5485614f4a6d3b49712",
+  "focused_tests": {
+    "autopilot_command_passed": 14,
+    "mission_regressions_passed": 100,
+    "failed": 0
+  },
+  "capabilities": {
+    "single_command_entrypoint": "ha",
+    "dirty_parent_repository_shadowing": true,
+    "safe_verified_patch_application": true,
+    "inspect_mode_without_source_modification": true,
+    "change_mode_with_verified_application": true,
+    "unborn_repository_support": true,
+    "explicit_verification_optional": true,
+    "internal_git_metadata_redacted_from_inspection": true
+  },
+  "acceptance": {
+    "dirty_repository_change": {
+      "status": "succeeded",
+      "result": "verified file applied while unrelated local changes remained untouched"
+    },
+    "unborn_repository_inspection": {
+      "status": "succeeded",
+      "source_commit_created": false,
+      "source_report_file_created": false
+    },
+    "unborn_repository_change": {
+      "status": "succeeded",
+      "result": "verified linux/README.md applied without requiring a manual first commit"
+    },
+    "existing_repository_inspection": {
+      "status": "succeeded",
+      "source_modified": false,
+      "internal_paths_exposed": false
+    }
+  },
+  "remote_side_effects": false
+}

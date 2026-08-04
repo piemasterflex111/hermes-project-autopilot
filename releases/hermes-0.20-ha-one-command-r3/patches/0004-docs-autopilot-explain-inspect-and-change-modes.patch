@@ -1,0 +1,50 @@
+From d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 14:50:05 -0700
+Subject: [PATCH] docs(autopilot): explain inspect and change modes
+
+---
+ docs/user-guide/autopilot-everyday.md | 30 +++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/docs/user-guide/autopilot-everyday.md b/docs/user-guide/autopilot-everyday.md
+index 42846a1fc..cb457d76e 100644
+--- a/docs/user-guide/autopilot-everyday.md
++++ b/docs/user-guide/autopilot-everyday.md
+@@ -33,3 +33,33 @@ Useful options:
+ - `--json`: return machine-readable output.
+ 
+ If verified files overlap existing local edits, Hermes does not overwrite them. It saves the verified patch under `~/.hermes/autopilot/results/<mission-id>/verified.patch` and reports the conflicting paths.
++
++## Inspect versus change
++
++`ha` now detects whether the request should answer a repository question or
++modify files.
++
++```bash
++ha "tell me what this repo does"
++```
++
++Inspection mode creates a sanitized, temporary repository manifest, runs the
++analysis in an isolated mission, prints the independently verified answer, and
++does not add a report file to the source checkout.
++
++```bash
++ha "create a linux directory and add linux/README.md"
++```
++
++Change mode creates, verifies, and safely applies the requested repository
++change. A request containing both inspection and mutation language is treated
++as a change request.
++
++Use `--mode inspect` or `--mode change` to override automatic detection.
++
++## Repositories without a first commit
++
++`ha` works after `git init` even when `HEAD` does not exist. It creates a
++temporary synthetic baseline from the current working tree without moving the
++source branch or making a source commit. Verified changes are applied back to
++the working tree, while inspection leaves the source untouched.
+-- 
+2.53.0
+

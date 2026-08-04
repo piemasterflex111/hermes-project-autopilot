@@ -1,0 +1,25 @@
+{
+  "patch_count": 4,
+  "patches": [
+    {
+      "path": "patches/0001-feat-autopilot-add-one-command-everyday-workflow.patch",
+      "bytes": 34614,
+      "sha256": "b61e9076501e198e9ee8d6a2726e77c142cd01b713c5759ac42d80ac87441bac"
+    },
+    {
+      "path": "patches/0002-docs-autopilot-document-one-command-workflow.patch",
+      "bytes": 2228,
+      "sha256": "687a45a5f8cf398d69261e6c6599e1947505a9afc57faf85e82accd5b4c76258"
+    },
+    {
+      "path": "patches/0003-fix-autopilot-support-unborn-repos-and-inspect-mode.patch",
+      "bytes": 23261,
+      "sha256": "b9881a52caf626dcbafec4bb5f643890afbf1b10c6643360e02d58bd852099aa"
+    },
+    {
+      "path": "patches/0004-docs-autopilot-explain-inspect-and-change-modes.patch",
+      "bytes": 1925,
+      "sha256": "0681f4439a2d6e77416aa608d70ea10e202027257a21ad0c55614ce0c3d29e5f"
+    }
+  ]
+}

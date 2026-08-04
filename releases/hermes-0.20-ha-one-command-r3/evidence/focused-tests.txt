@@ -1,0 +1,9 @@
+Hermes ha one-command feature acceptance
+========================================
+14 focused autopilot command tests passed
+100 mission regression tests passed
+0 failures
+Dirty repository change acceptance: passed
+Unborn repository inspection acceptance: passed
+Unborn repository change acceptance: passed
+Existing repository read-only inspection acceptance: passed
