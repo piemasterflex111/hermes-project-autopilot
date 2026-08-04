@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-04 — Hermes 0.20 runtime-repair r2
+
+- publish an eight-patch delta after compatibility source head `305506473`;
+- reject unregistered mission executor and verifier profiles before storage;
+- introduce workspace-permissive runtime execution while retaining strict planning-time path validation;
+- force restricted mission containers to run as the host UID/GID;
+- record 86 Docker/containment tests, 100 mission regressions, exact 33-patch replay, and a successful independent-verifier local-commit mission.
+
 ## v1.0.0 — Project Autopilot implementation archive
 
 ### Added

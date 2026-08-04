@@ -20,6 +20,8 @@
 - [x] 1,000-task and 5,000-task controller benchmarks
 - [x] Atomic claim contention with exactly one winner
 - [x] Recovery-phase retry and compact retry-context regressions
+- [x] Eight-patch Hermes 0.20 runtime-repair delta with exact replay tree
+- [x] Host-UID mission execution and successful executor/verifier/local-commit proof
 
 ## Completed operational gates
 
@@ -35,6 +37,7 @@
 - [ ] Quantified model context consumption, human intervention rate, retry count, and end-to-end completion latency
 - [x] Signed release bundle tooling and SPDX 2.3 software bill of materials
 - [ ] Upstream pull-request decomposition and review plan
+- [ ] Explicit CLI containment-mode selection and end-to-end `plan-auto` acceptance
 - [ ] Optional remote operations behind separate cryptographic and human approval gates
 
 Remote push, merge, deployment, and service restart must remain outside the v1 authority model.
