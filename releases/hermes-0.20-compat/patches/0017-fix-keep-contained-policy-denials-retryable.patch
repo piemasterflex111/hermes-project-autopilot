@@ -1,0 +1,284 @@
+From 5af5d6b387e6a1de60afe2bb767f2d283283e3d3 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 18:32:33 -0700
+Subject: [PATCH 17/25] fix: keep contained policy denials retryable
+
+---
+ hermes_cli/mission_service.py                 |  32 ++++++
+ .../test_mission_terminal_containment.py      | 102 ++++++++++++++++++
+ tools/terminal_tool.py                        |  99 +++++++++++++----
+ 3 files changed, 214 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index 59b63e94a..a5a8f7a1e 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -2018,6 +2018,38 @@ def block_terminal_containment_violation(
+             blocked_reason=reason,
+         )
+ 
++def record_terminal_policy_denial(
++    conn,
++    mission_id: str,
++    *,
++    task_id: str,
++    run_id: int,
++    reason: str,
++    audit: dict[str, Any],
++) -> None:
++    """Record a successfully contained policy denial without revoking the run.
++
++    Landlock may deny an internal write attempted by a test or subprocess even
++    when the model's command did not directly target a forbidden path. When no
++    out-of-scope filesystem entry appeared, containment succeeded: return the
++    failed command to the worker so it can narrow its strategy, while keeping
++    the durable mission lease active.
++    """
++    mission = mdb.get_mission(conn, mission_id)
++    if mission is None:
++        raise KeyError(mission_id)
++    mdb.record_evidence(
++        conn,
++        mission_id,
++        kind="sandbox_policy_error",
++        status="failed",
++        metadata=_redact_value({"reason": reason, **audit}),
++        task_id=task_id,
++        run_id=run_id,
++        cwd=mission.worktree_path,
++    )
++
++
+ def record_command_result(
+     conn,
+     mission_id: str,
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+index 772ca61cb..a98a70514 100644
+--- a/tests/tools/test_mission_terminal_containment.py
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -642,3 +642,105 @@ def test_controller_verification_disables_python_bytecode(
+ 
+     assert results[0]["exit_code"] == 0
+     assert not (Path(mission.worktree_path) / "__pycache__").exists()
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_indirect_landlock_denial_is_nonfatal_sandbox_policy_error(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import mission_service as service
++    from hermes_cli import missions_db as mdb
++    from tools import terminal_tool as terminal_module
++
++    hermes_home = tmp_path / "hermes-contained-denial"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_home / "kanban"))
++    source = _repo(tmp_path)
++    # The command names only app.py. The script computes the forbidden target
++    # internally, which models a broad test regenerating an unrelated artifact.
++    (source / "app.py").write_text(
++        "from pathlib import Path\nPath('/workspace/generated.out').write_text('x')\n",
++        encoding="utf-8",
++    )
++    _git(source, "add", "app.py")
++    _git(source, "commit", "-m", "indirect writer")
++
++    with kb.connect_closing(board="default") as conn:
++        contract = mdb.MissionContract(
++            outcome="Run a bounded test",
++            verification=["true"],
++            boundaries={
++                "allowed_roots": [str(source)],
++                "allowed_paths": ["app.py"],
++                "network_destinations": [],
++            },
++            allow_local_commit=False,
++        )
++        mission_id = mdb.create_mission(
++            conn, objective="Contain internal write", contract=contract,
++            autonomy_level=3, repo_path=str(source), board="default",
++        )
++        mission = service.prepare_mission(conn, mission_id)
++        executor = service.add_execution_task(
++            conn, mission_id, title="Run app", body="Run app.py", assignee="default",
++        )
++        service.finish_plan(conn, mission_id, verifier_assignee="default")
++        service.start_mission(conn, mission_id)
++        claimed = kb.claim_task(conn, executor)
++        assert claimed is not None
++        db_path = conn.execute("PRAGMA database_list").fetchone()[2]
++
++    worktree = Path(str(mission.worktree_path))
++    worktree.chmod(0o755)
++    policy = {
++        "mission_id": mission_id,
++        "mission_role": "executor",
++        "autonomy_level": 3,
++        "board": "default",
++        "worktree_path": str(worktree),
++        "allowed_paths": ["app.py"],
++        "network_destinations": [],
++        "allowed_terminal_backends": ["docker"],
++        "read_only": False,
++    }
++    monkeypatch.setenv("HERMES_MISSION_POLICY", json.dumps(policy))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", executor)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
++    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
++    monkeypatch.setenv("TERMINAL_ENV", "docker")
++    monkeypatch.setenv("TERMINAL_CWD", str(worktree))
++    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", MISSION_IMAGE)
++    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
++    monkeypatch.setenv("TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "false")
++    monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "false")
++    monkeypatch.delenv("HERMES_MISSION_EXECUTION_REVOKED", raising=False)
++    terminal_module.clear_session_cwd(executor)
++
++    try:
++        result = json.loads(terminal_module.terminal_tool(
++            command="cd /workspace && python3 app.py",
++            task_id=executor,
++            timeout=60,
++            force=True,
++        ))
++    finally:
++        terminal_module.cleanup_vm(executor, force_remove=True)
++        terminal_module.clear_session_cwd(executor)
++
++    assert result["exit_code"] == 126
++    assert "sandbox policy denied internal writes" in result["output"]
++    assert "HERMES_MISSION_EXECUTION_REVOKED" not in os.environ
++    assert not (worktree / "generated.out").exists()
++    with kb.connect_closing(board="default") as conn:
++        task = kb.get_task(conn, executor)
++        current = mdb.get_mission(conn, mission_id)
++        evidence = mdb.list_evidence(conn, mission_id)
++    assert task is not None and task.status == "running"
++    assert current is not None and current.status == "running"
++    policy_errors = [item for item in evidence if item["kind"] == "sandbox_policy_error"]
++    assert policy_errors
++    assert policy_errors[-1]["metadata"]["classification"] == "sandbox_policy_error"
++    assert policy_errors[-1]["metadata"]["fatal"] is False
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 514f71a23..34b9d94e3 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -3065,32 +3065,93 @@ def terminal_tool(
+                             )
+                         )
+                         if _violations or _landlock_denied:
+-                            os.environ["HERMES_MISSION_EXECUTION_REVOKED"] = "1"
+-                            _reason = (
+-                                "mission terminal created out-of-scope paths; changes were rolled back: "
+-                                + ", ".join(_violations)
+-                                if _violations
+-                                else "mission terminal write was denied by Landlock filesystem containment"
++                            _raw_output = str(result.get("output", ""))
++                            _denial_lines = [
++                                line for line in _raw_output.splitlines()
++                                if any(
++                                    marker in line.lower()
++                                    for marker in ("permission denied", "operation not permitted")
++                                )
++                            ]
++                            _denied_paths = sorted(set(
++                                match
++                                for line in _denial_lines
++                                for match in re.findall(
++                                    r"(/workspace(?:/[^\s'\"`:,]+)+)", line
++                                )
++                            ))
++                            # Only the path named on the actual denial line is
++                            # relevant. Tracebacks also mention the executing
++                            # source file (for example /workspace/app.py), which
++                            # must not be mistaken for the denied target.
++                            _direct_denied_target = any(
++                                path in command
++                                or path.removeprefix("/workspace/") in command
++                                for path in _denied_paths
++                            )
++                            _fatal_containment = bool(
++                                _violations
++                                or (
++                                    _landlock_denied
++                                    and (not _denied_paths or _direct_denied_target)
++                                )
+                             )
+                             _run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+                             _task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                             _board = os.environ.get("HERMES_KANBAN_BOARD")
+-                            if _run_raw and _task:
+-                                from hermes_cli import kanban_db as _guard_kb
+-                                from hermes_cli.mission_service import (
+-                                    block_terminal_containment_violation as _block_guard_violation,
++                            mission_guard_audit = {
++                                **(mission_guard_audit or {}),
++                                "classification": (
++                                    "containment_violation" if _fatal_containment
++                                    else "sandbox_policy_error"
++                                ),
++                                "denied_paths": _denied_paths,
++                                "fatal": _fatal_containment,
++                            }
++                            if _fatal_containment:
++                                os.environ["HERMES_MISSION_EXECUTION_REVOKED"] = "1"
++                                _reason = (
++                                    "mission terminal created out-of-scope paths; changes were rolled back: "
++                                    + ", ".join(_violations)
++                                    if _violations
++                                    else "mission terminal directly targeted a path denied by Landlock filesystem containment"
+                                 )
+-                                with _guard_kb.connect_closing(board=_board) as _guard_conn:
+-                                    _block_guard_violation(
+-                                        _guard_conn,
+-                                        str(_policy["mission_id"]),
+-                                        task_id=_task,
+-                                        run_id=int(_run_raw),
+-                                        reason=_reason,
+-                                        audit=mission_guard_audit,
++                                if _run_raw and _task:
++                                    from hermes_cli import kanban_db as _guard_kb
++                                    from hermes_cli.mission_service import (
++                                        block_terminal_containment_violation as _block_guard_violation,
++                                    )
++                                    with _guard_kb.connect_closing(board=_board) as _guard_conn:
++                                        _block_guard_violation(
++                                            _guard_conn,
++                                            str(_policy["mission_id"]),
++                                            task_id=_task,
++                                            run_id=int(_run_raw),
++                                            reason=_reason,
++                                            audit=mission_guard_audit,
++                                        )
++                            else:
++                                _reason = (
++                                    "sandbox policy denied internal writes outside the mission's approved paths; "
++                                    "no out-of-scope mutation occurred. Narrow the test command to task-specific "
++                                    "tests or leave broad verification to the controller's disposable verifier."
++                                )
++                                if _run_raw and _task:
++                                    from hermes_cli import kanban_db as _guard_kb
++                                    from hermes_cli.mission_service import (
++                                        record_terminal_policy_denial as _record_policy_denial,
+                                     )
++                                    with _guard_kb.connect_closing(board=_board) as _guard_conn:
++                                        _record_policy_denial(
++                                            _guard_conn,
++                                            str(_policy["mission_id"]),
++                                            task_id=_task,
++                                            run_id=int(_run_raw),
++                                            reason=_reason,
++                                            audit=mission_guard_audit,
++                                        )
+                             result = {
+-                                "output": (result.get("output", "") + "\n" + _reason).strip(),
++                                "output": (_raw_output + "\n" + _reason).strip(),
+                                 "returncode": 126,
+                             }
+                 except Exception as e:
+-- 
+2.53.0
+

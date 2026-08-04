@@ -14,11 +14,19 @@
 - [x] Safe retry controller behavior
 - [x] Deterministic 18-scenario safety release gate
 
+## Current compatibility evidence
+
+- [x] Exact 25-commit Hermes 0.20 replay series
+- [x] 1,000-task and 5,000-task controller benchmarks
+- [x] Atomic claim contention with exactly one winner
+- [x] Recovery-phase retry and compact retry-context regressions
+
 ## Next engineering milestones
 
 - [ ] Destination-level egress enforcement for non-empty network allowlists
 - [ ] Model-driven multi-repository benchmark corpus
-- [ ] Quantified context consumption, intervention rate, retry count, and completion latency
+- [x] Quantified single-workstation controller throughput, contention, persistence, and evidence growth
+- [ ] Quantified model context consumption, human intervention rate, retry count, and end-to-end completion latency
 - [ ] Signed release artifacts and software bill of materials
 - [ ] Upstream pull-request decomposition and review plan
 - [ ] Optional remote operations behind separate cryptographic and human approval gates

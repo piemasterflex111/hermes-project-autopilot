@@ -1,0 +1,259 @@
+From d18746d29496e060b1f3b14b6952e1360c11045c Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 14:25:29 -0700
+Subject: [PATCH 12/25] fix: verify missions in disposable writable clones
+
+---
+ hermes_cli/mission_service.py                 | 152 ++++++++++++++----
+ .../test_mission_terminal_containment.py      |  27 ++--
+ 2 files changed, 136 insertions(+), 43 deletions(-)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index b13bd9637..23b041f30 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -9,6 +9,7 @@ import json
+ import os
+ import re
+ import shlex
++import shutil
+ import subprocess
+ import tempfile
+ import time
+@@ -2242,17 +2243,91 @@ def _configured_mission_docker_image() -> str:
+     config = load_config_readonly()
+     terminal = config.get("terminal") or {}
+     return str(
+-        terminal.get("docker_image")
++        terminal.get("mission_verification_image")
++        or terminal.get("docker_image")
+         or "nikolaik/python-nodejs:python3.11-nodejs20"
+     )
+ 
+ 
++def _remove_verification_entry(path: Path) -> None:
++    if path.is_symlink() or path.is_file():
++        path.unlink()
++    elif path.is_dir():
++        shutil.rmtree(path)
++    else:
++        raise MissionError(f"unsupported verification workspace entry: {path}")
++
++
++def _copy_verification_entry(source: Path, target: Path) -> None:
++    if source.is_symlink():
++        target.symlink_to(os.readlink(source))
++    elif source.is_dir():
++        shutil.copytree(source, target, symlinks=True)
++    elif source.is_file():
++        shutil.copy2(source, target)
++    else:
++        raise MissionError(f"unsupported verification workspace entry: {source}")
++
++
++@contextlib.contextmanager
++def _ephemeral_verification_workspace(
++    mission: mdb.Mission,
++    root: Path,
++):
++    """Yield an exact, disposable Git checkout for one verification command.
++
++    The authoritative mission worktree is never mounted writable.  A local,
++    no-hardlink clone supplies self-contained Git metadata, then the current
++    mission files are mirrored over its base-commit index.  Commands may create
++    build output inside the copy, but the copy is discarded after that command.
++    """
++    if not mission.repo_path:
++        raise MissionError("verification requires the source repository path")
++    source_repo = Path(mission.repo_path).resolve(strict=True)
++    with tempfile.TemporaryDirectory(prefix="hermes-mission-verify-") as temp_dir:
++        sandbox = Path(temp_dir) / "workspace"
++        clone = subprocess.run(
++            [
++                "git", "clone", "--local", "--no-hardlinks", "--no-checkout",
++                str(source_repo), str(sandbox),
++            ],
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            timeout=120,
++            check=False,
++        )
++        if clone.returncode != 0:
++            raise MissionError(
++                clone.stderr.strip() or "could not create verification repository copy"
++            )
++        checkout = subprocess.run(
++            ["git", "-C", str(sandbox), "checkout", "--detach", mission.base_commit],
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            timeout=120,
++            check=False,
++        )
++        if checkout.returncode != 0:
++            raise MissionError(
++                checkout.stderr.strip() or "could not prepare verification base commit"
++            )
++        for entry in sandbox.iterdir():
++            if entry.name != ".git":
++                _remove_verification_entry(entry)
++        for entry in root.iterdir():
++            if entry.name != ".git":
++                _copy_verification_entry(entry, sandbox / entry.name)
++        yield sandbox
++
++
+ def _run_contract_verification_commands(
+     conn,
+     mission: mdb.Mission,
+     commands: list[str],
+ ) -> list[dict[str, Any]]:
+-    """Run exact contract commands in a read-only offline mission container."""
++    """Run exact contract commands offline in disposable writable Git copies."""
+     if not commands:
+         return []
+     if not mission.worktree_path:
+@@ -2271,42 +2346,57 @@ def _run_contract_verification_commands(
+         raise MissionError("verification requires the Docker executable")
+     image = _configured_mission_docker_image()
+     root = Path(mission.worktree_path).resolve(strict=True)
++    uid = os.getuid() if hasattr(os, "getuid") else 0
++    gid = os.getgid() if hasattr(os, "getgid") else 0
+     results: list[dict[str, Any]] = []
+     for criterion in commands:
+         executed = canonicalize_command(criterion, policy)
++        # The repository copy is disposable, so Landlock may allow writes
++        # anywhere under /workspace without granting writes to the real mission
++        # worktree.  A fresh copy per command prevents one criterion from
++        # altering the input seen by another criterion.
+         argv = landlock_wrapped_command(
+             executed,
+-            policy,
+-            read_only_workspace=True,
+-        )
+-        started_at = int(time.time())
+-        proc = subprocess.run(
+-            [
+-                docker,
+-                "run",
+-                "--rm",
+-                "--network=none",
+-                "--cap-drop=ALL",
+-                "--security-opt=no-new-privileges",
+-                "-v",
+-                f"{root}:/workspace:ro",
+-                "-w",
+-                "/workspace",
+-                image,
+-                *argv,
+-            ],
+-            text=True,
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-            timeout=300,
+-            check=False,
+-            stdin=subprocess.DEVNULL,
+-        )
+-        finished_at = int(time.time())
++            {"allowed_paths": []},
++            read_only_workspace=False,
++        )
++        with _ephemeral_verification_workspace(mission, root) as sandbox:
++            started_at = int(time.time())
++            proc = subprocess.run(
++                [
++                    docker,
++                    "run",
++                    "--rm",
++                    "--network=none",
++                    "--cap-drop=ALL",
++                    "--security-opt=no-new-privileges",
++                    "--user",
++                    f"{uid}:{gid}",
++                    "--tmpfs",
++                    "/tmp:rw,exec,nosuid,nodev,size=1g",
++                    "-e",
++                    "HOME=/tmp/hermes-home",
++                    "-v",
++                    f"{sandbox}:/workspace:rw",
++                    "-w",
++                    "/workspace",
++                    image,
++                    *argv,
++                ],
++                text=True,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                timeout=300,
++                check=False,
++                stdin=subprocess.DEVNULL,
++            )
++            finished_at = int(time.time())
+         containment = {
+             "controller_verification": True,
+             "network": "none",
+-            "workspace_mount": "read-only",
++            "workspace_mount": "ephemeral-copy-write",
++            "source_worktree_mutation": "prevented",
++            "fresh_copy_per_command": True,
+             "image": image,
+             "executed_command_sha256": hashlib.sha256(
+                 executed.encode("utf-8")
+@@ -2330,7 +2420,7 @@ def _run_contract_verification_commands(
+                 "evidence_id": evidence_id,
+             }
+         )
+-    verify_clean_scope(policy)
++        verify_clean_scope(policy)
+     return results
+ 
+ 
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+index 24134656c..517b0e5dc 100644
+--- a/tests/tools/test_mission_terminal_containment.py
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -569,25 +569,28 @@ def test_controller_runs_exact_verification_in_read_only_container(
+         worktree.chmod(0o755)
+         (worktree / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+ 
++        commands = [
++            "git diff --check",
++            "mkdir -p build && touch build/result.txt",
++        ]
+         results = service._run_contract_verification_commands(
+             conn,
+             mission,
+-            ["python3 -m py_compile app.py"],
++            commands,
+         )
+         evidence = mdb.list_evidence(conn, mission_id)
+ 
+-    assert results == [
+-        {
+-            "command": "python3 -m py_compile app.py",
+-            "exit_code": 0,
+-            "evidence_id": results[0]["evidence_id"],
+-        }
+-    ]
++    assert [item["command"] for item in results] == commands
++    assert [item["exit_code"] for item in results] == [0, 0]
+     exact = [row for row in evidence if row["kind"] == "command"]
+-    assert exact and exact[-1]["command"] == "python3 -m py_compile app.py"
+-    assert exact[-1]["exit_code"] == 0
+-    assert exact[-1]["metadata"]["containment"]["workspace_mount"] == "read-only"
+-    assert exact[-1]["metadata"]["containment"]["network"] == "none"
++    assert [row["command"] for row in exact[-2:]] == commands
++    assert all(row["exit_code"] == 0 for row in exact[-2:])
++    containment = exact[-1]["metadata"]["containment"]
++    assert containment["workspace_mount"] == "ephemeral-copy-write"
++    assert containment["source_worktree_mutation"] == "prevented"
++    assert containment["fresh_copy_per_command"] is True
++    assert containment["network"] == "none"
++    assert not (worktree / "build").exists()
+     assert not (worktree / "__pycache__").exists()
+     assert not (worktree / ".pytest_cache").exists()
+     assert not (worktree / ".coverage").exists()
+-- 
+2.53.0
+

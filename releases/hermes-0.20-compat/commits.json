@@ -1,0 +1,260 @@
+{
+  "upstream_repository": "https://github.com/NousResearch/hermes-agent.git",
+  "base_commit": "91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53",
+  "base_tree": "41d5376096787c8389d73552311ffa202483b9c0",
+  "head_commit": "30550647352814d934204d113dec6f742f9627b8",
+  "head_tree": "561ad3ff0402f44382bbab150d15ffaff9136ed4",
+  "commit_count": 25,
+  "commits": [
+    {
+      "commit": "5376062f5bb036a4545aa88280bcd24c0856aede",
+      "parents": [
+        "91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T17:45:03-07:00",
+      "subject": "feat: add restart-safe project autopilot missions"
+    },
+    {
+      "commit": "d81ee2e88cf7fa1887dfb4085a0e2cee4aab55cf",
+      "parents": [
+        "5376062f5bb036a4545aa88280bcd24c0856aede"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T19:02:32-07:00",
+      "subject": "feat: complete project autopilot v1 safety gates"
+    },
+    {
+      "commit": "e5004023582be65a89ec14c7a705422badb4b518",
+      "parents": [
+        "d81ee2e88cf7fa1887dfb4085a0e2cee4aab55cf"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T19:14:30-07:00",
+      "subject": "feat: add native project autopilot mission center"
+    },
+    {
+      "commit": "d4c8f70dbd29a96efafc3962b5d8e3646a6f3173",
+      "parents": [
+        "e5004023582be65a89ec14c7a705422badb4b518"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T20:19:30-07:00",
+      "subject": "feat: deliver authenticated mission controls and detail views"
+    },
+    {
+      "commit": "fa6e7e16b9c176e00cee5c7d19e03cf851b68a06",
+      "parents": [
+        "d4c8f70dbd29a96efafc3962b5d8e3646a6f3173"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-01T22:12:57-07:00",
+      "subject": "fix: requeue blocked executors on mission retry"
+    },
+    {
+      "commit": "abae5e02f7add943d08c5ffd0422858fe02d72c5",
+      "parents": [
+        "fa6e7e16b9c176e00cee5c7d19e03cf851b68a06"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-02T10:42:56-07:00",
+      "subject": "fix: preserve mission terminal policy in CLI workers"
+    },
+    {
+      "commit": "b4784527bbcb2df26cfcb37e44269c4672599439",
+      "parents": [
+        "abae5e02f7add943d08c5ffd0422858fe02d72c5"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-02T13:37:13-07:00",
+      "subject": "fix: enforce Autopilot mission containment gates"
+    },
+    {
+      "commit": "1badc8647c7c3488b1d7ef6dad0c68cd796000a3",
+      "parents": [
+        "b4784527bbcb2df26cfcb37e44269c4672599439"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-02T13:49:36-07:00",
+      "subject": "fix: canonicalize mission Docker workspace paths"
+    },
+    {
+      "commit": "81de14948b81ca3810a8f0013f4ec7ca5e4c2614",
+      "parents": [
+        "1badc8647c7c3488b1d7ef6dad0c68cd796000a3"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-02T14:01:03-07:00",
+      "subject": "fix: run exact contract verification in controller"
+    },
+    {
+      "commit": "0ce1569e73d161ae50f911df2d6727e48828428e",
+      "parents": [
+        "81de14948b81ca3810a8f0013f4ec7ca5e4c2614"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T13:33:00-07:00",
+      "subject": "fix: prepare approved mission paths before Landlock"
+    },
+    {
+      "commit": "673f0dbd107b00b58a2dcc800b4f67d739f6c059",
+      "parents": [
+        "0ce1569e73d161ae50f911df2d6727e48828428e"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T14:05:44-07:00",
+      "subject": "fix: allow explicit retry of mission triage tasks"
+    },
+    {
+      "commit": "d18746d29496e060b1f3b14b6952e1360c11045c",
+      "parents": [
+        "673f0dbd107b00b58a2dcc800b4f67d739f6c059"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T14:25:29-07:00",
+      "subject": "fix: verify missions in disposable writable clones"
+    },
+    {
+      "commit": "ec63be3f91902d7ca024984bcffccb10608570f1",
+      "parents": [
+        "d18746d29496e060b1f3b14b6952e1360c11045c"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T14:30:18-07:00",
+      "subject": "feat: configure dedicated mission verification image"
+    },
+    {
+      "commit": "a62c0b08dd8e42d4886b6c0563cf62e4c5a05bb2",
+      "parents": [
+        "ec63be3f91902d7ca024984bcffccb10608570f1"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T14:42:03-07:00",
+      "subject": "fix: verify only current mission evidence"
+    },
+    {
+      "commit": "4fc72371b54a8e63c69baa166e161918247e4b46",
+      "parents": [
+        "a62c0b08dd8e42d4886b6c0563cf62e4c5a05bb2"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T16:54:23-07:00",
+      "subject": "fix: harden mission recovery writes and verification"
+    },
+    {
+      "commit": "c549ef90dbbf349eb0273298a46003c664abda95",
+      "parents": [
+        "4fc72371b54a8e63c69baa166e161918247e4b46"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T18:17:56-07:00",
+      "subject": "fix: deliver mission inputs and harden recovery"
+    },
+    {
+      "commit": "5af5d6b387e6a1de60afe2bb767f2d283283e3d3",
+      "parents": [
+        "c549ef90dbbf349eb0273298a46003c664abda95"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T18:32:33-07:00",
+      "subject": "fix: keep contained policy denials retryable"
+    },
+    {
+      "commit": "46392bc2254435a29020355fa942ab8e245ece7c",
+      "parents": [
+        "5af5d6b387e6a1de60afe2bb767f2d283283e3d3"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T20:32:20-07:00",
+      "subject": "fix: adapt mission docker config to hermes 0.20"
+    },
+    {
+      "commit": "4c6ba4a0ed2651a5ac1080b165c5084664ae9ad8",
+      "parents": [
+        "46392bc2254435a29020355fa942ab8e245ece7c"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T20:37:49-07:00",
+      "subject": "test: add project autopilot scale benchmark"
+    },
+    {
+      "commit": "079a914359410009b4c23ed2a00fd807d1fe1724",
+      "parents": [
+        "4c6ba4a0ed2651a5ac1080b165c5084664ae9ad8"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T20:45:55-07:00",
+      "subject": "test: restore Hermes modules after isolated CLI reloads"
+    },
+    {
+      "commit": "abe3f9160d3ae3a2555f3d01638411e40d80e147",
+      "parents": [
+        "079a914359410009b4c23ed2a00fd807d1fe1724"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T20:50:31-07:00",
+      "subject": "test: isolate default-assignee module reloads"
+    },
+    {
+      "commit": "d29f9804c01849a2b51c11f207887d6187947d59",
+      "parents": [
+        "abe3f9160d3ae3a2555f3d01638411e40d80e147"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T20:53:49-07:00",
+      "subject": "test: isolate per-profile Kanban module reloads"
+    },
+    {
+      "commit": "034a185470e22f472d77f8bf27be41842806e3f3",
+      "parents": [
+        "d29f9804c01849a2b51c11f207887d6187947d59"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T21:13:18-07:00",
+      "subject": "fix: authorize mission Docker cwd from signed policy"
+    },
+    {
+      "commit": "de5b4f558430c1d3f0519bfa27ffd2d498eec1ce",
+      "parents": [
+        "034a185470e22f472d77f8bf27be41842806e3f3"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T21:45:15-07:00",
+      "subject": "fix: requeue recovery-phase mission executors"
+    },
+    {
+      "commit": "30550647352814d934204d113dec6f742f9627b8",
+      "parents": [
+        "de5b4f558430c1d3f0519bfa27ffd2d498eec1ce"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-03T21:56:22-07:00",
+      "subject": "fix: compact mission retry context"
+    }
+  ]
+}

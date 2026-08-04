@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "release_id": "hermes-0.20-compat-2026-08-03",
+  "status": "compatibility-release",
+  "upstream_repository": "https://github.com/NousResearch/hermes-agent.git",
+  "base_commit": "91937a6dc3ffbbe2f3be91a500f0ecf962c4cf53",
+  "expected_final_tree": "561ad3ff0402f44382bbab150d15ffaff9136ed4",
+  "patch_count": 25,
+  "evidence_summary": "evidence/summary.json",
+  "notes": "Preserves the original v1 archive while publishing the exact 25-commit Hermes 0.20 compatibility and hardening series.",
+  "source_head_commit": "30550647352814d934204d113dec6f742f9627b8",
+  "replay_invariant": "ordered patch count and exact final Git tree; public patch author emails are sanitized"
+}

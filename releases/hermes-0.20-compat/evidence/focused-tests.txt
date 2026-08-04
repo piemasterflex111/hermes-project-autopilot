@@ -1,0 +1,34 @@
+........................................................................ [ 33%]
+........................................................................ [ 66%]
+.......................................................................  [100%]
+=============================== warnings summary ===============================
+../../../.hermes/hermes-agent/venv/lib/python3.11/site-packages/fastapi/testclient.py:1
+  <HERMES_INSTALL>/venv/lib/python3.11/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/gateway/test_mission_gateway_actions.py::test_relay_mission_actions_use_durable_tokens_without_memory_registry
+  <HERMES_INSTALL>/venv/lib/python3.11/site-packages/lark_oapi/ws/pb/google/__init__.py:2: DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html
+    __import__('pkg_resources').declare_namespace(__name__)
+
+tests/gateway/test_mission_gateway_actions.py::test_relay_mission_actions_use_durable_tokens_without_memory_registry
+  <HERMES_INSTALL>/venv/lib/python3.11/site-packages/lark_oapi/ws/pb/google/__init__.py:2: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('lark_oapi.ws.pb.google')`.
+  Implementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages
+    __import__('pkg_resources').declare_namespace(__name__)
+
+tests/gateway/test_mission_gateway_actions.py::test_relay_mission_actions_use_durable_tokens_without_memory_registry
+  <HERMES_INSTALL>/venv/lib/python3.11/site-packages/pkg_resources/__init__.py:2559: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('lark_oapi.ws.pb')`.
+  Implementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages
+    declare_namespace(parent)
+
+tests/gateway/test_mission_gateway_actions.py::test_relay_mission_actions_use_durable_tokens_without_memory_registry
+  <HERMES_INSTALL>/venv/lib/python3.11/site-packages/pkg_resources/__init__.py:2559: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('lark_oapi.ws')`.
+  Implementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages
+    declare_namespace(parent)
+
+tests/gateway/test_mission_gateway_actions.py::test_relay_mission_actions_use_durable_tokens_without_memory_registry
+  <HERMES_INSTALL>/venv/lib/python3.11/site-packages/pkg_resources/__init__.py:2559: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('lark_oapi')`.
+  Implementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages
+    declare_namespace(parent)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+215 passed, 6 warnings in 12.26s

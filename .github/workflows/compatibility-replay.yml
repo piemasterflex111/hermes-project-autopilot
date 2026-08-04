@@ -1,0 +1,18 @@
+name: Hermes 0.20 compatibility replay
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify compatibility release metadata
+        run: python3 scripts/verify_compatibility_release.py
+      - name: Replay exact 25-commit series
+        run: ./scripts/replay_release.sh releases/hermes-0.20-compat /tmp/hermes-autopilot-020

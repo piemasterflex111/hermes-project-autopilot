@@ -1,0 +1,74 @@
+From 034a185470e22f472d77f8bf27be41842806e3f3 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 21:13:18 -0700
+Subject: [PATCH 23/25] fix: authorize mission Docker cwd from signed policy
+
+---
+ agent/mission_scope.py            | 15 ++++++---------
+ tests/hermes_cli/test_missions.py | 16 +++++++++++-----
+ 2 files changed, 17 insertions(+), 14 deletions(-)
+
+diff --git a/agent/mission_scope.py b/agent/mission_scope.py
+index 895603be3..5fb7db618 100644
+--- a/agent/mission_scope.py
++++ b/agent/mission_scope.py
+@@ -205,15 +205,12 @@ def terminal_host_cwd(cwd: str | Path, env_type: str) -> Path:
+         if not _inside(candidate, root):
+             raise PermissionError("mission terminal cwd is outside the approved worktree")
+         return candidate
+-    mount_enabled = os.environ.get(
+-        "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", ""
+-    ).strip().lower() in {"1", "true", "yes", "on"}
+-    host_cwd_raw = os.environ.get("TERMINAL_CWD", "").strip()
+-    if not mount_enabled or not host_cwd_raw:
+-        raise PermissionError("mission Docker worktree mount is not enabled")
+-    host_cwd = Path(host_cwd_raw).expanduser().resolve(strict=False)
+-    if host_cwd != root:
+-        raise PermissionError("mission Docker mount does not match the approved worktree")
++    # The signed mission policy is the authorization boundary. Do not require
++    # duplicate ambient terminal variables here: Hermes configuration loading
++    # may legitimately rewrite those implementation settings after dispatch,
++    # while the policy remains bound to the claimed task and durable lease.
++    # The DockerEnvironment constructor independently enforces that this exact
++    # host worktree is mounted at /workspace in restricted mode.
+     candidate = Path(cwd)
+     container_root = Path("/workspace")
+     if not candidate.is_absolute() or not _inside(candidate, container_root):
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index 2acc608fe..b4a84ed28 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -574,8 +574,11 @@ def test_worker_policy_is_fail_closed_and_records_file_hash(mission_env, monkeyp
+     monkeypatch.setenv("HERMES_KANBAN_TASK", executor)
+     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
+-    monkeypatch.setenv("TERMINAL_CWD", str(worktree))
+-    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
++    # Terminal authorization must derive from the signed mission policy, not
++    # duplicate mutable environment variables. The Docker constructor separately
++    # enforces the real bind mount.
++    monkeypatch.delenv("TERMINAL_CWD", raising=False)
++    monkeypatch.delenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", raising=False)
+     from agent.mission_scope import (
+         record_file_evidence,
+         require_terminal,
+@@ -590,10 +593,13 @@ def test_worker_policy_is_fail_closed_and_records_file_hash(mission_env, monkeyp
+         require_terminal(worktree, "local")
+     require_terminal("/workspace", "docker")
+     assert terminal_host_cwd("/workspace/tests", "docker") == worktree / "tests"
++    # Ambient terminal configuration cannot redirect mission authorization.
+     monkeypatch.setenv("TERMINAL_CWD", str(repo))
+-    with pytest.raises(PermissionError, match="does not match"):
+-        require_terminal("/workspace", "docker")
+-    monkeypatch.setenv("TERMINAL_CWD", str(worktree))
++    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
++    require_terminal("/workspace", "docker")
++    assert terminal_host_cwd("/workspace/tests", "docker") == worktree / "tests"
++    with pytest.raises(PermissionError, match="outside the Docker worktree mount"):
++        require_terminal("/root", "docker")
+     with pytest.raises(PermissionError, match="background processes"):
+         require_terminal("/workspace", "docker", background=True)
+     (worktree / "app.py").write_text("VALUE = 7\n")
+-- 
+2.53.0
+

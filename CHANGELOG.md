@@ -16,3 +16,24 @@
 - Identity-bound gateway subscriptions and one-use action tokens
 - Safe retry requeue behavior for blocked executor tasks
 - 18-scenario release gate and repository provenance replay
+
+
+## v1.1.0 — Hermes 0.20 compatibility and scale evidence
+
+### Added
+
+- Exact 25-commit compatibility and hardening patch series based on upstream commit `91937a6dc`
+- Generic versioned-release replay script
+- Machine-readable 1,000- and 5,000-executor-task benchmark evidence
+- Focused 215-test compatibility evidence
+- Repository consistency validation for commit chains, patch hashes, and scale invariants
+- Explicit scalability boundaries distinguishing controller scale from distributed model-worker scale
+
+### Fixed in the compatibility series
+
+- Mission Docker policy adaptation for Hermes 0.20
+- Signed-policy worktree authorization
+- Recovery-phase executor requeue
+- Compact mission retry context
+- Mission input delivery and recovery hardening
+- Current-mission-only verification evidence

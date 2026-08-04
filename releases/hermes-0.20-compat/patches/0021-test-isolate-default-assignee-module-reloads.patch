@@ -1,0 +1,70 @@
+From abe3f9160d3ae3a2555f3d01638411e40d80e147 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 20:50:31 -0700
+Subject: [PATCH 21/25] test: isolate default-assignee module reloads
+
+---
+ .../test_kanban_default_assignee.py           | 45 ++++++++++++++-----
+ 1 file changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_default_assignee.py b/tests/hermes_cli/test_kanban_default_assignee.py
+index d610f2a42..c1ecf7040 100644
+--- a/tests/hermes_cli/test_kanban_default_assignee.py
++++ b/tests/hermes_cli/test_kanban_default_assignee.py
+@@ -16,18 +16,43 @@ import pytest
+ 
+ @pytest.fixture()
+ def isolated_kanban_home(monkeypatch):
+-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
++    """Spin up a fresh HERMES_HOME and restore exact imported modules."""
+     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
+     monkeypatch.setenv("HERMES_HOME", test_home)
+-    # Force-reimport so the fresh HERMES_HOME is picked up.
+-    for mod in list(sys.modules.keys()):
+-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+-            del sys.modules[mod]
+-    from hermes_cli import kanban_db
+-    yield kanban_db, test_home
+-    # Cleanup is best-effort; tempfile dir survives but pytest isolation
+-    # gives each test its own monkeypatched HERMES_HOME so no cross-test
+-    # contamination.
++    selected = lambda name: (
++        name.startswith("hermes_cli")
++        or name.startswith("hermes_state")
++        or name == "hermes_constants"
++    )
++    originals = {name: module for name, module in sys.modules.items() if selected(name)}
++
++    def remove_selected_modules() -> None:
++        current = [name for name in list(sys.modules) if selected(name)]
++        for name in sorted(current, key=lambda value: value.count("."), reverse=True):
++            if "." in name:
++                parent_name, child_name = name.rsplit(".", 1)
++                parent = sys.modules.get(parent_name)
++                if parent is not None and getattr(parent, child_name, None) is sys.modules.get(name):
++                    delattr(parent, child_name)
++            sys.modules.pop(name, None)
++
++    def restore_original_modules() -> None:
++        sys.modules.update(originals)
++        for name, module in sorted(originals.items(), key=lambda item: item[0].count(".")):
++            if "." not in name:
++                continue
++            parent_name, child_name = name.rsplit(".", 1)
++            parent = sys.modules.get(parent_name)
++            if parent is not None:
++                setattr(parent, child_name, module)
++
++    remove_selected_modules()
++    try:
++        from hermes_cli import kanban_db
++        yield kanban_db, test_home
++    finally:
++        remove_selected_modules()
++        restore_original_modules()
+ 
+ 
+ def _fake_spawn(*args, **kwargs):
+-- 
+2.53.0
+

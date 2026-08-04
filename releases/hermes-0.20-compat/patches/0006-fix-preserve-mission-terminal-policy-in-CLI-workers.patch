@@ -1,0 +1,99 @@
+From abae5e02f7add943d08c5ffd0422858fe02d72c5 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sun, 2 Aug 2026 10:42:56 -0700
+Subject: [PATCH 06/25] fix: preserve mission terminal policy in CLI workers
+
+---
+ cli.py                                        | 12 ++++-
+ .../test_mission_terminal_env_precedence.py   | 50 +++++++++++++++++++
+ 2 files changed, 60 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_mission_terminal_env_precedence.py
+
+diff --git a/cli.py b/cli.py
+index c4df5f2ad..075ddb503 100644
+--- a/cli.py
++++ b/cli.py
+@@ -698,14 +698,22 @@ def load_cli_config() -> Dict[str, Any]:
+     # UNLESS we're inside a gateway process (detected by _HERMES_GATEWAY marker)
+     # where it was already set correctly by gateway/run.py's config bridge.
+     _is_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
++    _is_mission_worker = bool(os.environ.get("HERMES_MISSION_POLICY", "").strip())
+     for config_key, env_var in env_mappings.items():
+         if config_key in terminal_config:
+             if env_var == "TERMINAL_CWD":
+-                if _is_gateway:
++                if _is_gateway or (_is_mission_worker and env_var in os.environ):
+                     continue
+-                # CLI: always export (overrides stale .env or inherited values)
++                # CLI: always export (overrides stale .env or inherited values).
++                # Mission workers preserve an explicit dispatcher binding, but
++                # when none exists they still resolve cwd to the claimed worktree.
+                 os.environ[env_var] = str(terminal_config[config_key])
+                 continue
++            # Project Autopilot injects a fail-closed terminal posture into each
++            # worker process. A user profile must never overwrite those values
++            # (for example changing Docker mount=true back to false).
++            if _is_mission_worker and env_var in os.environ:
++                continue
+             if _file_has_terminal_config or env_var not in os.environ:
+                 val = terminal_config[config_key]
+                 if isinstance(val, (list, dict)):
+diff --git a/tests/tools/test_mission_terminal_env_precedence.py b/tests/tools/test_mission_terminal_env_precedence.py
+new file mode 100644
+index 000000000..f6e0f086c
+--- /dev/null
++++ b/tests/tools/test_mission_terminal_env_precedence.py
+@@ -0,0 +1,50 @@
++"""Mission worker terminal policy must outrank user profile settings."""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++
++def test_mission_terminal_env_survives_user_config(
++    monkeypatch, tmp_path: Path
++) -> None:
++    import cli
++
++    (tmp_path / "config.yaml").write_text(
++        """terminal:
++  backend: local
++  cwd: .
++  docker_mount_cwd_to_workspace: false
++  docker_network: true
++  docker_persist_across_processes: true
++""",
++        encoding="utf-8",
++    )
++    monkeypatch.setattr(cli, "_hermes_home", tmp_path)
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setenv(
++        "HERMES_MISSION_POLICY",
++        json.dumps(
++            {
++                "mission_id": "m_test",
++                "worktree_path": str(tmp_path),
++                "allowed_paths": [],
++                "network_destinations": [],
++            }
++        ),
++    )
++    monkeypatch.setenv("TERMINAL_ENV", "docker")
++    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
++    monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "false")
++    monkeypatch.setenv("TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "false")
++    monkeypatch.delenv("TERMINAL_CWD", raising=False)
++
++    cli.load_cli_config()
++
++    assert os.environ["TERMINAL_ENV"] == "docker"
++    assert os.environ["TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"] == "true"
++    assert os.environ["TERMINAL_DOCKER_NETWORK"] == "false"
++    assert os.environ["TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES"] == "false"
++    assert Path(os.environ["TERMINAL_CWD"]).resolve() == tmp_path.resolve()
+-- 
+2.53.0
+

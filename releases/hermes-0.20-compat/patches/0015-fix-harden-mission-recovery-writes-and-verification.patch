@@ -1,0 +1,312 @@
+From 4fc72371b54a8e63c69baa166e161918247e4b46 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 16:54:23 -0700
+Subject: [PATCH 15/25] fix: harden mission recovery writes and verification
+
+---
+ hermes_cli/mission_service.py         | 99 +++++++++++++++++++++++----
+ hermes_cli/missions_db.py             | 33 +++++++++
+ tests/hermes_cli/test_missions.py     | 38 ++++++++++
+ tests/tools/test_file_write_safety.py | 21 ++++++
+ tools/file_operations.py              | 18 +++++
+ 5 files changed, 196 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index ab4a3707b..5afb76ef1 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -2682,25 +2682,73 @@ def _verify_with_model_unlocked(conn, mission_id: str) -> mdb.Mission:
+         for command in mission.contract.verification
+         if command in current_command_evidence
+     ]
++
++    snapshot = deterministic.get("workspace_snapshot") or {}
++    snapshot_files = snapshot.get("files") or []
++    artifact_manifest = [
++        {
++            "path": str(item.get("path")),
++            "kind": item.get("kind"),
++            "bytes": item.get("bytes"),
++            "sha256": item.get("sha256"),
++        }
++        for item in snapshot_files
++    ]
++    compact_deterministic = {
++        "pass": deterministic.get("pass"),
++        "evidence_chain_valid": deterministic.get("evidence_chain_valid"),
++        "changed_paths": deterministic.get("changed_paths", []),
++        "scope_violations": deterministic.get("scope_violations", []),
++        "missing_verification": deterministic.get("missing_verification", []),
++        "open_intent_count": deterministic.get("open_intent_count", 0),
++        "unsupported_paths": deterministic.get("unsupported_paths", []),
++        "head_unchanged": deterministic.get("head_unchanged"),
++        "workspace_digest": snapshot.get("digest"),
++        "content_digest": snapshot.get("content_digest"),
++    }
+     if latest_deterministic is not None:
+-        evidence.append(latest_deterministic)
++        evidence.append({
++            "id": latest_deterministic["id"],
++            "kind": latest_deterministic["kind"],
++            "status": latest_deterministic["status"],
++            "metadata": compact_deterministic,
++        })
++
++    # Embed a bounded, priority-ordered sample of current text artifacts.  The
++    # previous payload serialized the full per-file snapshot before artifact
++    # contents, which could consume the local model context and make present
++    # files appear missing.  README and documentation/configuration artifacts
++    # now arrive first, while the complete manifest still proves every path.
++    def artifact_priority(relative: str) -> tuple[int, bytes]:
++        value = relative.lower()
++        if value in {"readme.md", "makefile", "pyproject.toml", "package.json"}:
++            rank = 0
++        elif value.startswith(("docs/", "architecture/", "course-map/")):
++            rank = 1
++        elif value.startswith(("inventory/", "site/", "scripts/", "tests/")):
++            rank = 2
++        else:
++            rank = 3
++        return rank, os.fsencode(relative)
+ 
+-    # Embed the current text of changed artifacts so the independent verifier
+-    # can inspect what exists instead of inferring content from filenames. Keep
+-    # the payload bounded and fail closed on unsupported/binary artifacts.
+     artifact_contents: dict[str, str] = {}
+-    artifact_budget = 96_000
+-    for relative in deterministic.get("changed_paths", []):
+-        path = root / str(relative)
++    artifact_budget = 48_000
++    per_file_limit = 6_000
++    for relative in sorted(
++        (str(item) for item in deterministic.get("changed_paths", [])),
++        key=artifact_priority,
++    ):
++        path = root / relative
+         if not path.is_file() or path.is_symlink():
+             continue
+         raw = path.read_bytes()
+         if b"\x00" in raw:
+             continue
+         text = raw.decode("utf-8", errors="replace")
+-        if len(text) > artifact_budget:
+-            text = text[:artifact_budget] + "\n...[truncated]"
+-        artifact_contents[str(relative)] = text
++        limit = min(per_file_limit, artifact_budget)
++        if len(text) > limit:
++            text = text[:limit] + "\n...[truncated]"
++        artifact_contents[relative] = text
+         artifact_budget -= min(len(text), artifact_budget)
+         if artifact_budget <= 0:
+             break
+@@ -2719,10 +2767,11 @@ def _verify_with_model_unlocked(conn, mission_id: str) -> mdb.Mission:
+     )
+     payload = {
+         "contract": asdict(mission.contract),
+-        "deterministic_checks": deterministic,
+         "current_artifacts": artifact_contents,
+-        "diff": diff,
++        "artifact_manifest": artifact_manifest,
+         "current_evidence": evidence,
++        "deterministic_checks": compact_deterministic,
++        "diff": diff,
+     }
+     response = call_llm(
+         task="mission_verifier",
+@@ -3503,7 +3552,31 @@ def reconcile_mission(conn, mission_id: str) -> mdb.Mission:
+         _quiesce_blocked_mission(conn, mission)
+         refreshed = mdb.get_mission(conn, mission_id)
+         assert refreshed is not None
+-        return refreshed
++        mission = refreshed
++    if (
++        mission.status == "blocked"
++        and mission.blocked_reason
++        and "recovery_ambiguous" in mission.blocked_reason
++        and not _ambiguous_open_intents(conn, mission_id)
++        and not _mission_needs_quiescence(conn, mission_id)
++        and _blocked_quiescence_proven(conn, mission)
++    ):
++        previous_reason = mission.blocked_reason
++        mdb.record_evidence(
++            conn,
++            mission_id,
++            kind="recovery",
++            status="passed",
++            metadata={
++                "action": "clear_stale_ambiguous_blocker",
++                "previous_reason": previous_reason,
++                "open_intents": 0,
++            },
++            cwd=mission.worktree_path,
++        )
++        return mdb.clear_blocked_reason(
++            conn, mission_id, expected_reason=previous_reason,
++        )
+     if _ambiguous_open_intents(conn, mission_id):
+         if mission.status in {
+             "running", "waiting_for_user", "verifying", "awaiting_approval", "committing",
+diff --git a/hermes_cli/missions_db.py b/hermes_cli/missions_db.py
+index 9272a64b3..db3e3d505 100644
+--- a/hermes_cli/missions_db.py
++++ b/hermes_cli/missions_db.py
+@@ -396,6 +396,39 @@ def transition_mission(
+     return mission
+ 
+ 
++def clear_blocked_reason(
++    conn: sqlite3.Connection,
++    mission_id: str,
++    *,
++    expected_reason: Optional[str] = None,
++) -> Mission:
++    """Clear a stale blocker while keeping the mission durably blocked.
++
++    This is intentionally narrower than a lifecycle transition.  It is used
++    after reconciliation proves that an earlier ambiguous mutation no longer
++    has an open intent or live owner.  The operator must still invoke the
++    normal retry action to resume execution.
++    """
++    ensure_schema(conn)
++    with kb.write_txn(conn):
++        row = conn.execute(
++            "SELECT status,blocked_reason FROM missions WHERE id=?", (mission_id,),
++        ).fetchone()
++        if row is None:
++            raise KeyError(mission_id)
++        if row["status"] != "blocked":
++            raise ValueError("blocked reason can only be cleared for a blocked mission")
++        if expected_reason is not None and row["blocked_reason"] != expected_reason:
++            raise ValueError("blocked reason changed before reconciliation completed")
++        conn.execute(
++            "UPDATE missions SET blocked_reason=NULL, updated_at=? WHERE id=? AND status='blocked'",
++            (int(time.time()), mission_id),
++        )
++    mission = get_mission(conn, mission_id)
++    assert mission is not None
++    return mission
++
++
+ def link_task(conn: sqlite3.Connection, mission_id: str, task_id: str, role: str) -> None:
+     """Bind a task once, or accept an exact idempotent re-bind.
+ 
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index 809ed75ac..218fcf57a 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -1568,6 +1568,39 @@ def shlex_quote(value: str) -> str:
+     return shlex.quote(value)
+ 
+ 
++def test_reconcile_clears_stale_ambiguous_blocker_after_quiescence(
++    mission_env,
++):
++    conn, repo = mission_env
++    mid = _created(conn, repo, autonomy=3)
++    service.prepare_mission(conn, mid)
++    service.add_execution_task(
++        conn, mid, title="Edit app.py", body="Set VALUE", assignee="default",
++    )
++    service.finish_plan(conn, mid, verifier_assignee="default")
++    service.start_mission(conn, mid)
++    mdb.transition_mission(
++        conn,
++        mid,
++        "blocked",
++        phase="recovery",
++        blocked_reason="recovery_ambiguous: unresolved mutation intent",
++    )
++
++    reconciled = service.reconcile_mission(conn, mid)
++
++    assert reconciled.status == "blocked"
++    assert reconciled.blocked_reason is None
++    recovery = [
++        row for row in mdb.list_evidence(conn, mid)
++        if row["kind"] == "recovery"
++        and row["metadata"].get("action") == "clear_stale_ambiguous_blocker"
++    ]
++    assert recovery and recovery[-1]["status"] == "passed"
++    retried = service.retry_mission(conn, mid)
++    assert retried.status == "running"
++
++
+ def test_controller_runs_missing_exact_verification_before_model(
+     mission_env, monkeypatch
+ ):
+@@ -1627,6 +1660,11 @@ def test_controller_runs_missing_exact_verification_before_model(
+     assert len(model_payloads) == 1
+     verifier_payload = model_payloads[0]
+     assert verifier_payload["current_artifacts"]["app.py"] == "VALUE = 3\n"
++    assert "workspace_snapshot" not in verifier_payload["deterministic_checks"]
++    assert any(
++        item["path"] == "app.py" for item in verifier_payload["artifact_manifest"]
++    )
++    assert len(json.dumps(verifier_payload)) < 100_000
+     command_rows = [
+         item for item in verifier_payload["current_evidence"]
+         if item.get("kind") == "command"
+diff --git a/tests/tools/test_file_write_safety.py b/tests/tools/test_file_write_safety.py
+index d59dce7b2..bf5bce032 100644
+--- a/tests/tools/test_file_write_safety.py
++++ b/tests/tools/test_file_write_safety.py
+@@ -257,6 +257,27 @@ class TestAtomicWrite:
+         assert (os.stat(target).st_mode & 0o777) == 0o600
+ 
+ 
++    def test_mission_exact_file_write_does_not_create_sibling_temp(
++        self, ops, tmp_path: Path, monkeypatch,
++    ):
++        """Exact-file Landlock grants cannot authorize a sibling temp file.
++
++        Mission writes therefore target the already-approved file directly;
++        normal non-mission writes retain atomic rename semantics.
++        """
++        target = tmp_path / ".gitignore"
++        target.write_text("old\n")
++        inode_before = target.stat().st_ino
++        monkeypatch.setenv("HERMES_MISSION_POLICY", '{"mission_id":"m_test"}')
++
++        result = ops.write_file(str(target), "new\n")
++
++        assert result.error is None, result.error
++        assert target.read_text() == "new\n"
++        assert target.stat().st_ino == inode_before
++        assert not list(tmp_path.glob(".hermes-tmp*"))
++
++
+ class TestBomHandling:
+     """UTF-8 BOM is stripped on read and preserved across write/patch.
+ 
+diff --git a/tools/file_operations.py b/tools/file_operations.py
+index f6a2deaca..fefa60270 100644
+--- a/tools/file_operations.py
++++ b/tools/file_operations.py
+@@ -1019,6 +1019,24 @@ class ShellFileOperations(FileOperations):
+         q_path = self._escape_shell_arg(path)
+         parent = os.path.dirname(path) or "."
+         q_parent = self._escape_shell_arg(parent)
++
++        # Mission workers may receive write authority for one exact existing
++        # file without write authority for its parent directory.  A sibling
++        # temp file would therefore be outside the compiled Landlock policy,
++        # even though the requested target itself is approved.  File-tool
++        # callers have already passed the exact target through
++        # mission_scope.require_write_path, and Landlock still enforces the
++        # final path.  In mission mode write the approved target in place and
++        # rely on the mission checkpoint/rollback boundary for crash recovery
++        # rather than widening parent-directory permissions.
++        if os.environ.get("HERMES_MISSION_POLICY", "").strip():
++            script = (
++                "set -e; "
++                f"t={q_path}; "
++                'cat > "$t"'
++            )
++            return self._exec(script, stdin_data=content)
++
+         # template basename: hidden so it doesn't show up in casual `ls`,
+         # carries a marker so an orphaned temp (only possible on a hard
+         # crash *between* cat and mv) is identifiable.
+-- 
+2.53.0
+

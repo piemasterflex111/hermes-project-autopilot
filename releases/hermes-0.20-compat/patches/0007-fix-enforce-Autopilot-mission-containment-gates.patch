@@ -1,0 +1,1638 @@
+From b4784527bbcb2df26cfcb37e44269c4672599439 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Sun, 2 Aug 2026 13:37:13 -0700
+Subject: [PATCH 07/25] fix: enforce Autopilot mission containment gates
+
+---
+ agent/mission_scope.py                        |   2 +
+ agent/mission_terminal_guard.py               | 428 ++++++++++++++++
+ hermes_cli/mission_service.py                 | 222 ++++++++-
+ .../test_mission_plan_resumption.py           | 160 ++++++
+ tests/hermes_cli/test_missions.py             |  15 +
+ .../test_mission_terminal_containment.py      | 461 ++++++++++++++++++
+ tools/environments/docker.py                  |   8 +
+ tools/terminal_tool.py                        | 105 ++++
+ 8 files changed, 1392 insertions(+), 9 deletions(-)
+ create mode 100644 agent/mission_terminal_guard.py
+ create mode 100644 tests/tools/test_mission_terminal_containment.py
+
+diff --git a/agent/mission_scope.py b/agent/mission_scope.py
+index bf965f840..895603be3 100644
+--- a/agent/mission_scope.py
++++ b/agent/mission_scope.py
+@@ -128,6 +128,8 @@ def mission_workspace_host_path(path: str | Path | PurePosixPath) -> Path:
+ 
+ def _require_live_executor_lease(policy: dict[str, Any]) -> None:
+     """Revalidate the durable mission/task lease at every mutating tool edge."""
++    if os.environ.get("HERMES_MISSION_EXECUTION_REVOKED") == "1":
++        raise PermissionError("mission execution was revoked after a containment violation")
+     if policy.get("mission_role") != "executor":
+         raise PermissionError("only a mission executor may mutate the workspace")
+     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+diff --git a/agent/mission_terminal_guard.py b/agent/mission_terminal_guard.py
+new file mode 100644
+index 000000000..2dcbd8f28
+--- /dev/null
++++ b/agent/mission_terminal_guard.py
+@@ -0,0 +1,428 @@
++"""Fail-closed terminal containment for Project Autopilot missions.
++
++The model is not a security boundary. This module combines static command
++rejection, Linux Landlock, a trusted Git/path manifest, and deterministic
++rollback of out-of-contract filesystem mutations.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import os
++import re
++import shutil
++import subprocess
++from pathlib import Path
++from typing import Any
++
++
++_FORBIDDEN_COMMANDS: tuple[tuple[re.Pattern[str], str], ...] = (
++    (
++        re.compile(r"(?:^|[;&|()\s])git\s+(?:-[^\s]+\s+)*init(?:\s|$)", re.I),
++        "mission terminal blocks git init; the controller owns repository identity",
++    ),
++    (
++        re.compile(
++            r"(?:^|[;&|()\s])git\s+(?:-[^\s]+\s+)*worktree\s+"
++            r"(?:add|move|repair|remove|prune)(?:\s|$)",
++            re.I,
++        ),
++        "mission terminal blocks Git worktree mutation; the controller owns the worktree",
++    ),
++    (
++        re.compile(r"(?:^|[;&|()\s])uv\s+init(?:\s|$)", re.I),
++        "mission terminal blocks uv init; modify the existing repository root explicitly",
++    ),
++)
++
++
++def validate_command(command: str) -> None:
++    """Reject commands that can create or replace repository identity."""
++    for pattern, message in _FORBIDDEN_COMMANDS:
++        if pattern.search(command):
++            raise PermissionError(message)
++
++
++def _root(policy: dict[str, Any]) -> Path:
++    raw = str(policy.get("worktree_path") or "").strip()
++    if not raw:
++        raise PermissionError("mission policy has no worktree path")
++    return Path(raw).expanduser().resolve(strict=True)
++
++
++def normalized_allowed_paths(policy: dict[str, Any]) -> tuple[str, ...]:
++    values: list[str] = []
++    for raw in policy.get("allowed_paths") or []:
++        value = str(raw).strip().strip("/")
++        candidate = Path(value)
++        if not value or candidate.is_absolute() or ".." in candidate.parts:
++            raise PermissionError(f"unsafe mission allowed path: {raw!r}")
++        values.append(candidate.as_posix())
++    return tuple(sorted(set(values)))
++
++
++def path_is_allowed(relative_path: str, allowed_paths: tuple[str, ...]) -> bool:
++    value = Path(relative_path).as_posix().strip("/")
++    if not value:
++        return False
++    if not allowed_paths:
++        return True
++    return any(value == item or value.startswith(item + "/") for item in allowed_paths)
++
++
++def _git_paths(root: Path, *args: str) -> set[str]:
++    proc = subprocess.run(
++        ["git", "-C", str(root), *args],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=30,
++        check=False,
++    )
++    if proc.returncode != 0:
++        error = proc.stderr.decode("utf-8", errors="replace").strip()
++        raise PermissionError(error or f"git {' '.join(args)} failed")
++    return {os.fsdecode(part) for part in proc.stdout.split(b"\0") if part}
++
++
++def nested_git_paths(root: Path) -> set[str]:
++    """Find nested .git files/directories without following symlinks."""
++    found: set[str] = set()
++    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
++        current_path = Path(current)
++        if current_path == root:
++            directories[:] = [name for name in directories if name != ".git"]
++        elif ".git" in directories:
++            git_path = current_path / ".git"
++            found.add(git_path.relative_to(root).as_posix())
++            directories.remove(".git")
++        if current_path != root and ".git" in files:
++            found.add((current_path / ".git").relative_to(root).as_posix())
++    return found
++
++
++def workspace_manifest(policy: dict[str, Any]) -> dict[str, list[str]]:
++    root = _root(policy)
++    tracked = _git_paths(root, "diff", "--name-only", "-z", "HEAD", "--")
++    staged = _git_paths(root, "diff", "--cached", "--name-only", "-z", "HEAD", "--")
++    untracked = _git_paths(root, "ls-files", "--others", "-z")
++    nested = nested_git_paths(root)
++    return {
++        "tracked": sorted(tracked | staged, key=os.fsencode),
++        "untracked": sorted(untracked, key=os.fsencode),
++        "nested_git": sorted(nested, key=os.fsencode),
++    }
++
++
++def manifest_violations(
++    policy: dict[str, Any], manifest: dict[str, list[str]]
++) -> list[str]:
++    allowed = normalized_allowed_paths(policy)
++    violations = {
++        path
++        for group in ("tracked", "untracked")
++        for path in manifest.get(group, [])
++        if not path_is_allowed(path, allowed)
++    }
++    violations.update(manifest.get("nested_git", []))
++    return sorted(violations, key=os.fsencode)
++
++
++def _safe_target(root: Path, relative_path: str) -> Path:
++    candidate = root / relative_path
++    parent = candidate.parent.resolve(strict=False)
++    if parent != root and root not in parent.parents:
++        raise PermissionError(
++            f"refusing to repair path outside mission worktree: {relative_path}"
++        )
++    return candidate
++
++
++def rollback_violations(policy: dict[str, Any], violations: list[str]) -> list[str]:
++    """Restore tracked paths and delete only violating untracked/nested paths."""
++    root = _root(policy)
++    if not violations:
++        return []
++    tracked = _git_paths(root, "ls-files", "-z")
++    restored: list[str] = []
++    for relative in sorted(set(violations), key=lambda item: (-item.count("/"), item)):
++        target = _safe_target(root, relative)
++        if relative in tracked:
++            proc = subprocess.run(
++                [
++                    "git",
++                    "-C",
++                    str(root),
++                    "restore",
++                    "--source=HEAD",
++                    "--staged",
++                    "--worktree",
++                    "--",
++                    relative,
++                ],
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                text=True,
++                timeout=30,
++                check=False,
++            )
++            if proc.returncode != 0:
++                raise PermissionError(
++                    proc.stderr.strip()
++                    or f"could not restore violating path: {relative}"
++                )
++            restored.append(relative)
++            continue
++        try:
++            if target.is_symlink() or target.is_file():
++                target.unlink(missing_ok=True)
++            elif target.is_dir():
++                shutil.rmtree(target)
++            else:
++                target.unlink(missing_ok=True)
++            restored.append(relative)
++        except OSError as exc:
++            raise PermissionError(
++                f"could not remove violating path {relative}: {exc}"
++            ) from exc
++        parent = target.parent
++        while parent != root:
++            try:
++                parent.rmdir()
++            except OSError:
++                break
++            parent = parent.parent
++    return sorted(restored, key=os.fsencode)
++
++
++def verify_clean_scope(policy: dict[str, Any]) -> dict[str, list[str]]:
++    manifest = workspace_manifest(policy)
++    violations = manifest_violations(policy, manifest)
++    if violations:
++        raise PermissionError(
++            "mission worktree already contains out-of-scope mutations: "
++            + ", ".join(violations)
++        )
++    return manifest
++
++
++def landlock_abi() -> int:
++    """Return the host Landlock ABI, or zero when unavailable."""
++    if os.name != "posix":
++        return 0
++    import ctypes
++    import platform
++
++    if platform.machine() not in {"x86_64", "aarch64"}:
++        return 0
++    libc = ctypes.CDLL(None, use_errno=True)
++    result = int(libc.syscall(444, 0, 0, 1))
++    return result if result > 0 else 0
++
++
++def runtime_preflight(policy: dict[str, Any], *, image: str) -> dict[str, Any]:
++    """Prove the real offline Docker/Landlock runtime before model planning."""
++    manifest = verify_clean_scope(policy)
++    host_abi = landlock_abi()
++    if host_abi < 3:
++        raise PermissionError(
++            "Project Autopilot requires Linux Landlock ABI 3 or newer"
++        )
++    from tools.environments.docker import find_docker
++
++    docker = find_docker()
++    if not docker:
++        raise PermissionError("Project Autopilot requires the Docker executable")
++    daemon = subprocess.run(
++        [docker, "info", "--format", "{{.ServerVersion}}"],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=15,
++        check=False,
++        stdin=subprocess.DEVNULL,
++    )
++    if daemon.returncode != 0:
++        raise PermissionError(
++            "Docker daemon is unavailable: "
++            + (daemon.stderr.strip() or daemon.stdout.strip() or "docker info failed")
++        )
++    inspected = subprocess.run(
++        [docker, "image", "inspect", image, "--format", "{{.Id}}"],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=15,
++        check=False,
++        stdin=subprocess.DEVNULL,
++    )
++    if inspected.returncode != 0:
++        raise PermissionError(f"mission Docker image is not present locally: {image}")
++    root = _root(policy)
++    probe_source = (
++        "import ctypes,os; "
++        "r=int(ctypes.CDLL(None,use_errno=True).syscall(444,0,0,1)); "
++        "print(r); "
++        "raise SystemExit(0 if r>=3 and os.path.isdir('/workspace') else 1)"
++    )
++    probe = subprocess.run(
++        [
++            docker,
++            "run",
++            "--rm",
++            "--network=none",
++            "--cap-drop=ALL",
++            "--security-opt=no-new-privileges",
++            "-v",
++            f"{root}:/workspace:ro",
++            "-w",
++            "/workspace",
++            image,
++            "python3",
++            "-c",
++            probe_source,
++        ],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=45,
++        check=False,
++        stdin=subprocess.DEVNULL,
++    )
++    try:
++        container_abi = int(probe.stdout.strip().splitlines()[-1])
++    except (IndexError, ValueError):
++        container_abi = 0
++    if probe.returncode != 0 or container_abi < 3:
++        detail = probe.stderr.strip() or probe.stdout.strip() or "probe failed"
++        raise PermissionError(f"mission Docker image cannot enforce Landlock: {detail}")
++    return {
++        "docker": docker,
++        "docker_server": daemon.stdout.strip(),
++        "image": image,
++        "image_id": inspected.stdout.strip(),
++        "host_landlock_abi": host_abi,
++        "container_landlock_abi": container_abi,
++        "network": "none",
++        "workspace": str(root),
++        "manifest": manifest,
++    }
++
++
++_LANDLOCK_LAUNCHER = r"""
++import base64, ctypes, json, os, sys
++CREATE, ADD, RESTRICT = 444, 445, 446
++VERSION = 1
++RULE_PATH_BENEATH = 1
++PR_SET_NO_NEW_PRIVS = 38
++O_PATH = getattr(os, "O_PATH", 0o10000000)
++WRITE_FILE = 1 << 1
++REMOVE_DIR = 1 << 4
++REMOVE_FILE = 1 << 5
++MAKE_CHAR = 1 << 6
++MAKE_DIR = 1 << 7
++MAKE_REG = 1 << 8
++MAKE_SOCK = 1 << 9
++MAKE_FIFO = 1 << 10
++MAKE_BLOCK = 1 << 11
++MAKE_SYM = 1 << 12
++REFER = 1 << 13
++TRUNCATE = 1 << 14
++WORKSPACE_WRITE_RIGHTS = (
++    WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG |
++    MAKE_SYM | REFER | TRUNCATE
++)
++SCRATCH_WRITE_RIGHTS = (
++    WORKSPACE_WRITE_RIGHTS | MAKE_SOCK | MAKE_FIFO
++)
++FILE_RIGHTS = WRITE_FILE | TRUNCATE
++class Ruleset(ctypes.Structure):
++    _fields_ = [("handled_access_fs", ctypes.c_uint64)]
++class PathRule(ctypes.Structure):
++    _pack_ = 1
++    _fields_ = [
++        ("allowed_access", ctypes.c_uint64),
++        ("parent_fd", ctypes.c_int32),
++    ]
++libc = ctypes.CDLL(None, use_errno=True)
++abi = libc.syscall(CREATE, 0, 0, VERSION)
++if abi < 3:
++    raise SystemExit("Hermes mission containment requires Landlock ABI >= 3")
++attr = Ruleset(SCRATCH_WRITE_RIGHTS)
++fd = libc.syscall(CREATE, ctypes.byref(attr), ctypes.sizeof(attr), 0)
++if fd < 0:
++    err = ctypes.get_errno()
++    raise OSError(err, os.strerror(err))
++def grant(path, rights):
++    try:
++        path_fd = os.open(path, O_PATH | os.O_CLOEXEC)
++    except FileNotFoundError:
++        return False
++    try:
++        rule = PathRule(rights, path_fd)
++        if libc.syscall(ADD, fd, RULE_PATH_BENEATH, ctypes.byref(rule), 0) < 0:
++            err = ctypes.get_errno()
++            raise OSError(err, os.strerror(err), path)
++    finally:
++        os.close(path_fd)
++    return True
++for scratch in ("/tmp", "/root", "/home"):
++    grant(scratch, SCRATCH_WRITE_RIGHTS)
++grant("/dev/null", FILE_RIGHTS)
++allowed = json.loads(sys.argv[2])
++for item in allowed:
++    path = "/workspace/" + item.strip("/")
++    if os.path.isdir(path):
++        grant(path, WORKSPACE_WRITE_RIGHTS)
++    elif os.path.isfile(path):
++        grant(path, FILE_RIGHTS)
++    else:
++        # Landlock rules can only name existing filesystem objects. Missing
++        # approved paths must be created through Hermes file tools, which
++        # enforce the exact relative path before mutation.
++        continue
++if not allowed:
++    grant("/workspace", WORKSPACE_WRITE_RIGHTS)
++if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
++    err = ctypes.get_errno()
++    raise OSError(err, os.strerror(err))
++if libc.syscall(RESTRICT, fd, 0) < 0:
++    err = ctypes.get_errno()
++    raise OSError(err, os.strerror(err))
++os.close(fd)
++# Keep disposable tool state outside the repository. The container persists for
++# the task, so these paths remain reusable across sequential terminal calls.
++ephemeral = {
++    "UV_PROJECT_ENVIRONMENT": "/tmp/hermes-uv-environment",
++    "UV_CACHE_DIR": "/tmp/hermes-uv-cache",
++    "PIP_CACHE_DIR": "/tmp/hermes-pip-cache",
++    "PYTHONPYCACHEPREFIX": "/tmp/hermes-pycache",
++    "COVERAGE_FILE": "/tmp/hermes-coverage",
++    "MYPY_CACHE_DIR": "/tmp/hermes-mypy-cache",
++    "RUFF_CACHE_DIR": "/tmp/hermes-ruff-cache",
++    "XDG_CACHE_HOME": "/tmp/hermes-xdg-cache",
++    "XDG_CONFIG_HOME": "/tmp/hermes-xdg-config",
++    "XDG_DATA_HOME": "/tmp/hermes-xdg-data",
++    "npm_config_cache": "/tmp/hermes-npm-cache",
++    "YARN_CACHE_FOLDER": "/tmp/hermes-yarn-cache",
++    "CARGO_HOME": "/tmp/hermes-cargo-home",
++    "CARGO_TARGET_DIR": "/tmp/hermes-cargo-target",
++}
++for key, value in ephemeral.items():
++    os.environ.setdefault(key, value)
++pytest_options = os.environ.get("PYTEST_ADDOPTS", "").strip()
++if "no:cacheprovider" not in pytest_options:
++    os.environ["PYTEST_ADDOPTS"] = (pytest_options + " -p no:cacheprovider").strip()
++os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
++command = base64.b64decode(sys.argv[1]).decode("utf-8")
++os.execv("/bin/bash", ["bash", "-c", command])
++"""
++
++
++def landlock_wrapped_command(command: str, policy: dict[str, Any]) -> list[str]:
++    """Return argv for a Landlock-confined bash command inside Docker."""
++    encoded_command = base64.b64encode(command.encode("utf-8")).decode("ascii")
++    allowed_json = json.dumps(
++        list(normalized_allowed_paths(policy)), separators=(",", ":")
++    )
++    return ["python3", "-c", _LANDLOCK_LAUNCHER, encoded_command, allowed_json]
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index 7a10691cb..c83aa3e2c 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -435,6 +435,77 @@ def _prepare_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+         raise
+ 
+ 
++def _mission_runtime_policy(mission: mdb.Mission) -> dict[str, Any]:
++    if not mission.worktree_path:
++        raise MissionError("mission preflight requires a prepared worktree")
++    boundaries = mission.contract.boundaries
++    return {
++        "mission_id": mission.id,
++        "mission_role": "executor",
++        "worktree_path": mission.worktree_path,
++        "allowed_paths": list(boundaries.get("allowed_paths") or []),
++        "allowed_terminal_backends": list(
++            boundaries.get("allowed_terminal_backends") or ["docker"]
++        ),
++        "read_only": False,
++    }
++
++
++def _runtime_preflight(mission: mdb.Mission) -> dict[str, Any]:
++    """Production runtime probe; tests replace this function explicitly."""
++    from agent.mission_terminal_guard import runtime_preflight
++    from hermes_cli.config import load_config_readonly
++
++    config = load_config_readonly()
++    terminal = config.get("terminal") or {}
++    image = str(
++        terminal.get("docker_image")
++        or "nikolaik/python-nodejs:python3.11-nodejs20"
++    )
++    return runtime_preflight(_mission_runtime_policy(mission), image=image)
++
++
++def _record_runtime_preflight(conn, mission: mdb.Mission) -> dict[str, Any]:
++    try:
++        report = _runtime_preflight(mission)
++    except Exception as exc:
++        current = mdb.get_mission(conn, mission.id)
++        if current is not None and current.status == "planning":
++            mdb.transition_mission(
++                conn,
++                mission.id,
++                "blocked",
++                phase="planning",
++                blocked_reason=f"runtime preflight failed: {exc}",
++            )
++        raise MissionError(f"runtime preflight failed: {exc}") from exc
++    store_evidence_blob(
++        conn,
++        mission,
++        kind="preflight",
++        status="passed",
++        content=json.dumps(report, ensure_ascii=False, sort_keys=True),
++        metadata={
++            "image": report.get("image"),
++            "image_id": report.get("image_id"),
++            "host_landlock_abi": report.get("host_landlock_abi"),
++            "container_landlock_abi": report.get("container_landlock_abi"),
++            "network": report.get("network"),
++        },
++        cwd=mission.worktree_path,
++    )
++    return report
++
++
++def _validate_start_scope(mission: mdb.Mission) -> None:
++    from agent.mission_terminal_guard import verify_clean_scope
++
++    try:
++        verify_clean_scope(_mission_runtime_policy(mission))
++    except PermissionError as exc:
++        raise MissionError(f"mission scope preflight failed: {exc}") from exc
++
++
+ def prepare_mission(conn, mission_id: str) -> mdb.Mission:
+     """Idempotently prepare one mission under its cross-process lock."""
+     with _mission_action_lock(conn, mission_id) as held:
+@@ -527,6 +598,7 @@ def _add_execution_task_unlocked(
+         or any(row["mission_id"] != mission_id for row in dependency_rows)
+     ):
+         raise MissionError("manual mission dependencies must be cards in the same mission")
++    _validate_plan_scope(mission, [{"title": title, "body": body}])
+     with kb._trusted_mission_controller_mutation():
+         task_id = kb.create_task(
+             conn, title=title, body=body, assignee=assignee,
+@@ -556,19 +628,88 @@ def _canonical_assignee(value: str, *, role: str) -> str:
+     return assignee
+ 
+ 
+-def _canonicalize_plan_payload(payload: Any) -> tuple[str, list[dict[str, str]]]:
++_PLAN_PATH_RE = re.compile(
++    r"/workspace/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*/?"
++    r"|(?<![A-Za-z0-9_.:/-])[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+/?"
++)
++
++
++def _normalize_planned_path(mission: mdb.Mission, raw: str, *, task_index: int) -> str:
++    value = str(raw).strip().strip("`'\" ,:;()[]{}")
++    if not value or "://" in value:
++        raise MissionError(f"planner task {task_index} contains an invalid path: {raw!r}")
++    worktree = Path(str(mission.worktree_path)).resolve(strict=False)
++    source = Path(mission.repo_path).resolve(strict=False)
++    if value == "/workspace":
++        raise MissionError(f"planner task {task_index} cannot claim the entire workspace")
++    if value.startswith("/workspace/"):
++        relative = value.removeprefix("/workspace/")
++    else:
++        candidate = Path(value).expanduser()
++        if candidate.is_absolute():
++            resolved = candidate.resolve(strict=False)
++            if resolved == source or source in resolved.parents:
++                raise MissionError(
++                    f"planner task {task_index} references the protected source checkout: {value}"
++                )
++            try:
++                relative = resolved.relative_to(worktree).as_posix()
++            except ValueError as exc:
++                raise MissionError(
++                    f"planner task {task_index} references a path outside the mission worktree: {value}"
++                ) from exc
++        else:
++            relative = candidate.as_posix().strip("/")
++    path = Path(relative)
++    if not relative or path.is_absolute() or ".." in path.parts:
++        raise MissionError(f"planner task {task_index} contains an unsafe path: {value}")
++    allowed = tuple(
++        str(item).strip().strip("/")
++        for item in mission.contract.boundaries.get("allowed_paths", [])
++    )
++    if allowed and not any(
++        relative == item or relative.startswith(item + "/")
++        for item in allowed
++    ):
++        raise MissionError(
++            f"planner task {task_index} path is outside the mission contract: {relative}"
++        )
++    return relative
++
++
++def _validate_plan_scope(mission: mdb.Mission, tasks: list[dict[str, Any]]) -> None:
++    """Reject planner paths that conflict with the durable mission contract."""
++    for index, task in enumerate(tasks, start=1):
++        declared = task.get("paths")
++        if declared is not None:
++            if not isinstance(declared, list) or any(
++                not isinstance(item, str) for item in declared
++            ):
++                raise MissionError(f"planner task {index} paths must be a list of strings")
++            normalized = [
++                _normalize_planned_path(mission, item, task_index=index)
++                for item in declared
++            ]
++            if len(normalized) != len(set(normalized)):
++                raise MissionError(f"planner task {index} contains duplicate paths")
++        for match in _PLAN_PATH_RE.findall(str(task.get("body") or "")):
++            _normalize_planned_path(mission, match, task_index=index)
++
++
++def _canonicalize_plan_payload(payload: Any) -> tuple[str, list[dict[str, Any]]]:
+     if not isinstance(payload, dict) or set(payload) != {"tasks"}:
+         raise MissionError("planner payload must contain only the tasks field")
+     tasks = payload.get("tasks")
+     if not isinstance(tasks, list) or not 1 <= len(tasks) <= 12:
+         raise MissionError("planner must return between 1 and 12 tasks")
+-    normalized: list[dict[str, str]] = []
++    normalized: list[dict[str, Any]] = []
+     for index, item in enumerate(tasks, start=1):
+         if not isinstance(item, dict):
+             raise MissionError(f"planner task {index} is not an object")
+-        if set(item) != {"title", "body"}:
++        keys = set(item)
++        if keys not in ({"title", "body"}, {"title", "body", "paths"}):
+             raise MissionError(
+-                f"planner task {index} must contain only title and body"
++                f"planner task {index} must contain title, body, and optional paths"
+             )
+         title_value = item.get("title")
+         body_value = item.get("body")
+@@ -578,7 +719,13 @@ def _canonicalize_plan_payload(payload: Any) -> tuple[str, list[dict[str, str]]]
+         body = body_value.strip()
+         if not title or not body:
+             raise MissionError(f"planner task {index} lacks title or body")
+-        normalized.append({"title": title, "body": body})
++        normalized_task: dict[str, Any] = {"title": title, "body": body}
++        if "paths" in item:
++            paths = item.get("paths")
++            if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
++                raise MissionError(f"planner task {index} paths must be a list of strings")
++            normalized_task["paths"] = [path.strip() for path in paths]
++        normalized.append(normalized_task)
+     canonical = json.dumps(
+         {"tasks": normalized}, ensure_ascii=False, sort_keys=True,
+         separators=(",", ":"),
+@@ -586,7 +733,7 @@ def _canonicalize_plan_payload(payload: Any) -> tuple[str, list[dict[str, str]]]
+     return canonical, normalized
+ 
+ 
+-def _load_canonical_plan(row: dict[str, Any]) -> tuple[list[dict[str, str]], str, str]:
++def _load_canonical_plan(row: dict[str, Any]) -> tuple[list[dict[str, Any]], str, str]:
+     payload_json = str(row["payload_json"])
+     plan_hash = str(row["plan_hash"])
+     if hashlib.sha256(payload_json.encode("utf-8")).hexdigest() != plan_hash:
+@@ -965,6 +1112,7 @@ def _materialize_canonical_plan(
+     conn, mission: mdb.Mission, plan_row: dict[str, Any],
+ ) -> mdb.Mission:
+     tasks, executor_assignee, verifier_assignee = _load_canonical_plan(plan_row)
++    _validate_plan_scope(mission, tasks)
+     plan_hash = str(plan_row["plan_hash"])
+     executor_ids: list[str] = []
+     for ordinal, item in enumerate(tasks, start=1):
+@@ -1057,13 +1205,20 @@ def plan_with_model(
+             canonical_verifier = _canonical_assignee(
+                 verifier_assignee, role="verifier",
+             )
++            _record_runtime_preflight(conn, mission)
+             from agent.auxiliary_client import call_llm
+ 
+             system = (
+                 "You are a mission planner. Return JSON only: "
+-                '{"tasks":[{"title":"...","body":"..."}]}. '
++                '{"tasks":[{"title":"...","body":"...","paths":["src/example.py"]}]}. '
+                 "Create 1-12 bounded implementation tasks in execution order. Every body "
+-                "must name its expected output and verification. Do not claim to execute work."
++                "must name its expected output and verification. Every task must declare "
++                "the exact repository-relative paths it may modify; use an empty paths list "
++                "for read-only or verification-only work. Paths must be inside contract.allowed_paths. "
++                "Treat /workspace as the existing repository root and never initialize a nested project. "
++                "Task bodies must tell executors to use Hermes file tools to create missing root files; "
++                "terminal writes are permitted only beneath approved paths that already exist. "
++                "Do not claim to execute work."
+             )
+             user = json.dumps(
+                 {
+@@ -1094,7 +1249,8 @@ def plan_with_model(
+                 payload = json.loads(raw)
+             except json.JSONDecodeError as exc:
+                 raise MissionError("planner returned malformed JSON") from exc
+-            canonical, _ = _canonicalize_plan_payload(payload)
++            canonical, planned_tasks = _canonicalize_plan_payload(payload)
++            _validate_plan_scope(mission, planned_tasks)
+             plan_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+             if conn.execute(
+                 """SELECT 1 FROM tasks
+@@ -1138,6 +1294,7 @@ def finish_plan(conn, mission_id: str, *, verifier_assignee: str) -> mdb.Mission
+         ).fetchall()
+         if not executor_rows:
+             raise MissionError("a mission plan requires at least one executor task")
++        _record_runtime_preflight(conn, mission)
+         verifier_rows = conn.execute(
+             """SELECT id FROM tasks
+                  WHERE mission_id=? AND mission_role='verifier'""",
+@@ -1209,6 +1366,7 @@ def _start_mission_unlocked(conn, mission_id: str) -> mdb.Mission:
+     _validate_worktree_identity(
+         mission, expected_head=mission.base_commit, require_clean=True,
+     )
++    _validate_start_scope(mission)
+     if not mission.root_task_id:
+         raise MissionError("mission has no controller task")
+     root = kb.get_task(conn, mission.root_task_id)
+@@ -1668,6 +1826,50 @@ def cancel_mission(conn, mission_id: str) -> mdb.Mission:
+         return _cancel_mission_unlocked(conn, mission_id)
+ 
+ 
++
++def block_terminal_containment_violation(
++    conn,
++    mission_id: str,
++    *,
++    task_id: str,
++    run_id: int,
++    reason: str,
++    audit: dict[str, Any],
++) -> None:
++    """Revoke a worker immediately after a terminal containment violation."""
++    mission = mdb.get_mission(conn, mission_id)
++    if mission is None:
++        raise KeyError(mission_id)
++    mdb.record_evidence(
++        conn,
++        mission_id,
++        kind="terminal_containment",
++        status="failed",
++        metadata=_redact_value({"reason": reason, **audit}),
++        task_id=task_id,
++        run_id=run_id,
++        cwd=mission.worktree_path,
++    )
++    task = kb.get_task(conn, task_id)
++    if task is not None and task.status == "running":
++        if not kb.block_task(
++            conn,
++            task_id,
++            reason=reason,
++            kind="capability",
++            expected_run_id=run_id,
++        ):
++            raise MissionError("could not revoke violating mission executor")
++    refreshed = mdb.get_mission(conn, mission_id)
++    if refreshed is not None and refreshed.status == "running":
++        mdb.transition_mission(
++            conn,
++            mission_id,
++            "blocked",
++            phase="execution",
++            blocked_reason=reason,
++        )
++
+ def record_command_result(
+     conn,
+     mission_id: str,
+@@ -1682,6 +1884,7 @@ def record_command_result(
+     tool_call_id: Optional[str] = None,
+     started_at: Optional[int] = None,
+     finished_at: Optional[int] = None,
++    containment: Optional[dict[str, Any]] = None,
+ ) -> int:
+     mission = mdb.get_mission(conn, mission_id)
+     if mission is None:
+@@ -1702,6 +1905,7 @@ def record_command_result(
+             "argv": _redact_value(shlex.split(command, posix=True) if command else []),
+             "command_sha256": command_hash,
+             "workspace_snapshot": snapshot,
++            **({"containment": _redact_value(containment)} if containment else {}),
+         },
+         task_id=task_id,
+         run_id=run_id,
+diff --git a/tests/hermes_cli/test_mission_plan_resumption.py b/tests/hermes_cli/test_mission_plan_resumption.py
+index e03a21b62..2e727f8f1 100644
+--- a/tests/hermes_cli/test_mission_plan_resumption.py
++++ b/tests/hermes_cli/test_mission_plan_resumption.py
+@@ -63,6 +63,21 @@ def prepared_mission(tmp_path: Path, monkeypatch):
+             board="default",
+         )
+         service.prepare_mission(conn, mission_id)
++        monkeypatch.setattr(
++            service,
++            "_runtime_preflight",
++            lambda mission: {
++                "docker": "/usr/bin/docker",
++                "docker_server": "test",
++                "image": "test-image",
++                "image_id": "sha256:test",
++                "host_landlock_abi": 8,
++                "container_landlock_abi": 8,
++                "network": "none",
++                "workspace": mission.worktree_path,
++                "manifest": {"tracked": [], "untracked": [], "nested_git": []},
++            },
++        )
+         try:
+             yield conn, mission_id, reopen
+         finally:
+@@ -305,3 +320,148 @@ def test_retry_rejects_tampered_adopted_card(
+             executor_assignee="default",
+             verifier_assignee="default",
+         )
++
++
++def test_planner_rejects_declared_path_outside_contract(
++    prepared_mission, monkeypatch,
++):
++    conn, mission_id, _ = prepared_mission
++    monkeypatch.setattr(
++        auxiliary_client,
++        "call_llm",
++        lambda **kwargs: SimpleNamespace(
++            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
++                "tasks": [{
++                    "title": "Create unrelated module",
++                    "body": "Create src/main/java/App.java and verify it compiles.",
++                    "paths": ["src/main/java/App.java"],
++                }]
++            })))],
++        ),
++    )
++
++    with pytest.raises(service.MissionError, match="outside the mission contract"):
++        service.plan_with_model(
++            conn,
++            mission_id,
++            executor_assignee="default",
++            verifier_assignee="default",
++        )
++
++    assert mdb.get_plan(conn, mission_id) is None
++    assert not _mission_cards(conn, mission_id, "executor")
++    assert not _mission_cards(conn, mission_id, "verifier")
++
++
++def test_planner_rejects_protected_source_checkout_path(
++    prepared_mission, monkeypatch,
++):
++    conn, mission_id, _ = prepared_mission
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    source_path = str(Path(mission.repo_path) / "app.py")
++    monkeypatch.setattr(
++        auxiliary_client,
++        "call_llm",
++        lambda **kwargs: SimpleNamespace(
++            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
++                "tasks": [{
++                    "title": "Modify source checkout",
++                    "body": f"Edit {source_path} directly.",
++                    "paths": [source_path],
++                }]
++            })))],
++        ),
++    )
++
++    with pytest.raises(service.MissionError, match="protected source checkout"):
++        service.plan_with_model(
++            conn,
++            mission_id,
++            executor_assignee="default",
++            verifier_assignee="default",
++        )
++
++    assert mdb.get_plan(conn, mission_id) is None
++
++
++def test_planner_accepts_workspace_path_inside_contract(
++    prepared_mission, monkeypatch,
++):
++    conn, mission_id, _ = prepared_mission
++    monkeypatch.setattr(
++        auxiliary_client,
++        "call_llm",
++        lambda **kwargs: SimpleNamespace(
++            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
++                "tasks": [{
++                    "title": "Update approved file",
++                    "body": "Edit /workspace/app.py and run python -m pytest.",
++                    "paths": ["/workspace/app.py"],
++                }]
++            })))],
++        ),
++    )
++
++    mission = service.plan_with_model(
++        conn,
++        mission_id,
++        executor_assignee="default",
++        verifier_assignee="default",
++    )
++
++    assert mission.status == "ready"
++    plan = mdb.get_plan(conn, mission_id)
++    assert plan is not None
++    assert json.loads(plan["payload_json"])["tasks"][0]["paths"] == [
++        "/workspace/app.py"
++    ]
++
++
++def test_manual_task_rejects_body_path_outside_contract(prepared_mission):
++    conn, mission_id, _ = prepared_mission
++
++    with pytest.raises(service.MissionError, match="outside the mission contract"):
++        service.add_execution_task(
++            conn,
++            mission_id,
++            title="Wrong root",
++            body="Create src/main/java/App.java and verify it compiles.",
++            assignee="default",
++        )
++
++    assert not _mission_cards(conn, mission_id, "executor")
++
++
++def test_runtime_preflight_blocks_before_planner_model(
++    prepared_mission, monkeypatch,
++):
++    conn, mission_id, _ = prepared_mission
++    calls = {"llm": 0}
++
++    def fail_preflight(mission):
++        raise PermissionError("Landlock unavailable")
++
++    def planner_must_not_run(**kwargs):
++        calls["llm"] += 1
++        raise AssertionError("planner model ran before runtime preflight")
++
++    monkeypatch.setattr(service, "_runtime_preflight", fail_preflight)
++    monkeypatch.setattr(auxiliary_client, "call_llm", planner_must_not_run)
++
++    with pytest.raises(service.MissionError, match="runtime preflight failed"):
++        service.plan_with_model(
++            conn,
++            mission_id,
++            executor_assignee="default",
++            verifier_assignee="default",
++        )
++
++    mission = mdb.get_mission(conn, mission_id)
++    assert mission is not None
++    assert mission.status == "blocked"
++    assert mission.phase == "planning"
++    assert "Landlock unavailable" in str(mission.blocked_reason)
++    assert calls["llm"] == 0
++    assert mdb.get_plan(conn, mission_id) is None
++    assert not _mission_cards(conn, mission_id, "executor")
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index 162d32c55..e819a9b9d 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -35,6 +35,21 @@ def mission_env(tmp_path, monkeypatch):
+     (repo / "app.py").write_text("VALUE = 1\n")
+     _git(repo, "add", "app.py")
+     _git(repo, "commit", "-m", "base")
++    monkeypatch.setattr(
++        service,
++        "_runtime_preflight",
++        lambda mission: {
++            "docker": "/usr/bin/docker",
++            "docker_server": "test",
++            "image": "test-image",
++            "image_id": "sha256:test",
++            "host_landlock_abi": 8,
++            "container_landlock_abi": 8,
++            "network": "none",
++            "workspace": mission.worktree_path,
++            "manifest": {"tracked": [], "untracked": [], "nested_git": []},
++        },
++    )
+     with kb.connect_closing(board="default") as conn:
+         yield conn, repo
+ 
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+new file mode 100644
+index 000000000..540571394
+--- /dev/null
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -0,0 +1,461 @@
++"""Regression tests for Project Autopilot terminal containment."""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from agent import mission_terminal_guard as guard
++from tools.environments import docker as docker_env
++
++
++MISSION_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
++
++
++def _mission_image_available() -> bool:
++    if shutil.which("docker") is None:
++        return False
++    proc = subprocess.run(
++        ["docker", "image", "inspect", MISSION_IMAGE],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++        timeout=10,
++        check=False,
++    )
++    return proc.returncode == 0
++
++
++REQUIRES_LOCAL_MISSION_IMAGE = pytest.mark.skipif(
++    not _mission_image_available(),
++    reason="the offline mission Docker image is not present locally",
++)
++
++
++def _git(repo: Path, *args: str) -> str:
++    proc = subprocess.run(
++        ["git", "-C", str(repo), *args],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++    )
++    return proc.stdout.strip()
++
++
++def _repo(tmp_path: Path) -> Path:
++    repo = tmp_path / "repo"
++    tmp_path.chmod(0o755)
++    (repo / "src").mkdir(parents=True)
++    repo.chmod(0o755)
++    (repo / "src").chmod(0o777)
++    (repo / "README.md").write_text("base\n", encoding="utf-8")
++    (repo / "src" / "base.py").write_text("VALUE = 1\n", encoding="utf-8")
++    _git(repo, "init")
++    _git(repo, "config", "user.email", "guard@example.test")
++    _git(repo, "config", "user.name", "Guard Test")
++    _git(repo, "add", ".")
++    _git(repo, "commit", "-m", "base")
++    return repo
++
++
++def _policy(repo: Path, allowed: list[str] | None = None) -> dict:
++    return {
++        "mission_id": "m_guard",
++        "mission_role": "executor",
++        "worktree_path": str(repo),
++        "allowed_paths": ["src"] if allowed is None else allowed,
++        "allowed_terminal_backends": ["docker"],
++        "read_only": False,
++    }
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "git init nested",
++        "cd src && git init",
++        "git worktree add ../other branch",
++        "uv init project-name",
++        "uv init .",
++    ],
++)
++def test_repository_creation_commands_are_rejected(command: str) -> None:
++    with pytest.raises(PermissionError):
++        guard.validate_command(command)
++
++
++def test_manifest_rolls_back_out_of_scope_changes_only(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++    policy = _policy(repo)
++    (repo / "src" / "allowed.py").write_text("ALLOWED = True\n", encoding="utf-8")
++    (repo / "README.md").write_text("tampered\n", encoding="utf-8")
++    nested = repo / "unexpected"
++    (nested / ".git").mkdir(parents=True)
++    (nested / "bad.py").write_text("BAD = True\n", encoding="utf-8")
++
++    manifest = guard.workspace_manifest(policy)
++    violations = guard.manifest_violations(policy, manifest)
++
++    assert "README.md" in violations
++    assert "unexpected/.git" in violations
++    assert "unexpected/bad.py" in violations
++    restored = guard.rollback_violations(policy, violations)
++    assert set(restored) == set(violations)
++    assert (repo / "README.md").read_text(encoding="utf-8") == "base\n"
++    assert not nested.exists()
++    assert (repo / "src" / "allowed.py").exists()
++    assert guard.manifest_violations(policy, guard.workspace_manifest(policy)) == []
++
++
++def test_existing_nested_git_blocks_before_command(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++    (repo / "src" / "nested" / ".git").mkdir(parents=True)
++    with pytest.raises(PermissionError, match="out-of-scope"):
++        guard.verify_clean_scope(_policy(repo))
++
++
++def test_restricted_docker_uses_landlock_launcher(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    captured: dict[str, object] = {}
++
++    def fake_popen(cmd, stdin_data=None):
++        captured["cmd"] = cmd
++        captured["stdin_data"] = stdin_data
++        return object()
++
++    monkeypatch.setattr(docker_env, "_popen_bash", fake_popen)
++    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
++    env._container_id = "container"
++    env._docker_exe = "docker"
++    env._restricted_mode = True
++    env._mission_policy = {
++        "mission_id": "m_guard",
++        "worktree_path": "/host/repo",
++        "allowed_paths": ["src"],
++    }
++    env._init_env_args = []
++
++    result = env._run_bash("touch /workspace/src/ok.py")
++
++    assert result is not None
++    cmd = captured["cmd"]
++    assert isinstance(cmd, list)
++    assert cmd[:3] == ["docker", "exec", "container"]
++    assert "python3" in cmd
++    assert "Landlock ABI" in cmd[cmd.index("-c") + 1]
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_landlock_denies_forbidden_write_in_real_container(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++    policy = _policy(repo)
++    argv = guard.landlock_wrapped_command(
++        "touch /workspace/src/allowed.py && touch /workspace/forbidden.py",
++        policy,
++    )
++    proc = subprocess.run(
++        [
++            "docker",
++            "run",
++            "--rm",
++            "--network=none",
++            "--cap-drop=ALL",
++            "--security-opt=no-new-privileges",
++            "-v",
++            f"{repo}:/workspace",
++            "-w",
++            "/workspace",
++            MISSION_IMAGE,
++            *argv,
++        ],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        timeout=60,
++        check=False,
++    )
++    assert proc.returncode != 0, proc.stdout
++    assert (repo / "src" / "allowed.py").exists()
++    assert not (repo / "forbidden.py").exists()
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_runtime_preflight_proves_real_image_and_landlock(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++
++    report = guard.runtime_preflight(
++        _policy(repo),
++        image=MISSION_IMAGE,
++    )
++
++    assert report["host_landlock_abi"] >= 3
++    assert report["container_landlock_abi"] >= 3
++    assert report["network"] == "none"
++    assert report["workspace"] == str(repo.resolve())
++    assert report["manifest"] == {
++        "tracked": [],
++        "untracked": [],
++        "nested_git": [],
++    }
++
++
++def test_manifest_includes_ignored_out_of_scope_files(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++    (repo / ".gitignore").write_text("ignored/\n", encoding="utf-8")
++    _git(repo, "add", ".gitignore")
++    _git(repo, "commit", "-m", "ignore fixture")
++    ignored = repo / "ignored" / "secret.bin"
++    ignored.parent.mkdir()
++    ignored.write_bytes(b"unsafe")
++
++    manifest = guard.workspace_manifest(_policy(repo))
++    violations = guard.manifest_violations(_policy(repo), manifest)
++
++    assert "ignored/secret.bin" in manifest["untracked"]
++    assert "ignored/secret.bin" in violations
++    guard.rollback_violations(_policy(repo), violations)
++    assert not ignored.exists()
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_missing_allowed_root_file_requires_exact_path_file_tool(
++    tmp_path: Path,
++) -> None:
++    repo = _repo(tmp_path)
++    policy = _policy(repo, allowed=["pyproject.toml"])
++    argv = guard.landlock_wrapped_command(
++        "touch /workspace/pyproject.toml /workspace/forbidden.txt",
++        policy,
++    )
++
++    proc = subprocess.run(
++        [
++            "docker",
++            "run",
++            "--rm",
++            "--network=none",
++            "--cap-drop=ALL",
++            "--security-opt=no-new-privileges",
++            "-v",
++            f"{repo}:/workspace",
++            "-w",
++            "/workspace",
++            MISSION_IMAGE,
++            *argv,
++        ],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        timeout=60,
++        check=False,
++    )
++    assert proc.returncode != 0
++    assert "Permission denied" in proc.stdout
++    assert not (repo / "pyproject.toml").exists()
++    assert not (repo / "forbidden.txt").exists()
++
++
++def test_process_revocation_latch_blocks_all_later_mutations(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from agent import mission_scope
++
++    repo = _repo(tmp_path)
++    monkeypatch.setenv(
++        "HERMES_MISSION_POLICY",
++        json.dumps({
++            "mission_id": "m_guard",
++            "mission_role": "executor",
++            "worktree_path": str(repo),
++            "allowed_paths": ["src"],
++            "allowed_terminal_backends": ["docker"],
++            "read_only": False,
++        }),
++    )
++    monkeypatch.setenv("HERMES_MISSION_EXECUTION_REVOKED", "1")
++
++    with pytest.raises(PermissionError, match="revoked"):
++        mission_scope.require_write_path(repo / "src" / "later.py")
++    with pytest.raises(PermissionError, match="revoked"):
++        mission_scope.require_terminal("/workspace", "docker")
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_ephemeral_python_tool_state_stays_outside_workspace(tmp_path: Path) -> None:
++    repo = _repo(tmp_path)
++    policy = _policy(repo)
++    command = (
++        'uv venv "$UV_PROJECT_ENVIRONMENT" >/dev/null && '
++        "python3 -c 'import os, pathlib; "
++        'assert os.environ["UV_PROJECT_ENVIRONMENT"].startswith("/tmp/"); '
++        'pathlib.Path(os.environ["COVERAGE_FILE"]).write_text("ok")'
++        "'"
++    )
++    argv = guard.landlock_wrapped_command(command, policy)
++
++    proc = subprocess.run(
++        [
++            "docker",
++            "run",
++            "--rm",
++            "--network=none",
++            "--cap-drop=ALL",
++            "--security-opt=no-new-privileges",
++            "-v",
++            f"{repo}:/workspace",
++            "-w",
++            "/workspace",
++            MISSION_IMAGE,
++            *argv,
++        ],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        timeout=60,
++        check=False,
++    )
++    assert proc.returncode == 0, proc.stdout
++    assert not (repo / ".venv").exists()
++    assert not (repo / ".pytest_cache").exists()
++    assert not (repo / ".coverage").exists()
++    assert guard.manifest_violations(policy, guard.workspace_manifest(policy)) == []
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_terminal_tool_blocks_mission_on_landlock_denial(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import mission_service as service
++    from hermes_cli import missions_db as mdb
++    from tools import terminal_tool as terminal_module
++
++    hermes_home = tmp_path / "hermes"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_home / "kanban"))
++    source = tmp_path / "source"
++    source.mkdir()
++    source.chmod(0o755)
++    (source / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
++    _git(source, "init")
++    _git(source, "config", "user.email", "guard@example.test")
++    _git(source, "config", "user.name", "Guard Test")
++    _git(source, "add", "app.py")
++    _git(source, "commit", "-m", "base")
++
++    monkeypatch.setattr(
++        service,
++        "_runtime_preflight",
++        lambda mission: {
++            "docker": "/usr/bin/docker",
++            "docker_server": "test",
++            "image": MISSION_IMAGE,
++            "image_id": "sha256:test",
++            "host_landlock_abi": 8,
++            "container_landlock_abi": 8,
++            "network": "none",
++            "workspace": mission.worktree_path,
++            "manifest": {"tracked": [], "untracked": [], "nested_git": []},
++        },
++    )
++
++    with kb.connect_closing(board="default") as conn:
++        contract = mdb.MissionContract(
++            outcome="Update app.py without creating unrelated files",
++            verification=["python3 -m py_compile app.py"],
++            constraints=["Do not create files outside app.py"],
++            boundaries={
++                "allowed_roots": [str(source)],
++                "allowed_paths": ["app.py"],
++                "network_destinations": [],
++            },
++            stop_when=["filesystem containment denies a write"],
++            allow_local_commit=False,
++        )
++        mission_id = mdb.create_mission(
++            conn,
++            objective="Exercise terminal containment",
++            contract=contract,
++            autonomy_level=3,
++            repo_path=str(source),
++            board="default",
++        )
++        mission = service.prepare_mission(conn, mission_id)
++        executor = service.add_execution_task(
++            conn,
++            mission_id,
++            title="Update the approved file",
++            body="Update app.py only and verify it compiles.",
++            assignee="default",
++        )
++        service.finish_plan(conn, mission_id, verifier_assignee="default")
++        service.start_mission(conn, mission_id)
++        claimed = kb.claim_task(conn, executor)
++        assert claimed is not None
++        db_path = conn.execute("PRAGMA database_list").fetchone()[2]
++
++    worktree = Path(str(mission.worktree_path))
++    worktree.chmod(0o755)
++    policy = {
++        "mission_id": mission_id,
++        "mission_role": "executor",
++        "autonomy_level": 3,
++        "board": "default",
++        "worktree_path": str(worktree),
++        "allowed_paths": ["app.py"],
++        "network_destinations": [],
++        "allowed_terminal_backends": ["docker"],
++        "read_only": False,
++    }
++    monkeypatch.setenv("HERMES_MISSION_POLICY", json.dumps(policy))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", executor)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
++    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
++    monkeypatch.setenv("TERMINAL_ENV", "docker")
++    monkeypatch.setenv("TERMINAL_CWD", str(worktree))
++    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", MISSION_IMAGE)
++    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
++    monkeypatch.setenv("TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "false")
++    monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "false")
++    terminal_module.clear_session_cwd(executor)
++
++    try:
++        result = json.loads(
++            terminal_module.terminal_tool(
++                command=(
++                    'printf "VALUE = 2\n" > /workspace/app.py && '
++                    "touch /workspace/forbidden.py"
++                ),
++                task_id=executor,
++                timeout=60,
++                force=True,
++            )
++        )
++    finally:
++        terminal_module.cleanup_vm(executor, force_remove=True)
++        terminal_module.clear_session_cwd(executor)
++
++    assert result["exit_code"] == 126
++    assert "Landlock filesystem containment" in result["output"]
++    assert (worktree / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
++    assert not (worktree / "forbidden.py").exists()
++    assert os.environ["HERMES_MISSION_EXECUTION_REVOKED"] == "1"
++
++    with kb.connect_closing(board="default") as conn:
++        task = kb.get_task(conn, executor)
++        current = mdb.get_mission(conn, mission_id)
++        evidence = mdb.list_evidence(conn, mission_id)
++    assert task is not None and task.status == "blocked"
++    assert current is not None and current.status == "blocked"
++    assert any(item["kind"] == "terminal_containment" for item in evidence)
++    command_evidence = [item for item in evidence if item["kind"] == "command"]
++    assert command_evidence
++    assert command_evidence[-1]["metadata"]["containment"]["violations"] == []
+diff --git a/tools/environments/docker.py b/tools/environments/docker.py
+index a15edd134..403321762 100644
+--- a/tools/environments/docker.py
++++ b/tools/environments/docker.py
+@@ -881,6 +881,7 @@ class DockerEnvironment(BaseEnvironment):
+         if cwd == "~":
+             cwd = "/root"
+         mission_labels: dict[str, str] = {}
++        self._mission_policy: dict | None = None
+         if restricted_mode:
+             # Scoped missions get exactly one host bind: their approved
+             # worktree at /workspace.  Defense in depth belongs here as well as
+@@ -904,6 +905,7 @@ class DockerEnvironment(BaseEnvironment):
+             except json.JSONDecodeError as exc:
+                 raise ValueError("restricted Docker mode requires a valid mission policy") from exc
+             mission_id = str(mission_policy.get("mission_id") or "").strip()
++            self._mission_policy = mission_policy
+             board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+             db_path = os.environ.get("HERMES_KANBAN_DB", "").strip()
+             run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+@@ -1671,6 +1673,12 @@ class DockerEnvironment(BaseEnvironment):
+ 
+         if login:
+             cmd.extend(["bash", "-l", "-c", cmd_string])
++        elif self._restricted_mode:
++            from agent.mission_terminal_guard import landlock_wrapped_command
++
++            if self._mission_policy is None:
++                raise PermissionError("restricted Docker command has no mission policy")
++            cmd.extend(landlock_wrapped_command(cmd_string, self._mission_policy))
+         else:
+             cmd.extend(["bash", "-c", cmd_string])
+ 
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index dba2a3153..6c2951409 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -2990,6 +2990,7 @@ def terminal_tool(
+                 from tools.interrupt import clear_current_thread_interrupt
+                 clear_current_thread_interrupt()
+ 
++            mission_guard_audit = None
+             while retry_count <= max_retries:
+                 try:
+                     command_cwd = _resolve_command_cwd(
+@@ -3001,6 +3002,18 @@ def terminal_tool(
+                     if config.get("mission_restricted"):
+                         command_cwd = str(mission_container_path(command_cwd))
+                     require_terminal(command_cwd, env_type, background=False)
++                    if config.get("mission_restricted"):
++                        from agent.mission_terminal_guard import (
++                            validate_command as _validate_mission_command,
++                            verify_clean_scope as _verify_mission_scope,
++                        )
++                        from agent.mission_scope import current_policy as _current_mission_policy
++
++                        _policy = _current_mission_policy()
++                        if _policy is None:
++                            raise PermissionError("mission terminal lost its scope policy")
++                        _validate_mission_command(command)
++                        mission_guard_audit = {"before": _verify_mission_scope(_policy)}
+                     execute_kwargs = {
+                         "timeout": effective_timeout,
+                         "cwd": command_cwd,
+@@ -3012,7 +3025,98 @@ def terminal_tool(
+                         "bounded_capture": True,
+                     }
+                     result = env.execute(command, **execute_kwargs)
++                    if config.get("mission_restricted"):
++                        from agent.mission_terminal_guard import (
++                            manifest_violations as _mission_manifest_violations,
++                            rollback_violations as _rollback_mission_violations,
++                            workspace_manifest as _mission_workspace_manifest,
++                        )
++                        from agent.mission_scope import current_policy as _current_mission_policy
++
++                        _policy = _current_mission_policy()
++                        if _policy is None:
++                            raise PermissionError("mission terminal lost its scope policy")
++                        _after = _mission_workspace_manifest(_policy)
++                        _violations = _mission_manifest_violations(_policy, _after)
++                        _rolled_back = _rollback_mission_violations(_policy, _violations)
++                        mission_guard_audit = {
++                            **(mission_guard_audit or {}),
++                            "after": _after,
++                            "violations": _violations,
++                            "rolled_back": _rolled_back,
++                        }
++                        _landlock_denied = bool(
++                            result.get("returncode", 0) != 0
++                            and "/workspace" in str(result.get("output", ""))
++                            and any(
++                                marker in str(result.get("output", "")).lower()
++                                for marker in ("permission denied", "operation not permitted")
++                            )
++                        )
++                        if _violations or _landlock_denied:
++                            os.environ["HERMES_MISSION_EXECUTION_REVOKED"] = "1"
++                            _reason = (
++                                "mission terminal created out-of-scope paths; changes were rolled back: "
++                                + ", ".join(_violations)
++                                if _violations
++                                else "mission terminal write was denied by Landlock filesystem containment"
++                            )
++                            _run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
++                            _task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
++                            _board = os.environ.get("HERMES_KANBAN_BOARD")
++                            if _run_raw and _task:
++                                from hermes_cli import kanban_db as _guard_kb
++                                from hermes_cli.mission_service import (
++                                    block_terminal_containment_violation as _block_guard_violation,
++                                )
++                                with _guard_kb.connect_closing(board=_board) as _guard_conn:
++                                    _block_guard_violation(
++                                        _guard_conn,
++                                        str(_policy["mission_id"]),
++                                        task_id=_task,
++                                        run_id=int(_run_raw),
++                                        reason=_reason,
++                                        audit=mission_guard_audit,
++                                    )
++                            result = {
++                                "output": (result.get("output", "") + "\n" + _reason).strip(),
++                                "returncode": 126,
++                            }
+                 except Exception as e:
++                    if isinstance(e, PermissionError) and config.get("mission_restricted"):
++                        os.environ["HERMES_MISSION_EXECUTION_REVOKED"] = "1"
++                        _reason = str(e)
++                        _audit = {**(mission_guard_audit or {}), "guard_error": _reason}
++                        try:
++                            from agent.mission_scope import current_policy as _current_mission_policy
++                            from hermes_cli import kanban_db as _guard_kb
++                            from hermes_cli.mission_service import (
++                                block_terminal_containment_violation as _block_guard_violation,
++                            )
++
++                            _policy = _current_mission_policy()
++                            _run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
++                            _task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
++                            _board = os.environ.get("HERMES_KANBAN_BOARD")
++                            if _policy is not None and _run_raw and _task:
++                                with _guard_kb.connect_closing(board=_board) as _guard_conn:
++                                    _block_guard_violation(
++                                        _guard_conn,
++                                        str(_policy["mission_id"]),
++                                        task_id=_task,
++                                        run_id=int(_run_raw),
++                                        reason=_reason,
++                                        audit=_audit,
++                                    )
++                        except Exception:
++                            logger.error("could not persist mission containment block", exc_info=True)
++                        return json.dumps({
++                            "output": "",
++                            "exit_code": 126,
++                            "error": _reason,
++                            "status": "blocked",
++                            "containment": _audit,
++                        }, ensure_ascii=False)
+                     error_str = str(e).lower()
+                     if "timeout" in error_str:
+                         return json.dumps({
+@@ -3235,6 +3339,7 @@ def terminal_tool(
+                             stdout=output,
+                             task_id=os.environ.get("HERMES_KANBAN_TASK") or effective_task_id,
+                             run_id=(int(_mission_run_raw) if _mission_run_raw else None),
++                            containment=mission_guard_audit,
+                         )
+                     result_dict["mission_evidence_id"] = _mission_evidence_id
+             except Exception as exc:
+-- 
+2.53.0
+
