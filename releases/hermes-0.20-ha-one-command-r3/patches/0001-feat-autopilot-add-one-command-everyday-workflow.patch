@@ -1,0 +1,910 @@
+From d278b799c4109aa989e117ebd193f9938811188f Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 14:03:43 -0700
+Subject: [PATCH] feat(autopilot): add one-command everyday workflow
+
+---
+ agent/mission_terminal_guard.py               |   6 +-
+ hermes_cli/autopilot_cmd.py                   | 570 ++++++++++++++++++
+ hermes_cli/main.py                            |  15 +
+ tests/hermes_cli/test_autopilot_cmd.py        | 174 ++++++
+ .../test_mission_terminal_containment.py      |   9 +-
+ tools/terminal_tool.py                        |  44 ++
+ 6 files changed, 816 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/autopilot_cmd.py
+ create mode 100644 tests/hermes_cli/test_autopilot_cmd.py
+
+diff --git a/agent/mission_terminal_guard.py b/agent/mission_terminal_guard.py
+index cd7259a10..9388107f0 100644
+--- a/agent/mission_terminal_guard.py
++++ b/agent/mission_terminal_guard.py
+@@ -17,6 +17,10 @@ from pathlib import Path
+ from typing import Any
+ 
+ 
++class RecoverablePolicyError(PermissionError):
++    """A contained command denial that must not revoke the mission lease."""
++
++
+ _FORBIDDEN_COMMANDS: tuple[tuple[re.Pattern[str], str], ...] = (
+     (
+         re.compile(r"(?:^|[;&|()\s])git\s+(?:-[^\s]+\s+)*init(?:\s|$)", re.I),
+@@ -41,7 +45,7 @@ def validate_command(command: str) -> None:
+     """Reject commands that can create or replace repository identity."""
+     for pattern, message in _FORBIDDEN_COMMANDS:
+         if pattern.search(command):
+-            raise PermissionError(message)
++            raise RecoverablePolicyError(message)
+ 
+ 
+ def canonicalize_command(command: str, policy: dict[str, Any]) -> str:
+diff --git a/hermes_cli/autopilot_cmd.py b/hermes_cli/autopilot_cmd.py
+new file mode 100644
+index 000000000..e903c59a7
+--- /dev/null
++++ b/hermes_cli/autopilot_cmd.py
+@@ -0,0 +1,570 @@
++"""One-command everyday interface for Project Autopilot.
++
++This module deliberately uses the proven manual-plan path underneath:
++create -> task-add -> plan-finish -> start -> dispatch -> verify -> local commit.
++The user supplies one objective and one or more deterministic verification
++commands; project registration, clean-source preparation, mission graph
++construction, polling, and safe result application are automatic.
++"""
++
++from __future__ import annotations
++
++import argparse
++import contextlib
++import hashlib
++import json
++import os
++import re
++import shlex
++import subprocess
++import sys
++import time
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from typing import Iterable, Optional
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import mission_service as mission_service
++from hermes_cli import missions_db as mdb
++from hermes_cli import projects_db as pdb
++
++
++_TERMINAL_STATUSES = {"succeeded", "blocked", "failed", "cancelled"}
++_SAFE_SEGMENT = re.compile(r"[^a-zA-Z0-9._-]+")
++
++
++class AutopilotError(RuntimeError):
++    """User-facing one-command workflow error."""
++
++
++@dataclass(frozen=True)
++class RepositoryContext:
++    original_root: Path
++    invocation_dir: Path
++    scope_prefix: str
++    source_repo: Path
++    shadow_path: Optional[Path]
++    dirty: bool
++
++
++@dataclass(frozen=True)
++class ApplyResult:
++    applied: bool
++    patch_path: Optional[Path]
++    changed_paths: tuple[str, ...]
++    conflict_paths: tuple[str, ...] = ()
++    reason: str = ""
++
++
++def build_parser(parent_subparsers) -> argparse.ArgumentParser:
++    parser = parent_subparsers.add_parser(
++        "autopilot",
++        help="Complete one verified repository task with one command",
++        description=(
++            "Run one bounded task from the current folder. Hermes automatically "
++            "detects the Git root, creates a clean shadow when the repository is "
++            "dirty, registers the project, builds and dispatches the mission, "
++            "waits for independent verification, and safely applies the verified "
++            "change back when it does not overlap local edits."
++        ),
++    )
++    parser.add_argument("objective", help="Plain-English task to complete")
++    parser.add_argument(
++        "--verify",
++        action="append",
++        default=[],
++        help=(
++            "Optional deterministic proof command. Repeat for multiple commands. "
++            "When omitted, Hermes requires a clean diff plus at least one change."
++        ),
++    )
++    parser.add_argument(
++        "--outcome",
++        default=None,
++        help="Exact desired result; defaults to the objective",
++    )
++    parser.add_argument(
++        "--repo",
++        default=".",
++        help="Folder to operate on; defaults to the current directory",
++    )
++    parser.add_argument(
++        "--path",
++        action="append",
++        default=[],
++        help=(
++            "Allowed path relative to the selected folder. Repeat as needed. "
++            "When omitted, the selected folder itself is the scope."
++        ),
++    )
++    parser.add_argument("--profile", default="default")
++    parser.add_argument("--board", default=None)
++    parser.add_argument("--timeout", type=int, default=600)
++    parser.add_argument("--poll", type=float, default=3.0)
++    parser.add_argument(
++        "--no-apply",
++        action="store_true",
++        help="Keep the verified result only on the mission branch",
++    )
++    parser.add_argument("--json", action="store_true")
++    parser.set_defaults(_autopilot_parser=parser)
++    return parser
++
++
++def _git(repo: Path, *args: str, check: bool = True, binary: bool = False):
++    proc = subprocess.run(
++        ["git", "-C", str(repo), *args],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=not binary,
++        check=False,
++    )
++    if check and proc.returncode != 0:
++        stderr = proc.stderr.decode(errors="replace") if binary else proc.stderr
++        raise AutopilotError(stderr.strip() or f"git {' '.join(args)} failed")
++    return proc
++
++
++def _safe_slug(value: str) -> str:
++    slug = _SAFE_SEGMENT.sub("-", value.strip()).strip("-._").lower()
++    return slug[:48] or "task"
++
++
++def _resolve_repository(start: str | Path) -> tuple[Path, Path, str]:
++    invocation = Path(start).expanduser().resolve()
++    if invocation.is_file():
++        invocation = invocation.parent
++    if not invocation.is_dir():
++        raise AutopilotError(f"folder does not exist: {invocation}")
++    proc = _git(invocation, "rev-parse", "--show-toplevel", check=False)
++    if proc.returncode != 0:
++        raise AutopilotError(
++            "Autopilot needs a Git repository. Run it from a project folder "
++            "that already contains Git history."
++        )
++    root = Path(proc.stdout.strip()).resolve()
++    try:
++        relative = invocation.relative_to(root)
++    except ValueError as exc:
++        raise AutopilotError("selected folder is outside its Git root") from exc
++    prefix = "" if relative == Path(".") else relative.as_posix().strip("/")
++    return root, invocation, prefix
++
++
++def _repo_dirty(repo: Path) -> bool:
++    return bool(_git(repo, "status", "--porcelain", "-z").stdout)
++
++
++def _shadow_base(original_root: Path) -> Path:
++    digest = hashlib.sha256(str(original_root).encode()).hexdigest()[:12]
++    return Path.home() / ".hermes" / "autopilot" / "shadows" / (
++        f"{_safe_slug(original_root.name)}-{digest}"
++    )
++
++
++def _create_shadow(original_root: Path) -> Path:
++    base = _shadow_base(original_root)
++    base.mkdir(parents=True, exist_ok=True)
++    shadow = base / f"run-{int(time.time())}-{os.getpid()}"
++    _git(original_root, "worktree", "add", "--detach", str(shadow), "HEAD")
++    return shadow.resolve()
++
++
++def _prepare_repository(start: str | Path) -> RepositoryContext:
++    root, invocation, prefix = _resolve_repository(start)
++    dirty = _repo_dirty(root)
++    shadow = _create_shadow(root) if dirty else None
++    return RepositoryContext(
++        original_root=root,
++        invocation_dir=invocation,
++        scope_prefix=prefix,
++        source_repo=shadow or root,
++        shadow_path=shadow,
++        dirty=dirty,
++    )
++
++
++def _cleanup_shadow(context: RepositoryContext) -> None:
++    if context.shadow_path is None:
++        return
++    with contextlib.suppress(Exception):
++        _git(
++            context.original_root,
++            "worktree",
++            "remove",
++            "--force",
++            str(context.shadow_path),
++        )
++
++
++def _join_scope(prefix: str, value: str) -> str:
++    raw = str(value or "").strip().replace("\\", "/")
++    if not raw:
++        raise AutopilotError("allowed path must not be empty")
++    candidate = Path(raw)
++    if candidate.is_absolute() or ".." in candidate.parts:
++        raise AutopilotError(f"allowed path must stay inside the selected folder: {value}")
++    normalized = candidate.as_posix().strip("/")
++    return f"{prefix}/{normalized}".strip("/") if prefix else normalized
++
++
++def _allowed_paths(prefix: str, paths: Iterable[str]) -> list[str]:
++    values = [_join_scope(prefix, item) for item in paths]
++    if values:
++        return list(dict.fromkeys(values))
++    return [prefix] if prefix else []
++
++
++def _scoped_command(prefix: str, command: str) -> str:
++    command = str(command or "").strip()
++    if not command:
++        raise AutopilotError("verification command must not be empty")
++    if not prefix:
++        return command
++    return f"cd {shlex.quote(prefix)} && {command}"
++
++
++def _verification_commands(prefix: str, commands: Iterable[str]) -> list[str]:
++    explicit = [str(item).strip() for item in commands if str(item).strip()]
++    if explicit:
++        return [_scoped_command(prefix, command) for command in explicit]
++    if prefix:
++        quoted = shlex.quote(prefix)
++        return [
++            f'git diff --check && test -n "$(git status --porcelain -- {quoted})"'
++        ]
++    return ['git diff --check && test -n "$(git status --porcelain)"']
++
++
++def _task_body(objective: str, prefix: str) -> str:
++    target = f"/workspace/{prefix}" if prefix else "/workspace"
++    return (
++        f"Complete this objective: {objective.strip()}\n\n"
++        f"Target folder: {target}\n"
++        "The existing repository root is /workspace. Begin terminal work with "
++        "cd /workspace, then edit the target folder from that root. Do not run "
++        "any git command: the host controller owns Git inspection, verification, "
++        "and commit. Never run git init, git clone, git worktree, or uv init. "
++        "Use normal terminal and file tools. Perform the requested file change "
++        "before any optional inspection. Make the smallest complete change that "
++        "satisfies the objective. Do not create another repository or write "
++        "outside /workspace. When finished, report the exact files changed."
++    )
++
++
++def _ensure_project(context: RepositoryContext, board: str) -> str:
++    digest = hashlib.sha256(str(context.original_root).encode()).hexdigest()[:8]
++    slug = f"autopilot-{_safe_slug(context.original_root.name)}-{digest}"
++    shadow_parent = _shadow_base(context.original_root)
++    shadow_parent.mkdir(parents=True, exist_ok=True)
++    with pdb.connect_closing() as conn:
++        project = pdb.get_project(conn, slug)
++        if project is None:
++            pid = pdb.create_project(
++                conn,
++                name=f"Autopilot: {context.original_root.name}",
++                slug=slug,
++                folders=[str(context.original_root), str(shadow_parent)],
++                primary_path=str(context.original_root),
++                board_slug=board,
++                description="Automatically managed by `hermes autopilot`.",
++            )
++            return pid
++        pdb.add_folder(conn, project.id, str(context.original_root))
++        pdb.add_folder(conn, project.id, str(shadow_parent))
++        if project.board_slug != board:
++            pdb.update_project(conn, project.id, board_slug=board)
++        return project.id
++
++
++def _dispatch_once(board: str, profile: str) -> None:
++    with kb.connect_closing(board=board) as conn:
++        kb.dispatch_once(
++            conn,
++            dry_run=False,
++            max_spawn=1,
++            board=board,
++            default_assignee=profile,
++        )
++
++
++def _wait_for_mission(
++    board: str,
++    mission_id: str,
++    *,
++    profile: str,
++    timeout: int,
++    poll: float,
++    quiet: bool,
++) -> dict:
++    deadline = time.monotonic() + max(1, int(timeout))
++    last_summary = ""
++    while time.monotonic() < deadline:
++        _dispatch_once(board, profile)
++        with kb.connect_closing(board=board) as conn:
++            report = mission_service.mission_report(conn, mission_id)
++        mission = report["mission"]
++        tasks = ", ".join(
++            f"{item['mission_role']}={item['status']}" for item in report["tasks"]
++        )
++        summary = f"{mission['status']} ({tasks})"
++        if not quiet and summary != last_summary:
++            print(f"  {summary}", flush=True)
++            last_summary = summary
++        if mission["status"] in _TERMINAL_STATUSES:
++            return report
++        time.sleep(max(0.25, float(poll)))
++    raise AutopilotError(
++        f"mission {mission_id} is still running after {timeout} seconds; "
++        f"check it with `hermes mission --board {board} show {mission_id}`"
++    )
++
++
++def _write_patch(
++    original_root: Path,
++    *,
++    mission_id: str,
++    base_commit: str,
++    verified_commit: str,
++) -> tuple[Path, tuple[str, ...]]:
++    result_root = Path.home() / ".hermes" / "autopilot" / "results" / mission_id
++    result_root.mkdir(parents=True, exist_ok=True)
++    patch_path = result_root / "verified.patch"
++    patch = _git(
++        original_root,
++        "diff",
++        "--binary",
++        base_commit,
++        verified_commit,
++        binary=True,
++    ).stdout
++    patch_path.write_bytes(patch)
++    raw_paths = _git(
++        original_root,
++        "diff",
++        "--name-only",
++        "-z",
++        base_commit,
++        verified_commit,
++        binary=True,
++    ).stdout
++    paths = tuple(
++        item.decode(errors="surrogateescape")
++        for item in raw_paths.split(b"\0")
++        if item
++    )
++    return patch_path, paths
++
++
++def _local_conflicts(original_root: Path, changed_paths: Iterable[str]) -> tuple[str, ...]:
++    conflicts: list[str] = []
++    for path in changed_paths:
++        status = _git(
++            original_root,
++            "status",
++            "--porcelain",
++            "--untracked-files=all",
++            "--",
++            path,
++        ).stdout
++        if status.strip():
++            conflicts.append(path)
++    return tuple(conflicts)
++
++
++def _apply_verified_change(
++    context: RepositoryContext,
++    *,
++    mission_id: str,
++    base_commit: str,
++    verified_commit: str,
++    apply: bool,
++) -> ApplyResult:
++    patch_path, changed_paths = _write_patch(
++        context.original_root,
++        mission_id=mission_id,
++        base_commit=base_commit,
++        verified_commit=verified_commit,
++    )
++    if not changed_paths:
++        return ApplyResult(False, patch_path, (), reason="verified commit has no changed files")
++    if not apply:
++        return ApplyResult(False, patch_path, changed_paths, reason="automatic apply disabled")
++    conflicts = _local_conflicts(context.original_root, changed_paths)
++    if conflicts:
++        return ApplyResult(
++            False,
++            patch_path,
++            changed_paths,
++            conflicts,
++            "verified paths overlap existing local changes",
++        )
++    check = _git(
++        context.original_root,
++        "apply",
++        "--check",
++        "--whitespace=nowarn",
++        str(patch_path),
++        check=False,
++    )
++    if check.returncode != 0:
++        return ApplyResult(
++            False,
++            patch_path,
++            changed_paths,
++            reason=check.stderr.strip() or "patch no longer applies cleanly",
++        )
++    _git(
++        context.original_root,
++        "apply",
++        "--whitespace=nowarn",
++        str(patch_path),
++    )
++    return ApplyResult(True, patch_path, changed_paths)
++
++
++def _result_payload(report: dict, context: RepositoryContext, applied: ApplyResult) -> dict:
++    mission = report["mission"]
++    return {
++        "mission_id": mission["id"],
++        "status": mission["status"],
++        "blocked_reason": mission.get("blocked_reason"),
++        "scope": str(context.invocation_dir),
++        "source_mode": "clean-shadow" if context.shadow_path else "direct",
++        "worktree": mission.get("worktree_path"),
++        "mission_branch": mission.get("branch_name"),
++        "verified_commit": mission.get("verified_commit"),
++        "applied": applied.applied,
++        "changed_paths": list(applied.changed_paths),
++        "conflict_paths": list(applied.conflict_paths),
++        "patch_path": str(applied.patch_path) if applied.patch_path else None,
++        "apply_reason": applied.reason or None,
++        "evidence_chain_valid": report.get("evidence_chain_valid"),
++    }
++
++
++def autopilot_command(args: argparse.Namespace) -> int:
++    parser = getattr(args, "_autopilot_parser", None)
++    objective = str(getattr(args, "objective", "") or "").strip()
++    if not objective:
++        if parser is not None:
++            parser.print_help()
++        return 2
++    board = args.board or kb.get_current_board()
++    context: Optional[RepositoryContext] = None
++    try:
++        context = _prepare_repository(args.repo)
++        allowed = _allowed_paths(context.scope_prefix, args.path)
++        verification = _verification_commands(context.scope_prefix, args.verify)
++        project_id = _ensure_project(context, board)
++        contract = mdb.MissionContract(
++            outcome=(args.outcome or objective).strip(),
++            verification=verification,
++            constraints=[
++                "Make the smallest complete change required by the objective.",
++                "Do not create a nested Git repository.",
++            ],
++            boundaries={
++                "allowed_roots": [str(context.source_repo)],
++                "allowed_paths": allowed,
++                "containment_mode": "workspace-permissive",
++                "network_destinations": [],
++            },
++            stop_when=["The objective requires information that is not present in the repository."],
++            allow_local_commit=True,
++        )
++        with kb.connect_closing(board=board) as conn:
++            mission = mission_service.create_mission(
++                conn,
++                objective=objective,
++                contract=contract,
++                autonomy_level=4,
++                repo_path=str(context.source_repo),
++                board=board,
++                risk_level="low",
++                project_id=project_id,
++                budget={"evidence_bytes": 100 * 1024 * 1024},
++            )
++            mission_service.add_execution_task(
++                conn,
++                mission.id,
++                title=objective[:120],
++                body=_task_body(objective, context.scope_prefix),
++                assignee=args.profile,
++                parents=[],
++            )
++            mission = mission_service.finish_plan(
++                conn,
++                mission.id,
++                verifier_assignee=args.profile,
++            )
++            mission = mission_service.start_mission(conn, mission.id)
++        if not args.json:
++            mode = "clean shadow" if context.shadow_path else "repository"
++            print(f"Autopilot {mission.id}: working in {mode} for {context.invocation_dir}")
++        report = _wait_for_mission(
++            board,
++            mission.id,
++            profile=args.profile,
++            timeout=args.timeout,
++            poll=args.poll,
++            quiet=args.json,
++        )
++        current = report["mission"]
++        if current["status"] != "succeeded":
++            payload = _result_payload(
++                report,
++                context,
++                ApplyResult(False, None, (), reason="mission did not succeed"),
++            )
++            if args.json:
++                print(json.dumps(payload, indent=2, default=str))
++            else:
++                print(f"Autopilot stopped: {current['status']}")
++                if current.get("blocked_reason"):
++                    print(f"Reason: {current['blocked_reason']}")
++                print(f"Worktree: {current.get('worktree_path')}")
++            return 1
++        verified = str(current.get("verified_commit") or "").strip()
++        base = str(current.get("base_commit") or "").strip()
++        if not verified or not base:
++            raise AutopilotError("mission succeeded without a verifiable commit identity")
++        applied = _apply_verified_change(
++            context,
++            mission_id=mission.id,
++            base_commit=base,
++            verified_commit=verified,
++            apply=not args.no_apply,
++        )
++        payload = _result_payload(report, context, applied)
++        if args.json:
++            print(json.dumps(payload, indent=2, default=str))
++        else:
++            print("Autopilot completed and independently verified the task.")
++            print(f"Verified commit: {verified}")
++            if applied.applied:
++                print(f"Applied to: {context.original_root}")
++            else:
++                print(f"Result kept as patch: {applied.patch_path}")
++                if applied.reason:
++                    print(f"Not applied automatically: {applied.reason}")
++                if applied.conflict_paths:
++                    print("Conflicts: " + ", ".join(applied.conflict_paths))
++            if applied.changed_paths:
++                print("Changed: " + ", ".join(applied.changed_paths))
++        return 0
++    except (
++        AutopilotError,
++        ValueError,
++        KeyError,
++        OSError,
++        mission_service.MissionError,
++    ) as exc:
++        if getattr(args, "json", False):
++            print(json.dumps({"status": "error", "error": str(exc)}, indent=2))
++        else:
++            print(f"autopilot: {exc}", file=sys.stderr)
++        return 1
++    finally:
++        if context is not None:
++            _cleanup_shadow(context)
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 82e2e7a2c..5d812457d 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -4831,6 +4831,13 @@ def cmd_mission(args):
+     return mission_command(args)
+ 
+ 
++def cmd_autopilot(args):
++    """One-command everyday Project Autopilot workflow."""
++    from hermes_cli.autopilot_cmd import autopilot_command
++
++    return autopilot_command(args)
++
++
+ def cmd_project(args):
+     """Manage projects (named, multi-folder workspaces)."""
+     from hermes_cli.projects_cmd import projects_command
+@@ -11488,6 +11495,14 @@ def main():
+     mission_parser = _build_mission_parser(subparsers)
+     mission_parser.set_defaults(func=cmd_mission)
+ 
++    # =========================================================================
++    # autopilot command — one-command everyday mission workflow
++    # =========================================================================
++    from hermes_cli.autopilot_cmd import build_parser as _build_autopilot_parser
++
++    autopilot_parser = _build_autopilot_parser(subparsers)
++    autopilot_parser.set_defaults(func=cmd_autopilot)
++
+     # =========================================================================
+     # project command — named, multi-folder workspaces
+     # =========================================================================
+diff --git a/tests/hermes_cli/test_autopilot_cmd.py b/tests/hermes_cli/test_autopilot_cmd.py
+new file mode 100644
+index 000000000..0a4f0fe73
+--- /dev/null
++++ b/tests/hermes_cli/test_autopilot_cmd.py
+@@ -0,0 +1,174 @@
++from __future__ import annotations
++
++import argparse
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import autopilot_cmd as ap
++
++
++def git(repo: Path, *args: str) -> str:
++    proc = subprocess.run(
++        ["git", "-C", str(repo), *args],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=True,
++    )
++    return proc.stdout.strip()
++
++
++def init_repo(tmp_path: Path) -> Path:
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    git(repo, "init", "-b", "main")
++    git(repo, "config", "user.name", "Test User")
++    git(repo, "config", "user.email", "test@example.com")
++    (repo / "README.md").write_text("base\n", encoding="utf-8")
++    (repo / "nested").mkdir()
++    (repo / "nested" / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    git(repo, "add", ".")
++    git(repo, "commit", "-m", "base")
++    return repo
++
++
++def test_parser_accepts_single_command_shape() -> None:
++    parser = argparse.ArgumentParser()
++    sub = parser.add_subparsers(dest="command")
++    ap.build_parser(sub)
++    args = parser.parse_args([
++        "autopilot",
++        "Create a file",
++    ])
++    assert args.objective == "Create a file"
++    assert args.verify == []
++    assert args.repo == "."
++
++
++
++
++def test_default_verification_requires_valid_nonempty_diff() -> None:
++    assert ap._verification_commands("", []) == [
++        'git diff --check && test -n "$(git status --porcelain)"'
++    ]
++    assert ap._verification_commands("nested", []) == [
++        'git diff --check && test -n "$(git status --porcelain -- nested)"'
++    ]
++    assert ap._verification_commands("nested", ["test -f result.txt"]) == [
++        "cd nested && test -f result.txt"
++    ]
++
++
++def test_resolve_repository_scopes_to_current_subdirectory(tmp_path: Path) -> None:
++    repo = init_repo(tmp_path)
++    root, invocation, prefix = ap._resolve_repository(repo / "nested")
++    assert root == repo.resolve()
++    assert invocation == (repo / "nested").resolve()
++    assert prefix == "nested"
++
++
++def test_verification_and_allowed_paths_are_scoped() -> None:
++    assert ap._scoped_command("nested", "test -f result.txt") == (
++        "cd nested && test -f result.txt"
++    )
++    assert ap._allowed_paths("nested", []) == ["nested"]
++    assert ap._allowed_paths("nested", ["docs/out.md"]) == ["nested/docs/out.md"]
++    with pytest.raises(ap.AutopilotError):
++        ap._allowed_paths("nested", ["../outside"])
++
++
++def test_dirty_repository_uses_clean_shadow(tmp_path: Path, monkeypatch) -> None:
++    repo = init_repo(tmp_path)
++    (repo / "dirty.txt").write_text("local\n", encoding="utf-8")
++    monkeypatch.setattr(ap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
++    context = ap._prepare_repository(repo / "nested")
++    try:
++        assert context.dirty is True
++        assert context.shadow_path is not None
++        assert context.source_repo != repo
++        assert git(context.source_repo, "status", "--porcelain") == ""
++        assert context.scope_prefix == "nested"
++    finally:
++        ap._cleanup_shadow(context)
++
++
++def test_clean_repository_uses_original_root(tmp_path: Path) -> None:
++    repo = init_repo(tmp_path)
++    context = ap._prepare_repository(repo / "nested")
++    assert context.dirty is False
++    assert context.shadow_path is None
++    assert context.source_repo == repo.resolve()
++
++
++def test_apply_verified_change_updates_only_verified_paths(tmp_path: Path, monkeypatch) -> None:
++    repo = init_repo(tmp_path)
++    base = git(repo, "rev-parse", "HEAD")
++    git(repo, "switch", "-c", "mission")
++    (repo / "nested" / "result.txt").write_text("done\n", encoding="utf-8")
++    git(repo, "add", "nested/result.txt")
++    git(repo, "commit", "-m", "mission result")
++    verified = git(repo, "rev-parse", "HEAD")
++    git(repo, "switch", "main")
++    monkeypatch.setattr(ap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
++    context = ap.RepositoryContext(
++        original_root=repo.resolve(),
++        invocation_dir=(repo / "nested").resolve(),
++        scope_prefix="nested",
++        source_repo=repo.resolve(),
++        shadow_path=None,
++        dirty=False,
++    )
++    result = ap._apply_verified_change(
++        context,
++        mission_id="m_test",
++        base_commit=base,
++        verified_commit=verified,
++        apply=True,
++    )
++    assert result.applied is True
++    assert result.changed_paths == ("nested/result.txt",)
++    assert (repo / "nested" / "result.txt").read_text() == "done\n"
++    assert git(repo, "status", "--porcelain", "--", "README.md") == ""
++
++
++def test_apply_verified_change_refuses_overlapping_local_edit(tmp_path: Path, monkeypatch) -> None:
++    repo = init_repo(tmp_path)
++    base = git(repo, "rev-parse", "HEAD")
++    git(repo, "switch", "-c", "mission")
++    target = repo / "nested" / "tracked.txt"
++    target.write_text("mission\n", encoding="utf-8")
++    git(repo, "add", "nested/tracked.txt")
++    git(repo, "commit", "-m", "mission edit")
++    verified = git(repo, "rev-parse", "HEAD")
++    git(repo, "switch", "main")
++    target.write_text("user edit\n", encoding="utf-8")
++    monkeypatch.setattr(ap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
++    context = ap.RepositoryContext(
++        original_root=repo.resolve(),
++        invocation_dir=(repo / "nested").resolve(),
++        scope_prefix="nested",
++        source_repo=repo.resolve(),
++        shadow_path=None,
++        dirty=True,
++    )
++    result = ap._apply_verified_change(
++        context,
++        mission_id="m_conflict",
++        base_commit=base,
++        verified_commit=verified,
++        apply=True,
++    )
++    assert result.applied is False
++    assert result.conflict_paths == ("nested/tracked.txt",)
++    assert target.read_text() == "user edit\n"
++    assert result.patch_path is not None and result.patch_path.is_file()
++
++def test_task_body_pins_existing_repository_root() -> None:
++    body = ap._task_body("Create result.txt", "nested")
++    assert "existing repository root is /workspace" in body
++    assert "Do not run any git command" in body
++    assert "Never run git init" in body
++    assert "controller owns Git inspection" in body
++    assert "Target folder: /workspace/nested" in body
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+index 152e453fc..a5f0283f2 100644
+--- a/tests/tools/test_mission_terminal_containment.py
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -92,10 +92,17 @@ def _policy(
+     ],
+ )
+ def test_repository_creation_commands_are_rejected(command: str) -> None:
+-    with pytest.raises(PermissionError):
++    with pytest.raises(guard.RecoverablePolicyError):
+         guard.validate_command(command)
+ 
+ 
++def test_repository_identity_denial_is_nonfatal_by_type() -> None:
++    with pytest.raises(guard.RecoverablePolicyError) as caught:
++        guard.validate_command("cd src && git init")
++    assert isinstance(caught.value, PermissionError)
++    assert "controller owns repository identity" in str(caught.value)
++
++
+ def test_manifest_rolls_back_out_of_scope_changes_only(tmp_path: Path) -> None:
+     repo = _repo(tmp_path)
+     policy = _policy(repo)
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index a057e9868..f340a82f5 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -3159,6 +3159,50 @@ def terminal_tool(
+                                 "returncode": 126,
+                             }
+                 except Exception as e:
++                    if config.get("mission_restricted"):
++                        from agent.mission_terminal_guard import RecoverablePolicyError
++                        if isinstance(e, RecoverablePolicyError):
++                            _reason = (
++                                str(e)
++                                + ". Continue in the existing repository at /workspace; "
++                                  "do not initialize or replace repository metadata."
++                            )
++                            _audit = {
++                                **(mission_guard_audit or {}),
++                                "classification": "repository_identity_policy",
++                                "fatal": False,
++                                "guard_error": str(e),
++                            }
++                            try:
++                                from agent.mission_scope import current_policy as _current_mission_policy
++                                from hermes_cli import kanban_db as _guard_kb
++                                from hermes_cli.mission_service import (
++                                    record_terminal_policy_denial as _record_policy_denial,
++                                )
++
++                                _policy = _current_mission_policy()
++                                _run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
++                                _task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
++                                _board = os.environ.get("HERMES_KANBAN_BOARD")
++                                if _policy is not None and _run_raw and _task:
++                                    with _guard_kb.connect_closing(board=_board) as _guard_conn:
++                                        _record_policy_denial(
++                                            _guard_conn,
++                                            str(_policy["mission_id"]),
++                                            task_id=_task,
++                                            run_id=int(_run_raw),
++                                            reason=_reason,
++                                            audit=_audit,
++                                        )
++                            except Exception:
++                                logger.error("could not persist recoverable mission policy denial", exc_info=True)
++                            return json.dumps({
++                                "output": "",
++                                "exit_code": 126,
++                                "error": _reason,
++                                "status": "error",
++                                "containment": _audit,
++                            }, ensure_ascii=False)
+                     if isinstance(e, PermissionError) and config.get("mission_restricted"):
+                         os.environ["HERMES_MISSION_EXECUTION_REVOKED"] = "1"
+                         _reason = str(e)
+-- 
+2.53.0
+

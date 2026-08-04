@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "release_id": "hermes-0.20-ha-one-command-r3-2026-08-04",
+  "status": "usability-delta",
+  "base_release": "releases/hermes-0.20-runtime-repair-r2",
+  "base_expected_tree": "3de433cb93ac980be1fdd96cb4006cffdb5d4943",
+  "active_base_commit": "edf49e9b8c1287a501964119011d962529e58142",
+  "active_head_commit": "d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4",
+  "expected_final_tree": "43bd0f96f5b44398a70dc5485614f4a6d3b49712",
+  "patch_count": 4,
+  "total_patch_count_from_upstream_base": 37,
+  "evidence_summary": "evidence/ha-feature-summary.json",
+  "replay_script": "scripts/replay_ha_one_command_release.sh",
+  "notes": "Four-commit usability delta adding the ha one-command interface, dirty-repository shadow execution, inspect/change modes, unborn repository support, verified result application, and audit-friendly output.",
+  "replay_invariant": "runtime-repair final tree plus ordered ha patches equals exact final Git tree"
+}

@@ -1,0 +1,54 @@
+From 9400aad5dea73f878a1b8532f2d08a2b12cfc3b3 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 14:03:43 -0700
+Subject: [PATCH] docs(autopilot): document one-command workflow
+
+---
+ docs/user-guide/autopilot-everyday.md | 35 +++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+ create mode 100644 docs/user-guide/autopilot-everyday.md
+
+diff --git a/docs/user-guide/autopilot-everyday.md b/docs/user-guide/autopilot-everyday.md
+new file mode 100644
+index 000000000..42846a1fc
+--- /dev/null
++++ b/docs/user-guide/autopilot-everyday.md
+@@ -0,0 +1,35 @@
++# Everyday Project Autopilot
++
++Project Autopilot has a one-command interface for normal repository tasks.
++Run it from the folder that should change:
++
++```bash
++ha "Create a concise post-interview template in POST_INTERVIEW_TEMPLATE.md"
++```
++
++`ha` is a local shortcut for `hermes autopilot`. The command automatically:
++
++1. finds the Git repository and scopes work to the current folder;
++2. creates a clean shadow of committed `HEAD` when the parent repository has unrelated changes;
++3. registers the project;
++4. creates the mission, executor, and independent verifier;
++5. dispatches and waits;
++6. creates a verified local mission commit;
++7. applies the verified patch back only when it does not overlap existing local edits.
++
++When no `--verify` command is supplied, Hermes requires a whitespace-clean, nonempty Git change in the selected scope. For stronger proof, add a deterministic check:
++
++```bash
++ha "Create POST_INTERVIEW_TEMPLATE.md" \
++  --verify 'test -s POST_INTERVIEW_TEMPLATE.md'
++```
++
++Useful options:
++
++- `--repo PATH`: operate on a different folder.
++- `--path PATH`: narrow the declared contract to a specific relative path.
++- `--verify COMMAND`: provide one or more exact proof commands.
++- `--no-apply`: keep the verified result on the mission branch without applying it to the current checkout.
++- `--json`: return machine-readable output.
++
++If verified files overlap existing local edits, Hermes does not overwrite them. It saves the verified patch under `~/.hermes/autopilot/results/<mission-id>/verified.patch` and reports the conflicting paths.
+-- 
+2.53.0
+

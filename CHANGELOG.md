@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-04 — `ha` one-command release r3
+
+- add the `ha "describe the task"` everyday entrypoint;
+- automate repository detection, project registration, mission construction, dispatch, verification, and safe result application;
+- support dirty parent repositories through clean shadow worktrees;
+- distinguish read-only inspect mode from change mode;
+- support repositories with no first commit yet;
+- publish four apply-ready patches, exact final-tree replay, 14 focused command tests, and 100 mission regressions.
+
 ## 2026-08-04 — Hermes 0.20 runtime-repair r2
 
 - publish an eight-patch delta after compatibility source head `305506473`;
