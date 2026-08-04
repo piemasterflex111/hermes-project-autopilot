@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-04T12:54:22-07:00",
+  "mission_id": "m_c488e9e80eb7",
+  "autonomy_level": 4,
+  "status": "succeeded",
+  "tasks": {
+    "controller": "done",
+    "executor": "done",
+    "verifier": "done"
+  },
+  "artifact": {
+    "path": "smoke.txt",
+    "content": "HERMES_AUTOPILOT_OK",
+    "owner": "host-user:host-group",
+    "mode": "0640"
+  },
+  "verified_commit": "d061df716a630ab09e2b7888a02fdf565ec70dee",
+  "mission_branch": "hermes/mission-c488e9e80eb7",
+  "final_disposition": "verified_local_commit",
+  "source_default_branch_advanced": false,
+  "sanitization": "absolute workstation paths, hostnames, process IDs, database paths, and tokens omitted"
+}

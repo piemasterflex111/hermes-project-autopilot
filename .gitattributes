@@ -3,3 +3,4 @@
 hermes_integration/** whitespace=-trailing-space,-blank-at-eof
 patches/** whitespace=-trailing-space,-blank-at-eof
 prerequisites/** whitespace=-trailing-space,-blank-at-eof
+releases/**/patches/** whitespace=-trailing-space,-blank-at-eof

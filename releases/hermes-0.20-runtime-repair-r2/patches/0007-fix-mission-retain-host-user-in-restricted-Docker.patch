@@ -1,0 +1,83 @@
+From 85da50a76c6fa70f6aee05d16c2104d500ce9f52 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 12:52:26 -0700
+Subject: [PATCH 7/8] fix(mission): retain host user in restricted Docker
+
+---
+ tests/tools/test_docker_environment.py | 45 ++++++++++++++++++++++++++
+ tools/environments/docker.py           |  5 ++-
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tools/test_docker_environment.py b/tests/tools/test_docker_environment.py
+index 9f1396319..af6c01a06 100644
+--- a/tests/tools/test_docker_environment.py
++++ b/tests/tools/test_docker_environment.py
+@@ -1,3 +1,4 @@
++import json
+ import logging
+ import os
+ from io import StringIO
+@@ -1490,3 +1491,47 @@ def test_extra_args_set_shm_size_helper():
+     assert docker_env._extra_args_set_shm_size(None) is False
+     # non-string entries must not crash (config.yaml can be malformed)
+     assert docker_env._extra_args_set_shm_size([42, None, "--shm-size=1g"]) is True
++
++
++def test_restricted_mode_forces_host_user_for_bind_mounted_worktree(
++    monkeypatch, tmp_path
++):
++    """Mission containers must not create root-owned files in host worktrees."""
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++    db_path = tmp_path / "kanban.db"
++    db_path.write_bytes(b"test")
++    monkeypatch.setenv(
++        "HERMES_MISSION_POLICY",
++        json.dumps({
++            "mission_id": "m_host_owner",
++            "mission_role": "executor",
++            "worktree_path": str(worktree),
++            "allowed_paths": ["smoke.txt"],
++            "containment_mode": "workspace-permissive",
++            "allowed_terminal_backends": ["docker"],
++            "read_only": False,
++        }),
++    )
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "owner-test")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-owner")
++    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
++    monkeypatch.setattr(docker_env.os, "getuid", lambda: 1234, raising=False)
++    monkeypatch.setattr(docker_env.os, "getgid", lambda: 5678, raising=False)
++    calls = _mock_subprocess_run(monkeypatch)
++
++    _make_dummy_env(
++        cwd="/workspace",
++        host_cwd=str(worktree),
++        auto_mount_cwd=True,
++        task_id="task-owner",
++        run_as_host_user=False,
++        restricted_mode=True,
++    )
++
++    run_args = _run_args_from_calls(calls)
++    assert "--user" in run_args
++    index = run_args.index("--user")
++    assert run_args[index + 1] == "1234:5678"
+diff --git a/tools/environments/docker.py b/tools/environments/docker.py
+index 8f5b500ba..dc502b6ee 100644
+--- a/tools/environments/docker.py
++++ b/tools/environments/docker.py
+@@ -935,7 +935,10 @@ class DockerEnvironment(BaseEnvironment):
+                 "PYTHONDONTWRITEBYTECODE": "1",
+             }
+             network = False
+-            run_as_host_user = False
++            # Mission worktrees are bind-mounted host directories. Force the
++            # container to the invoking host UID/GID so newly created files
++            # remain readable and committable by host-side verification.
++            run_as_host_user = True
+             extra_args = []
+         super().__init__(cwd=cwd, timeout=timeout)
+         self._persistent = persistent_filesystem

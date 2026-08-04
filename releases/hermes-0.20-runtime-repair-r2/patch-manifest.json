@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "patch_count": 8,
+  "patches": [
+    {
+      "path": "patches/0001-fix-mission-reject-unregistered-worker-profiles.patch",
+      "bytes": 4785,
+      "sha256": "9604992a6fa48b5bf41a89ea5e9be390a27be9c0f72d00855c5acb871f36e9c3"
+    },
+    {
+      "path": "patches/0002-fix-mission-allow-unrestricted-worktree-execution.patch",
+      "bytes": 13229,
+      "sha256": "75bfb2f778524f1e96f41c99ef1e22fb2523368295a094fd2395bf081cbd0a17"
+    },
+    {
+      "path": "patches/0003-docs-mission-define-workspace-permissive-boundary.patch",
+      "bytes": 4298,
+      "sha256": "2c0d66991530a8d4834b2a1658b2dc8eab6342e3654a1174607dc78412e227af"
+    },
+    {
+      "path": "patches/0004-fix-mission-preserve-host-ownership-in-worktrees.patch",
+      "bytes": 2965,
+      "sha256": "b7393eeff83cc30c9da66e2ef975a24571c108b00e53a786e75bec2f63f815d5"
+    },
+    {
+      "path": "patches/0005-test-docker-initialize-restricted-mode-in-synthetic-.patch",
+      "bytes": 1099,
+      "sha256": "47145bdd02b2b3ee1eaf467d1408cc35503206ea3328b7a2d10b95d34e5e7ebf"
+    },
+    {
+      "path": "patches/0006-docs-mission-record-host-user-executor-ownership.patch",
+      "bytes": 1331,
+      "sha256": "aa17bb4964f6d73fdcc8d3dda63b77f36fbf051a4f26c374c978b334126d4c4d"
+    },
+    {
+      "path": "patches/0007-fix-mission-retain-host-user-in-restricted-Docker.patch",
+      "bytes": 3415,
+      "sha256": "c50b367ecf5f1debea3549ec093be8ce3edc2900a47e0c8dfc657890f65075b3"
+    },
+    {
+      "path": "patches/0008-docs-mission-record-successful-end-to-end-proof.patch",
+      "bytes": 1967,
+      "sha256": "753f4c8071c7811f0fb3abc505c597d02a9e1a9cf3dd2bb12b13f79d5f4a97e1"
+    }
+  ]
+}

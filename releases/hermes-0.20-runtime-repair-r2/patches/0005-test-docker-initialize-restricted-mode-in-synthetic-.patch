@@ -1,0 +1,29 @@
+From 208615e87cf13f0c3e77bc50ab5b86960612cb5d Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 12:43:12 -0700
+Subject: [PATCH 5/8] test(docker): initialize restricted mode in synthetic env
+
+---
+ tests/tools/test_docker_environment.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tests/tools/test_docker_environment.py b/tests/tools/test_docker_environment.py
+index 3684f237a..9f1396319 100644
+--- a/tests/tools/test_docker_environment.py
++++ b/tests/tools/test_docker_environment.py
+@@ -55,6 +55,7 @@ def _make_dummy_env(**kwargs):
+         extra_args=kwargs.get("extra_args", []),
+         persist_across_processes=kwargs.get("persist_across_processes", True),
+         shm_size=kwargs.get("shm_size", docker_env._DEFAULT_SHM_SIZE),
++        restricted_mode=kwargs.get("restricted_mode", False),
+     )
+ 
+ 
+@@ -171,6 +172,7 @@ def _make_execute_only_env(forward_env=None):
+     env._snapshot_ready = True
+     env._last_sync_time = None
+     env._init_env_args = []
++    env._restricted_mode = False
+     return env
+ 
+ 

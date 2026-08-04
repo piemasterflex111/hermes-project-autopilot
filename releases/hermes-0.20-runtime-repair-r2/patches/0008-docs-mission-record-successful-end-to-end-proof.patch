@@ -1,0 +1,43 @@
+From e1c0fba172b881f9fd6953ad7aad5c6f2081c04d Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 12:57:05 -0700
+Subject: [PATCH 8/8] docs(mission): record successful end-to-end proof
+
+---
+ .../project-autopilot-workspace-permissive.md | 26 +++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/docs/security/project-autopilot-workspace-permissive.md b/docs/security/project-autopilot-workspace-permissive.md
+index f6ff0fca0..817437faa 100644
+--- a/docs/security/project-autopilot-workspace-permissive.md
++++ b/docs/security/project-autopilot-workspace-permissive.md
+@@ -99,3 +99,29 @@ Run a fresh end-to-end mission that:
+ 4. preserves host Git access;
+ 5. reaches approval or success without `chown`, direct SQLite edits, or
+    containment revocation.
++
++## End-to-end validation — 2026-08-04
++
++The deployed active checkout completed a fresh autonomy-4 mission through the
++normal `hermes` binary after the gateway was restarted.
++
++- active Hermes commit: `954a54f3c65f82c80fb47e26631c3a0d6d5aa909`;
++- mission: `m_c488e9e80eb7`;
++- board: `autopilot-proof-20260804-125422`;
++- controller: `done`;
++- executor: `done`;
++- verifier: `done`;
++- mission status: `succeeded`;
++- output ownership: `payam-adloo:payam-adloo`, mode `640`;
++- committed output: `HERMES_AUTOPILOT_OK`;
++- verified mission commit: `d061df716a630ab09e2b7888a02fdf565ec70dee`;
++- mission branch: `hermes/mission-c488e9e80eb7`;
++- final disposition: `verified_local_commit`;
++- Docker/containment tests: 86 passed;
++- mission regressions: 100 passed.
++
++`verified_local_commit` means Hermes committed the verified result to the
++isolated mission branch. The source repository's default branch remains
++unchanged until a separate merge or integration action is intentionally
++performed. A later `mission commit` call correctly rejects because the commit
++gate was already consumed during autonomous completion.

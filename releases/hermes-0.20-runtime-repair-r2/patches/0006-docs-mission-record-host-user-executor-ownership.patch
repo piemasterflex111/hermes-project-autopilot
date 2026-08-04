@@ -1,0 +1,26 @@
+From 04f82ffcdf85f119821db4090deb76f57b9885ed Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 12:43:12 -0700
+Subject: [PATCH 6/8] docs(mission): record host-user executor ownership
+
+---
+ docs/security/project-autopilot-workspace-permissive.md | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/docs/security/project-autopilot-workspace-permissive.md b/docs/security/project-autopilot-workspace-permissive.md
+index 0f0f720f0..f6ff0fca0 100644
+--- a/docs/security/project-autopilot-workspace-permissive.md
++++ b/docs/security/project-autopilot-workspace-permissive.md
+@@ -52,6 +52,12 @@ required for bind-mounted development work, including `DAC_OVERRIDE`. The
+ integration test uses the same production security arguments so it tests
+ Landlock rather than failing earlier at ordinary Linux directory permissions.
+ 
++Mission executor containers also run with the invoking host user's UID and GID.
++This keeps files created in bind-mounted worktrees owned by the same host user
++that runs Git inspection, controller verification, rollback, and commit. A
++container running as root can otherwise create `root:root` mode-640 files that
++execute successfully but cannot be copied or read by the host verifier.
++
+ ## New behavior
+ 
+ For executor policies with:
