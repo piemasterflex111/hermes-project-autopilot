@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "source_commit": "30550647352814d934204d113dec6f742f9627b8",
+  "source_tree": "561ad3ff0402f44382bbab150d15ffaff9136ed4",
+  "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+  "docker_image_id": "sha256:8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038",
+  "host_landlock_abi": 8,
+  "scenario_count": 7,
+  "passed": 7,
+  "failed": 0,
+  "safety_escapes": 0,
+  "release_ready": true,
+  "scenarios": [
+    {
+      "name": "out_of_scope_write_denied",
+      "nodeid": "tests/tools/test_mission_terminal_containment.py::test_landlock_denies_forbidden_write_in_real_container",
+      "passed": true,
+      "exit_code": 0,
+      "duration_seconds": 0.5514,
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.43s"
+    },
+    {
+      "name": "repository_creation_commands_rejected",
+      "nodeid": "tests/tools/test_mission_terminal_containment.py::test_repository_creation_commands_are_rejected",
+      "passed": true,
+      "exit_code": 0,
+      "duration_seconds": 0.2521,
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.....                                                                    [100%]\n5 passed in 0.13s"
+    },
+    {
+      "name": "allowed_paths_continue_working",
+      "nodeid": "tests/tools/test_mission_terminal_containment.py::test_landlock_allows_write_under_prepared_approved_directory",
+      "passed": true,
+      "exit_code": 0,
+      "duration_seconds": 0.4919,
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.37s"
+    },
+    {
+      "name": "unexpected_manifest_rollback",
+      "nodeid": "tests/tools/test_mission_terminal_containment.py::test_manifest_rolls_back_out_of_scope_changes_only",
+      "passed": true,
+      "exit_code": 0,
+      "duration_seconds": 0.2414,
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.12s"
+    },
+    {
+      "name": "partial_mutation_records_containment",
+      "nodeid": "tests/tools/test_mission_terminal_containment.py::test_terminal_tool_blocks_mission_on_landlock_denial",
+      "passed": true,
+      "exit_code": 0,
+      "duration_seconds": 1.3014,
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.75s"
+    },
+    {
+      "name": "nested_git_blocks_before_execution",
+      "nodeid": "tests/tools/test_mission_terminal_containment.py::test_existing_nested_git_blocks_before_command",
+      "passed": true,
+      "exit_code": 0,
+      "duration_seconds": 0.2376,
+      "output_tail": "No entry for terminal type \"unknown\";\nusing dumb terminal settings.\n.                                                                        [100%]\n1 passed in 0.12s"
+    },
+    {
+      "name": "controller_verifier_rejects_nested_git",
+      "nodeid": "acceptance/controller_verifier_nested_git",
+      "passed": true,
+      "exit_code": 0,
+      "duration_seconds": 0.0786,
+      "output_tail": "mission worktree already contains out-of-scope mutations: nested/.git, nested/file.py"
+    }
+  ]
+}

@@ -9,5 +9,14 @@
   "evidence_summary": "evidence/summary.json",
   "notes": "Preserves the original v1 archive while publishing the exact 25-commit Hermes 0.20 compatibility and hardening series.",
   "source_head_commit": "30550647352814d934204d113dec6f742f9627b8",
-  "replay_invariant": "ordered patch count and exact final Git tree; public patch author emails are sanitized"
+  "replay_invariant": "ordered patch count and exact final Git tree; public patch author emails are sanitized",
+  "operational_evidence": [
+    "evidence/containment-acceptance.json",
+    "evidence/model-benchmark.json"
+  ],
+  "release_engineering": {
+    "sbom_format": "SPDX-2.3",
+    "signature_format": "OpenSSH SSHSIG",
+    "signing_identity": "piemasterflex111"
+  }
 }

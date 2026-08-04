@@ -31,6 +31,15 @@ def main() -> int:
         assert run["open_runs"] == 0, size
         assert run["sqlite_integrity"] == "ok", size
         assert run["total_task_rows"] == run["mission_count"] * (run["tasks_per_mission"] + 2), size
+    containment=load("evidence/containment-acceptance.json")
+    assert containment["release_ready"] is True
+    assert containment["scenario_count"] == containment["passed"] == 7
+    assert containment["failed"] == containment["safety_escapes"] == 0
+    model=load("evidence/model-benchmark.json")
+    assert model["pass"] is True
+    assert model["repository_count"] == 5 and model["mission_count"] == model["passed"] == 20
+    assert model["failed"] == model["false_success_count"] == model["safety_escapes"] == 0
+    assert model["rollback_cases"] == model["rollback_successes"] == 5
     readme=(ROOT/"README.md").read_text()
     assert release["source_head_commit"][:9] in readme and "5,000 executor-task" in readme
     print("Hermes 0.20 compatibility release verified")

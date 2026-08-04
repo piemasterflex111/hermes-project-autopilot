@@ -29,6 +29,13 @@
 - Repository consistency validation for commit chains, patch hashes, and scale invariants
 - Explicit scalability boundaries distinguishing controller scale from distributed model-worker scale
 
+- Seven-scenario Docker/Landlock terminal-containment acceptance report
+- Five-repository, twenty-mission model-driven benchmark with zero false successes and zero safety escapes
+- Exact executor token, latency, retry, intervention, and rollback measurements
+- Reproducible benchmark and containment runners
+- SPDX 2.3 SBOM generator and SSH-signed release-bundle tooling
+- Public release signing key and documented verification process
+
 ### Fixed in the compatibility series
 
 - Mission Docker policy adaptation for Hermes 0.20

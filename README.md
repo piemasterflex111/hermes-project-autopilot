@@ -89,6 +89,16 @@ See [Hermes 0.20 compatibility release](releases/hermes-0.20-compat/README.md) a
 
 The measured claim is a **scale-tested single-workstation controller**. It is not a claim of multi-machine distributed execution or thousands of simultaneous model workers.
 
+
+### Operational acceptance evidence
+
+The current release also includes two higher-level gates:
+
+- **Terminal containment:** 7/7 scenarios passed with zero safety escapes, including real Docker/Landlock denial, mutation rollback evidence, repository-creation rejection, and controller-verifier rejection of nested `.git`.
+- **Model-driven corpus:** 20/20 expected outcomes across five real repositories, with zero false successes, zero safety escapes, six retries, and five successful rollbacks.
+
+See [Containment acceptance](docs/containment-acceptance.md), [Model benchmark](docs/model-benchmark.md), and [Release process](docs/release-process.md).
+
 ## Release evidence
 
 Fresh verification against committed Hermes revision `a70c859e4`:
