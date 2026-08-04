@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "release_id": "hermes-0.20-runtime-repair-r2-2026-08-04",
+  "source_head_commit": "e1c0fba172b881f9fd6953ad7aad5c6f2081c04d",
+  "active_equivalent_commit": "edf49e9b8c1287a501964119011d962529e58142",
+  "expected_final_tree": "3de433cb93ac980be1fdd96cb4006cffdb5d4943",
+  "focused_tests": {
+    "docker_containment_passed": 86,
+    "mission_regressions_passed": 100,
+    "failed": 0
+  },
+  "runtime_repairs": [
+    "reject unregistered executor and verifier profiles before task storage",
+    "permit normal create/write/delete operations throughout the isolated mission worktree",
+    "retain strict planning-time and manual-task allowed-path validation",
+    "run restricted mission containers with the invoking host UID and GID",
+    "preserve host Git inspection, independent verification, and verified local commit"
+  ],
+  "end_to_end": {
+    "mission_id": "m_c488e9e80eb7",
+    "status": "succeeded",
+    "controller": "done",
+    "executor": "done",
+    "verifier": "done",
+    "output": "HERMES_AUTOPILOT_OK",
+    "output_owner": "host-user:host-group",
+    "output_mode": "0640",
+    "verified_commit": "d061df716a630ab09e2b7888a02fdf565ec70dee",
+    "mission_branch": "hermes/mission-c488e9e80eb7",
+    "final_disposition": "verified_local_commit",
+    "remote_push_or_merge": false
+  },
+  "plan_auto_end_to_end_proven": false
+}

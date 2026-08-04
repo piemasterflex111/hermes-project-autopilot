@@ -1,0 +1,4 @@
+Hermes 0.20 runtime-repair r2
+Docker, ownership, and containment tests: 86 passed, 0 failed
+Mission regression tests: 100 passed, 0 failed
+End-to-end normal-binary mission: succeeded

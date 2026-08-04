@@ -89,6 +89,17 @@ See [Hermes 0.20 compatibility release](releases/hermes-0.20-compat/README.md) a
 
 The measured claim is a **scale-tested single-workstation controller**. It is not a claim of multi-machine distributed execution or thousands of simultaneous model workers.
 
+## Hermes 0.20 runtime-repair r2
+
+An eight-patch delta now records the August 4 runtime repair after source head `305506473`. The repair rejects unregistered profiles, permits ordinary repository writes throughout the isolated `/workspace` worktree, preserves strict planning-time path validation, runs restricted mission containers as the host UID/GID, and proves a full controller → executor → verifier → verified-local-commit mission.
+
+- Runtime-repair source head: `e1c0fba172b881f9fd6953ad7aad5c6f2081c04d`
+- Deployed equivalent active head: `edf49e9b8c1287a501964119011d962529e58142`
+- Exact final tree: `3de433cb93ac980be1fdd96cb4006cffdb5d4943`
+- 86 Docker/containment tests and 100 mission regressions passed
+- End-to-end mission `m_c488e9e80eb7` succeeded with an independent verifier and verified local commit
+
+See [Hermes 0.20 runtime-repair r2](releases/hermes-0.20-runtime-repair-r2/README.md) and [Runtime containment modes](docs/runtime-containment-modes.md). The manual-plan runtime path is proven; end-to-end `plan-auto` acceptance remains pending.
 
 ### Operational acceptance evidence
 

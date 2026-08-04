@@ -1,0 +1,91 @@
+{
+  "base_release": "../hermes-0.20-compat",
+  "base_source_head_commit": "30550647352814d934204d113dec6f742f9627b8",
+  "base_tree": "561ad3ff0402f44382bbab150d15ffaff9136ed4",
+  "head_commit": "e1c0fba172b881f9fd6953ad7aad5c6f2081c04d",
+  "active_equivalent_commit": "edf49e9b8c1287a501964119011d962529e58142",
+  "head_tree": "3de433cb93ac980be1fdd96cb4006cffdb5d4943",
+  "commit_count": 8,
+  "commits": [
+    {
+      "commit": "86af037f2f2cc34c10bb65590adf15b0c9c94149",
+      "parents": [
+        "30550647352814d934204d113dec6f742f9627b8"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T11:18:28-07:00",
+      "subject": "fix(mission): reject unregistered worker profiles"
+    },
+    {
+      "commit": "f39e1cae204228a4b175377c188474aac69e7693",
+      "parents": [
+        "86af037f2f2cc34c10bb65590adf15b0c9c94149"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T12:34:27-07:00",
+      "subject": "fix(mission): allow unrestricted worktree execution"
+    },
+    {
+      "commit": "779dc778a354a84b4833092e1606ef9dcf54f6b0",
+      "parents": [
+        "f39e1cae204228a4b175377c188474aac69e7693"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T12:34:27-07:00",
+      "subject": "docs(mission): define workspace-permissive boundary"
+    },
+    {
+      "commit": "eea4d643d1b9f1510fccb4117af57361cb2b6c61",
+      "parents": [
+        "779dc778a354a84b4833092e1606ef9dcf54f6b0"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T12:43:12-07:00",
+      "subject": "fix(mission): preserve host ownership in worktrees"
+    },
+    {
+      "commit": "208615e87cf13f0c3e77bc50ab5b86960612cb5d",
+      "parents": [
+        "eea4d643d1b9f1510fccb4117af57361cb2b6c61"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T12:43:12-07:00",
+      "subject": "test(docker): initialize restricted mode in synthetic env"
+    },
+    {
+      "commit": "04f82ffcdf85f119821db4090deb76f57b9885ed",
+      "parents": [
+        "208615e87cf13f0c3e77bc50ab5b86960612cb5d"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T12:43:12-07:00",
+      "subject": "docs(mission): record host-user executor ownership"
+    },
+    {
+      "commit": "85da50a76c6fa70f6aee05d16c2104d500ce9f52",
+      "parents": [
+        "04f82ffcdf85f119821db4090deb76f57b9885ed"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T12:52:26-07:00",
+      "subject": "fix(mission): retain host user in restricted Docker"
+    },
+    {
+      "commit": "e1c0fba172b881f9fd6953ad7aad5c6f2081c04d",
+      "parents": [
+        "85da50a76c6fa70f6aee05d16c2104d500ce9f52"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T12:57:05-07:00",
+      "subject": "docs(mission): record successful end-to-end proof"
+    }
+  ]
+}

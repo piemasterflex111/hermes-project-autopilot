@@ -1,0 +1,138 @@
+From 86af037f2f2cc34c10bb65590adf15b0c9c94149 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 11:18:28 -0700
+Subject: [PATCH 1/8] fix(mission): reject unregistered worker profiles
+
+---
+ hermes_cli/mission_service.py     | 16 ++++++-
+ tests/hermes_cli/test_missions.py | 72 +++++++++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index f8750a681..e93cb4962 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -729,10 +729,14 @@ def _add_execution_task_unlocked(
+         or any(row["mission_id"] != mission_id for row in dependency_rows)
+     ):
+         raise MissionError("manual mission dependencies must be cards in the same mission")
++    canonical_assignee = _canonical_assignee(
++    assignee,
++    role="executor",
++)
+     _validate_plan_scope(mission, [{"title": title, "body": body}])
+     with kb._trusted_mission_controller_mutation():
+         task_id = kb.create_task(
+-            conn, title=title, body=_mission_executor_body(body), assignee=assignee,
++            conn, title=title, body=_mission_executor_body(body), assignee=canonical_assignee,
+             created_by="mission-planner", parents=dependencies,
+             workspace_kind="worktree", workspace_path=mission.worktree_path,
+             branch_name=mission.branch_name, project_id=mission.project_id,
+@@ -768,9 +772,19 @@ _PLAN_VERIFIER_BODY = (
+ def _canonical_assignee(value: str, *, role: str) -> str:
+     if not isinstance(value, str) or not value.strip():
+         raise MissionError(f"{role} assignee is required")
++
+     assignee = kb._canonical_assignee(value.strip())
++
+     if not assignee:
+         raise MissionError(f"{role} assignee is required")
++
++    from hermes_cli.profiles import profile_exists
++
++    if not profile_exists(assignee):
++        raise MissionError(
++            f"{role} assignee profile is not registered: {assignee}"
++        )
++
+     return assignee
+ 
+ 
+diff --git a/tests/hermes_cli/test_missions.py b/tests/hermes_cli/test_missions.py
+index 89a36a1d7..f3da89862 100644
+--- a/tests/hermes_cli/test_missions.py
++++ b/tests/hermes_cli/test_missions.py
+@@ -134,7 +134,37 @@ def test_mission_requires_explicit_valid_contract(mission_env):
+             boundaries={"allowed_roots": [str(repo)], "allowed_paths": ["../escape"]},
+         ).validate()
+ 
++def test_manual_mission_preserves_valid_executor_profile(
++    mission_env,
++    monkeypatch,
++):
++    """A valid worker profile must survive task creation unchanged."""
++    from hermes_cli import profiles as profiles_mod
++
++    conn, repo = mission_env
++
++    monkeypatch.setattr(
++        profiles_mod,
++        "profile_exists",
++        lambda name: name == "default",
++    )
++
++    mission_id = _created(conn, repo)
++    service.prepare_mission(conn, mission_id)
++
++    task_id = service.add_execution_task(
++        conn,
++        mission_id,
++        title="Valid worker profile",
++        body="Store this task with the intended worker.",
++        assignee="default",
++    )
+ 
++    task = kb.get_task(conn, task_id)
++
++    assert task is not None
++    assert task.assignee == "default"
++    
+ def test_execution_rejects_unenforceable_network_scope(mission_env):
+     conn, repo = mission_env
+     contract = _contract(repo)
+@@ -1926,3 +1956,45 @@ def test_mission_spawn_disables_python_bytecode(mission_env, monkeypatch):
+     kb._default_spawn(kb.get_task(conn, executor_id), mission.worktree_path, board="default")
+ 
+     assert captured["PYTHONDONTWRITEBYTECODE"] == "1"
++
++def test_manual_mission_rejects_unknown_executor_profile_before_task_storage(
++    mission_env,
++    monkeypatch,
++):
++    """Invalid mission workers must be rejected before an executor row exists."""
++    from hermes_cli import profiles as profiles_mod
++
++    conn, repo = mission_env
++
++    monkeypatch.setattr(
++        profiles_mod,
++        "profile_exists",
++        lambda name: name == "default",
++    )
++
++    mission_id = _created(conn, repo)
++    service.prepare_mission(conn, mission_id)
++
++    with pytest.raises(
++        service.MissionError,
++        match=r"executor assignee profile is not registered",
++    ):
++        service.add_execution_task(
++            conn,
++            mission_id,
++            title="Invalid worker profile",
++            body="This task must not be stored.",
++            assignee="profile-that-does-not-exist",
++        )
++
++    executor_count = conn.execute(
++        """
++        SELECT COUNT(*)
++        FROM tasks
++        WHERE mission_id=?
++          AND mission_role='executor'
++        """,
++        (mission_id,),
++    ).fetchone()[0]
++
++    assert executor_count == 0

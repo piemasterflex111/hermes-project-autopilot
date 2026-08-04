@@ -1,0 +1,111 @@
+From 779dc778a354a84b4833092e1606ef9dcf54f6b0 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 12:34:27 -0700
+Subject: [PATCH 3/8] docs(mission): define workspace-permissive boundary
+
+---
+ .../project-autopilot-workspace-permissive.md | 95 +++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+ create mode 100644 docs/security/project-autopilot-workspace-permissive.md
+
+diff --git a/docs/security/project-autopilot-workspace-permissive.md b/docs/security/project-autopilot-workspace-permissive.md
+new file mode 100644
+index 000000000..0f0f720f0
+--- /dev/null
++++ b/docs/security/project-autopilot-workspace-permissive.md
+@@ -0,0 +1,95 @@
++# Project Autopilot workspace-permissive execution
++
++## Decision
++
++Project Autopilot executor missions use the isolated Git worktree as the
++runtime write boundary. Executors may create, modify, rename, and delete any
++path under `/workspace`.
++
++Planning-time contract validation remains strict: planner declarations and
++manual task bodies that name paths outside `contract.boundaries.allowed_paths`
++are rejected before execution. Once a valid task is running, path-level
++Landlock and file-tool enforcement no longer block ordinary work elsewhere
++inside the isolated worktree.
++
++## Boundaries retained
++
++The worker container does not mount the host home directory, the active Hermes
++checkout, Hermes state, credentials, system paths, or the Docker socket.
++
++The following controls remain:
++
++- only the mission worktree is mounted at `/workspace`;
++- paths outside `/workspace` remain unavailable;
++- network remains disabled unless the mission contract enables it;
++- the executor must hold the live mission/task lease;
++- verifier execution remains read-only;
++- Git worktree, rollback reference, evidence ledger, and approval flow remain;
++- explicit repository-creation commands remain rejected;
++- planner and manual-task path declarations remain bound to `allowed_paths`.
++
++## Failure that motivated the change
++
++A valid smoke mission attempted to create `/workspace/smoke.txt` with a normal
++Python file write. The file was contract-approved but did not yet exist when
++strict per-path Landlock rules were installed. Landlock could not grant rights
++to the missing inode, so Hermes revoked the executor and blocked the mission.
++
++Controlled measurements proved that worktree ownership remained healthy, host
++Git access remained available, and the dispatcher spawned the correct worker.
++The reproducible blocker was strict per-path runtime enforcement.
++
++## Linux DAC and Landlock
++
++Two independent permission layers apply:
++
++1. Linux discretionary access control, including ownership, mode bits, and
++   container capabilities.
++2. Landlock filesystem rules installed inside the worker process.
++
++The production Docker backend drops all capabilities and adds back the minimum
++required for bind-mounted development work, including `DAC_OVERRIDE`. The
++integration test uses the same production security arguments so it tests
++Landlock rather than failing earlier at ordinary Linux directory permissions.
++
++## New behavior
++
++For executor policies with:
++
++```json
++{"containment_mode": "workspace-permissive"}
++```
++
++Hermes:
++
++1. grants Landlock write/create/delete rights recursively to `/workspace`;
++2. permits file tools to write any path within the worktree;
++3. does not roll back in-worktree changes merely because runtime output extends
++   beyond `allowed_paths`;
++4. keeps planning-time path validation strict.
++
++Strict mode remains available to direct guard callers and tests by setting:
++
++```json
++{"containment_mode": "strict"}
++```
++
++New CLI-created missions and legacy missions without the field default to
++`workspace-permissive` at runtime.
++
++## Verification completed
++
++- focused contract-regression tests: 2 passed;
++- containment and Docker-scope suite: 34 passed;
++- mission regression suite: 100 passed.
++
++## Remaining release gate
++
++Run a fresh end-to-end mission that:
++
++1. creates `smoke.txt` through a normal terminal write;
++2. completes the executor;
++3. completes the independent verifier;
++4. preserves host Git access;
++5. reaches approval or success without `chown`, direct SQLite edits, or
++   containment revocation.

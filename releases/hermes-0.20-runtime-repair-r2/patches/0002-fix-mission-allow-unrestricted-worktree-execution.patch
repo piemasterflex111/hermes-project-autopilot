@@ -1,0 +1,321 @@
+From f39e1cae204228a4b175377c188474aac69e7693 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 12:34:27 -0700
+Subject: [PATCH 2/8] fix(mission): allow unrestricted worktree execution
+
+---
+ agent/mission_scope.py                        |   3 +-
+ agent/mission_terminal_guard.py               |  39 ++++--
+ hermes_cli/kanban_db.py                       |   3 +
+ hermes_cli/mission_service.py                 |  12 +-
+ hermes_cli/missions.py                        |   1 +
+ hermes_cli/missions_db.py                     |   7 ++
+ .../test_mission_terminal_containment.py      | 111 +++++++++++++++++-
+ 7 files changed, 157 insertions(+), 19 deletions(-)
+
+diff --git a/agent/mission_scope.py b/agent/mission_scope.py
+index 5fb7db618..27f935e92 100644
+--- a/agent/mission_scope.py
++++ b/agent/mission_scope.py
+@@ -185,8 +185,9 @@ def require_write_path(path: str | Path) -> None:
+         raise PermissionError(
+             f"mission {policy['mission_id']} blocks writes outside {root}: {candidate}"
+         )
++    containment_mode = str(policy.get("containment_mode") or "strict")
+     allowed = [str(v).strip().strip("/") for v in policy.get("allowed_paths", [])]
+-    if allowed:
++    if containment_mode != "workspace-permissive" and allowed:
+         rel = candidate.relative_to(root).as_posix()
+         if not any(rel == item or rel.startswith(item + "/") for item in allowed):
+             raise PermissionError(
+diff --git a/agent/mission_terminal_guard.py b/agent/mission_terminal_guard.py
+index 6d2792d65..cd7259a10 100644
+--- a/agent/mission_terminal_guard.py
++++ b/agent/mission_terminal_guard.py
+@@ -85,6 +85,10 @@ def path_is_allowed(relative_path: str, allowed_paths: tuple[str, ...]) -> bool:
+     return any(value == item or value.startswith(item + "/") for item in allowed_paths)
+ 
+ 
++def workspace_is_permissive(policy: dict[str, Any]) -> bool:
++    return str(policy.get("containment_mode") or "strict") == "workspace-permissive"
++
++
+ def _git_paths(root: Path, *args: str) -> set[str]:
+     proc = subprocess.run(
+         ["git", "-C", str(root), *args],
+@@ -131,6 +135,8 @@ def workspace_manifest(policy: dict[str, Any]) -> dict[str, list[str]]:
+ def manifest_violations(
+     policy: dict[str, Any], manifest: dict[str, list[str]]
+ ) -> list[str]:
++    if workspace_is_permissive(policy):
++        return []
+     allowed = normalized_allowed_paths(policy)
+     violations = {
+         path
+@@ -386,20 +392,26 @@ grant("/dev/null", FILE_RIGHTS)
+ spec = json.loads(sys.argv[2])
+ allowed = spec["allowed_paths"]
+ read_only_workspace = bool(spec["read_only_workspace"])
++containment_mode = str(spec.get("containment_mode") or "strict")
+ if not read_only_workspace:
+-    for item in allowed:
+-        path = "/workspace/" + item.strip("/")
+-        if os.path.isdir(path):
+-            grant(path, WORKSPACE_WRITE_RIGHTS)
+-        elif os.path.isfile(path):
+-            grant(path, FILE_RIGHTS)
+-        else:
+-            # Landlock rules can only name existing filesystem objects. Missing
+-            # approved paths must be created through Hermes file tools, which
+-            # enforce the exact relative path before mutation.
+-            continue
+-    if not allowed:
+-        grant("/workspace", WORKSPACE_WRITE_RIGHTS)
++    if containment_mode == "workspace-permissive":
++        # The isolated Git worktree is the execution boundary. Permit normal
++        # shell, compiler, package-manager, and file-tool writes anywhere
++        # beneath /workspace while leaving host paths unmounted.
++        grant("/workspace", SCRATCH_WRITE_RIGHTS)
++    else:
++        for item in allowed:
++            path = "/workspace/" + item.strip("/")
++            if os.path.isdir(path):
++                grant(path, WORKSPACE_WRITE_RIGHTS)
++            elif os.path.isfile(path):
++                grant(path, FILE_RIGHTS)
++            else:
++                # Strict mode cannot grant a missing inode. The validated
++                # Hermes file tool remains the creation path in this mode.
++                continue
++        if not allowed:
++            grant("/workspace", WORKSPACE_WRITE_RIGHTS)
+ if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+     err = ctypes.get_errno()
+     raise OSError(err, os.strerror(err))
+@@ -448,6 +460,7 @@ def landlock_wrapped_command(
+         {
+             "allowed_paths": list(normalized_allowed_paths(policy)),
+             "read_only_workspace": bool(read_only_workspace),
++            "containment_mode": str(policy.get("containment_mode") or "strict"),
+         },
+         separators=(",", ":"),
+     )
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 5c84824d4..9604039d5 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -9380,6 +9380,9 @@ def _default_spawn(
+                 "board": _mission.board,
+                 "worktree_path": _mission.worktree_path,
+                 "allowed_paths": _boundaries.get("allowed_paths", []),
++                "containment_mode": str(
++                    _boundaries.get("containment_mode") or "workspace-permissive"
++                ),
+                 "network_destinations": _boundaries.get("network_destinations", []),
+                 "allowed_terminal_backends": _boundaries.get(
+                     "allowed_terminal_backends", ["docker"]
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index e93cb4962..eac8bc0b3 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -445,6 +445,9 @@ def _mission_runtime_policy(mission: mdb.Mission) -> dict[str, Any]:
+         "mission_role": "executor",
+         "worktree_path": mission.worktree_path,
+         "allowed_paths": list(boundaries.get("allowed_paths") or []),
++        "containment_mode": str(
++            boundaries.get("containment_mode") or "workspace-permissive"
++        ),
+         "allowed_terminal_backends": list(
+             boundaries.get("allowed_terminal_backends") or ["docker"]
+         ),
+@@ -749,8 +752,9 @@ def _add_execution_task_unlocked(
+ _MISSION_EXECUTOR_RUNTIME_NOTE = (
+     "Mission runtime boundary: the existing repository root inside terminal "
+     "commands is /workspace. Never cd to or reference the host workspace_path. "
+-    "Use repository-relative paths or /workspace paths. Create missing root "
+-    "files with Hermes file tools rather than shell redirection."
++    "Use repository-relative paths or /workspace paths. Normal terminal and "
++    "file-tool writes are allowed anywhere inside /workspace. Never target "
++    "paths outside /workspace."
+ )
+ 
+ 
+@@ -1376,8 +1380,8 @@ def plan_with_model(
+                 "the exact repository-relative paths it may modify; use an empty paths list "
+                 "for read-only or verification-only work. Paths must be inside contract.allowed_paths. "
+                 "Treat /workspace as the existing repository root and never initialize a nested project. "
+-                "Task bodies must tell executors to use Hermes file tools to create missing root files; "
+-                "terminal writes are permitted only beneath approved paths that already exist. "
++                "Task bodies may use normal terminal commands or Hermes file tools for any path "
++                "inside /workspace; never target host paths or paths outside /workspace. "
+                 "Do not claim to execute work."
+             )
+             user = json.dumps(
+diff --git a/hermes_cli/missions.py b/hermes_cli/missions.py
+index df590ab40..69c92fcfe 100644
+--- a/hermes_cli/missions.py
++++ b/hermes_cli/missions.py
+@@ -126,6 +126,7 @@ def mission_command(args: argparse.Namespace) -> int:
+                     boundaries={
+                         "allowed_roots": [str(Path(v).expanduser().resolve()) for v in args.allowed_root],
+                         "allowed_paths": args.allowed_path,
++                        "containment_mode": "workspace-permissive",
+                         "network_destinations": args.network,
+                     },
+                     stop_when=args.stop_when,
+diff --git a/hermes_cli/missions_db.py b/hermes_cli/missions_db.py
+index db3e3d505..e4c50a178 100644
+--- a/hermes_cli/missions_db.py
++++ b/hermes_cli/missions_db.py
+@@ -90,6 +90,13 @@ class MissionContract:
+             not isinstance(item, str) or not item.strip() for item in backends
+         ):
+             raise ValueError("boundaries.allowed_terminal_backends must be a list of strings")
++        containment_mode = str(
++            self.boundaries.get("containment_mode") or "workspace-permissive"
++        )
++        if containment_mode not in {"strict", "workspace-permissive"}:
++            raise ValueError(
++                "boundaries.containment_mode must be strict or workspace-permissive"
++            )
+ 
+     def to_json(self) -> str:
+         self.validate()
+diff --git a/tests/tools/test_mission_terminal_containment.py b/tests/tools/test_mission_terminal_containment.py
+index a98a70514..152e453fc 100644
+--- a/tests/tools/test_mission_terminal_containment.py
++++ b/tests/tools/test_mission_terminal_containment.py
+@@ -7,6 +7,7 @@ import os
+ import shutil
+ import subprocess
+ from pathlib import Path
++from types import SimpleNamespace
+ 
+ import pytest
+ 
+@@ -63,12 +64,18 @@ def _repo(tmp_path: Path) -> Path:
+     return repo
+ 
+ 
+-def _policy(repo: Path, allowed: list[str] | None = None) -> dict:
++def _policy(
++    repo: Path,
++    allowed: list[str] | None = None,
++    *,
++    containment_mode: str = "strict",
++) -> dict:
+     return {
+         "mission_id": "m_guard",
+         "mission_role": "executor",
+         "worktree_path": str(repo),
+         "allowed_paths": ["src"] if allowed is None else allowed,
++        "containment_mode": containment_mode,
+         "allowed_terminal_backends": ["docker"],
+         "read_only": False,
+     }
+@@ -744,3 +751,105 @@ def test_indirect_landlock_denial_is_nonfatal_sandbox_policy_error(
+     assert policy_errors
+     assert policy_errors[-1]["metadata"]["classification"] == "sandbox_policy_error"
+     assert policy_errors[-1]["metadata"]["fatal"] is False
++
++
++def test_workspace_permissive_manifest_treats_contract_paths_as_advisory(
++    tmp_path: Path,
++) -> None:
++    repo = _repo(tmp_path)
++    policy = _policy(
++        repo,
++        allowed=["smoke.txt"],
++        containment_mode="workspace-permissive",
++    )
++    (repo / "README.md").write_text("changed\n", encoding="utf-8")
++    (repo / "generated").mkdir()
++    (repo / "generated" / "extra.txt").write_text("ok\n", encoding="utf-8")
++
++    manifest = guard.workspace_manifest(policy)
++
++    assert manifest["tracked"] == ["README.md"]
++    assert "generated/extra.txt" in manifest["untracked"]
++    assert guard.manifest_violations(policy, manifest) == []
++
++
++def test_workspace_permissive_file_tool_allows_any_in_worktree_path(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from agent import mission_scope
++
++    repo = _repo(tmp_path)
++    policy = _policy(
++        repo,
++        allowed=["smoke.txt"],
++        containment_mode="workspace-permissive",
++    )
++    monkeypatch.setenv("HERMES_MISSION_POLICY", json.dumps(policy))
++    monkeypatch.setattr(
++        mission_scope,
++        "_require_live_executor_lease",
++        lambda current: None,
++    )
++
++    mission_scope.require_write_path(repo / "generated" / "extra.txt")
++
++    with pytest.raises(PermissionError, match="outside"):
++        mission_scope.require_write_path(tmp_path / "outside.txt")
++def test_mission_runtime_defaults_old_contracts_to_workspace_permissive(
++    tmp_path: Path,
++) -> None:
++    from hermes_cli import mission_service as service
++
++    mission = SimpleNamespace(
++        id="m_old",
++        worktree_path=str(tmp_path),
++        contract=SimpleNamespace(boundaries={}),
++    )
++
++    policy = service._mission_runtime_policy(mission)
++
++    assert policy["containment_mode"] == "workspace-permissive"
++
++
++@REQUIRES_LOCAL_MISSION_IMAGE
++def test_workspace_permissive_landlock_allows_normal_worktree_writes(
++    tmp_path: Path,
++) -> None:
++    repo = _repo(tmp_path)
++    policy = _policy(
++        repo,
++        allowed=["smoke.txt"],
++        containment_mode="workspace-permissive",
++    )
++    argv = guard.landlock_wrapped_command(
++        "printf 'HERMES_AUTOPILOT_OK\\n' > /workspace/smoke.txt && "
++        "mkdir -p /workspace/generated && "
++        "printf 'extra\\n' > /workspace/generated/extra.txt",
++        policy,
++    )
++
++    proc = subprocess.run(
++        [
++            "docker",
++            "run",
++            "--rm",
++            "--network=none",
++            *docker_env._BASE_SECURITY_ARGS,
++            "-v",
++            f"{repo}:/workspace",
++            "-w",
++            "/workspace",
++            MISSION_IMAGE,
++            *argv,
++        ],
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        timeout=60,
++        check=False,
++    )
++
++    assert proc.returncode == 0, proc.stdout
++    assert (repo / "smoke.txt").read_text(encoding="utf-8") == "HERMES_AUTOPILOT_OK\n"
++    assert (repo / "generated" / "extra.txt").read_text(encoding="utf-8") == "extra\n"

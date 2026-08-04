@@ -68,6 +68,24 @@ class RepositoryIntegrityTests(unittest.TestCase):
             self.assertEqual(0, run["open_runs"])
             self.assertEqual("ok", run["sqlite_integrity"])
 
+    def test_runtime_repair_release_is_consistent(self):
+        release_dir = ROOT / "releases/hermes-0.20-runtime-repair-r2"
+        release = json.loads((release_dir / "release.json").read_text())
+        evidence = json.loads((release_dir / "evidence/runtime-repair-summary.json").read_text())
+        self.assertEqual(8, release["patch_count"])
+        self.assertEqual(33, release["total_patch_count_from_upstream_base"])
+        self.assertEqual(release["source_head_commit"], evidence["source_head_commit"])
+        self.assertEqual(release["expected_final_tree"], evidence["expected_final_tree"])
+        self.assertEqual(86, evidence["focused_tests"]["docker_containment_passed"])
+        self.assertEqual(100, evidence["focused_tests"]["mission_regressions_passed"])
+        self.assertEqual(0, evidence["focused_tests"]["failed"])
+        proof = evidence["end_to_end"]
+        self.assertEqual("succeeded", proof["status"])
+        self.assertEqual("done", proof["controller"])
+        self.assertEqual("done", proof["executor"])
+        self.assertEqual("done", proof["verifier"])
+        self.assertFalse(evidence["plan_auto_end_to_end_proven"])
+
     def test_containment_acceptance_is_complete(self):
         report = json.loads((ROOT / "releases/hermes-0.20-compat/evidence/containment-acceptance.json").read_text())
         self.assertTrue(report["release_ready"])
