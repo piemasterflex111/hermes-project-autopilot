@@ -14,8 +14,11 @@ SCENARIOS = [
 ]
 IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
 
-def run(cmd, *, cwd, timeout=240, env=None):
-    return subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False, env=env)
+def run(cmd: list[str], *, cwd: Path, timeout: int = 240, env=None):
+    if not cmd or any(not isinstance(item, str) or "\x00" in item for item in cmd):
+        raise ValueError("command must be a non-empty list of NUL-free strings")
+    return subprocess.run(cmd, shell=False, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=timeout, check=False, env=env)  # nosec B603: argv list, never a shell
 
 def direct_nested_verifier(python: str, repo: Path, env: dict[str, str]):
     source = r'''
@@ -27,6 +30,7 @@ with tempfile.TemporaryDirectory(prefix="autopilot-nested-verifier-") as raw:
     os.environ["HERMES_HOME"]=str(home); os.environ["HERMES_KANBAN_HOME"]=str(home/"kanban")
     def git(*args): return subprocess.run(["git","-C",str(project),*args],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True).stdout.strip()
     (project/"app.py").write_text("VALUE = 1\n"); git("init"); git("config","user.email","acceptance@example.test"); git("config","user.name","Acceptance"); git("add","."); git("commit","-m","base")
+    original_preflight=service._runtime_preflight
     service._runtime_preflight=lambda mission:{"docker":"/usr/bin/docker","docker_server":"test","image":"nikolaik/python-nodejs:python3.11-nodejs20","image_id":"sha256:test","host_landlock_abi":8,"container_landlock_abi":8,"network":"none","workspace":mission.worktree_path,"manifest":{"tracked":[],"untracked":[],"nested_git":[]}}
     with kb.connect_closing(board="default") as conn:
         contract=mdb.MissionContract(outcome="Update app.py only",verification=["true"],constraints=["No nested repositories"],boundaries={"allowed_roots":[str(project)],"allowed_paths":["app.py"],"network_destinations":[]})
@@ -37,6 +41,7 @@ with tempfile.TemporaryDirectory(prefix="autopilot-nested-verifier-") as raw:
         except Exception as exc:
             message=str(exc); assert "nested/.git" in message and "out-of-scope" in message.lower(), message
         else: raise AssertionError("controller verifier accepted a nested .git")
+    service._runtime_preflight=original_preflight
 '''
     return run([python, "-c", source], cwd=repo, env=env)
 

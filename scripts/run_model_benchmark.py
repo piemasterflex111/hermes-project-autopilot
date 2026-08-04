@@ -22,8 +22,10 @@ from typing import Any
 
 
 def run(cmd: list[str], *, check: bool = True, timeout: int = 180, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          timeout=timeout, env=env)
+    if not cmd or any(not isinstance(item, str) or "\x00" in item for item in cmd):
+        raise ValueError("command must be a non-empty list of NUL-free strings")
+    proc = subprocess.run(cmd, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=timeout, env=env)  # nosec B603: argv list, never a shell
     if check and proc.returncode:
         raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stdout}")
     return proc
