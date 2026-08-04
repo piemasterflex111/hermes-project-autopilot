@@ -27,7 +27,7 @@ def main() -> int:
     args = ap.parse_args()
     repo, out, tag = args.repo.resolve(), args.output_dir.resolve(), args.tag
     out.mkdir(parents=True, exist_ok=True)
-    commit = run(["git", "-C", str(repo), "rev-parse", tag]).stdout.strip()
+    commit = run(["git", "-C", str(repo), "rev-parse", f"{tag}^{{}}"]).stdout.strip()
     tree = run(["git", "-C", str(repo), "rev-parse", f"{tag}^{{tree}}"]).stdout.strip()
     base = f"{args.project_name}-{tag}"
     archive = out / f"{base}.tar.gz"

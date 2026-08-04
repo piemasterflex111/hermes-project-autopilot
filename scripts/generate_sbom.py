@@ -17,7 +17,7 @@ def main() -> int:
     ap.add_argument("--namespace-base", default="https://github.com/piemasterflex111/hermes-project-autopilot/spdx")
     args = ap.parse_args()
     repo = args.repo.resolve()
-    commit = git(repo, "rev-parse", args.ref).strip()
+    commit = git(repo, "rev-parse", f"{args.ref}^{{}}").strip()
     tree = git(repo, "rev-parse", f"{args.ref}^{{tree}}").strip()
     paths = [p for p in git(repo, "ls-tree", "-r", "--name-only", args.ref).splitlines() if p]
     files, relationships = [], []
@@ -30,7 +30,7 @@ def main() -> int:
         files.append({"SPDXID": spdx, "fileName": path, "checksums": [{"algorithm": "SHA256", "checksumValue": checksum}], "licenseConcluded": "NOASSERTION", "copyrightText": "NOASSERTION"})
         relationships.append({"spdxElementId": "SPDXRef-Package", "relationshipType": "CONTAINS", "relatedSpdxElement": spdx})
     name = args.name
-    committed = git(repo, "show", "-s", "--format=%cI", args.ref).strip()
+    committed = git(repo, "show", "-s", "--format=%cI", f"{args.ref}^{{}}").strip()
     created = datetime.datetime.fromisoformat(committed).astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     doc = {
         "spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT",
