@@ -1,0 +1,11 @@
+Hermes mobile-shortcuts r4 acceptance
+=====================================
+30 focused mobile-command tests passed
+128 mission and containment tests passed
+0 failures
+Real repository with three tracked gitlinks: named-file inspection passed
+Dirty and untracked input snapshot: passed
+Unquoted ham and ha commands: passed
+Piped hapaste with date and URL: passed
+Missing-file suggestion: passed
+Vague-task and nested-worktree rejection: passed

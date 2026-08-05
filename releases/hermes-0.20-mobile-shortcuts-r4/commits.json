@@ -1,0 +1,41 @@
+{
+  "base_release": "../hermes-0.20-ha-one-command-r3",
+  "base_tree": "43bd0f96f5b44398a70dc5485614f4a6d3b49712",
+  "source_base_commit": "d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4",
+  "source_head_commit": "b5053677363998180d9a6f8dd5fbe2c1b12bc0cf",
+  "active_equivalent_commit": "d8e82a0c3a8f4e2c907e9232ebffabf398db5b14",
+  "head_tree": "f3ee17996dd69de2045a68e507438db1825c18e3",
+  "commit_count": 3,
+  "commits": [
+    {
+      "commit": "dcf814ef024ec2725d403dfa31a8ca03fd14a3cf",
+      "parents": [
+        "d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T18:01:23-07:00",
+      "subject": "feat(autopilot): add mobile-first shortcuts"
+    },
+    {
+      "commit": "165549a9256ed66bd42a7c17f9d81f83f98fc368",
+      "parents": [
+        "dcf814ef024ec2725d403dfa31a8ca03fd14a3cf"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T18:01:23-07:00",
+      "subject": "docs(autopilot): document mobile shortcuts"
+    },
+    {
+      "commit": "b5053677363998180d9a6f8dd5fbe2c1b12bc0cf",
+      "parents": [
+        "165549a9256ed66bd42a7c17f9d81f83f98fc368"
+      ],
+      "author_name": "Payam Adloo",
+      "author_email": "31391809+piemasterflex111@users.noreply.github.com",
+      "author_date": "2026-08-04T18:08:09-07:00",
+      "subject": "fix(autopilot): isolate inspection from tracked gitlinks"
+    }
+  ]
+}

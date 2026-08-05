@@ -124,6 +124,30 @@ no first commit yet.
 
 See [`ha` one-command release r3](releases/hermes-0.20-ha-one-command-r3/README.md).
 
+## Mobile-first shortcuts release r4
+
+The latest three-patch delta makes Project Autopilot practical from a phone
+terminal:
+
+```bash
+hai FILE
+ham TASK WITHOUT QUOTES
+hapaste
+```
+
+It adds unquoted objectives, focused named-file inspection, dirty/untracked
+input snapshots, saved verified answers, interactive or piped paste analysis,
+file-name suggestions, date/URL-safe planning, grounded next-action filtering,
+and safe inspection of repositories that already contain tracked Git links.
+
+- Source feature head: `b5053677363998180d9a6f8dd5fbe2c1b12bc0cf`
+- Deployed equivalent head: `d8e82a0c3a8f4e2c907e9232ebffabf398db5b14`
+- Exact final tree: `f3ee17996dd69de2045a68e507438db1825c18e3`
+- 30 focused mobile tests and 128 mission/containment tests passed
+- Full replay count: 40 ordered patches from the compatibility base
+
+See [mobile-shortcuts release r4](releases/hermes-0.20-mobile-shortcuts-r4/README.md).
+
 ### Operational acceptance evidence
 
 The current release also includes two higher-level gates:

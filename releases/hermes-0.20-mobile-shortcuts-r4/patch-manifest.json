@@ -1,0 +1,20 @@
+{
+  "patch_count": 3,
+  "patches": [
+    {
+      "path": "patches/0001-feat-autopilot-add-mobile-first-shortcuts.patch",
+      "bytes": 35413,
+      "sha256": "424dec80fea96e3803b5376782f75d7b3e8d608e96f0daf05dbd79bf62af49dc"
+    },
+    {
+      "path": "patches/0002-docs-autopilot-document-mobile-shortcuts.patch",
+      "bytes": 1975,
+      "sha256": "c23070f9e01e3e51eeecfd01aa6075653b85730e99f57183c20803b5013b3923"
+    },
+    {
+      "path": "patches/0003-fix-autopilot-isolate-inspection-from-tracked-gitlinks.patch",
+      "bytes": 3984,
+      "sha256": "b35b5d4e84f7932f53fbad51808a3a43ea15bc4e53c82b13dfbb0fba7cb28195"
+    }
+  ]
+}

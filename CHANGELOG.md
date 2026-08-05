@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-08-04 — mobile-shortcuts release r4
+
+- add `hai FILE`, unquoted `ham ...`, and interactive/piped `hapaste`;
+- snapshot modified and untracked named inputs into disposable shadows;
+- archive independently verified inspection answers;
+- recognize common read-only phrases and reject vague tasks before model work;
+- ignore dates and URLs during planner path extraction;
+- add missing-file suggestions and protected-worktree rejection;
+- ground next-action output and remove internal workspace terminology;
+- isolate inspection from pre-existing tracked Git links;
+- publish three apply-ready patches, exact 40-patch replay, 30 focused mobile tests, and 128 mission/containment tests.
+
 ## 2026-08-04 — `ha` one-command release r3
 
 - add the `ha "describe the task"` everyday entrypoint;

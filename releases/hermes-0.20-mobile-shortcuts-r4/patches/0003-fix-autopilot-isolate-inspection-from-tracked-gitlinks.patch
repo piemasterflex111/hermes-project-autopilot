@@ -1,0 +1,95 @@
+From b5053677363998180d9a6f8dd5fbe2c1b12bc0cf Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 18:08:09 -0700
+Subject: [PATCH] fix(autopilot): isolate inspection from tracked gitlinks
+
+---
+ hermes_cli/autopilot_cmd.py            | 28 +++++++++++++++++++++++
+ tests/hermes_cli/test_autopilot_cmd.py | 31 ++++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+)
+
+diff --git a/hermes_cli/autopilot_cmd.py b/hermes_cli/autopilot_cmd.py
+index 9cccb82da..eb990138b 100644
+--- a/hermes_cli/autopilot_cmd.py
++++ b/hermes_cli/autopilot_cmd.py
+@@ -537,6 +537,33 @@ def _git_identity_env() -> dict[str, str]:
+     return env
+ 
+ 
++def _strip_inspection_gitlinks(context: RepositoryContext) -> tuple[str, ...]:
++    """Remove pre-existing gitlinks only from the disposable inspect shadow."""
++    if context.source_repo == context.original_root:
++        raise AutopilotError("inspection gitlink filtering requires a shadow repository")
++    result = _git(context.source_repo, "ls-files", "--stage", "-z")
++    paths: list[str] = []
++    for entry in result.stdout.split("\0"):
++        if not entry or "\t" not in entry:
++            continue
++        metadata, repo_path = entry.split("\t", 1)
++        mode = metadata.split()[0] if metadata.split() else ""
++        if mode == "160000":
++            paths.append(repo_path)
++    if not paths:
++        return ()
++    env = _git_identity_env()
++    _git(context.source_repo, "rm", "-f", "--", *paths, env=env)
++    _git(
++        context.source_repo,
++        "commit",
++        "-m",
++        "chore: exclude unsupported gitlinks from inspection",
++        env=env,
++    )
++    return tuple(paths)
++
++
+ def _snapshot_input_files(
+     context: RepositoryContext,
+     inputs: Iterable[InputFile],
+@@ -1039,6 +1066,7 @@ def autopilot_command(args: argparse.Namespace) -> int:
+         context_path = _context_path(context.scope_prefix) if mode == "inspect" else None
+         if mode == "inspect":
+             context = _ensure_inspection_shadow(context)
++            _strip_inspection_gitlinks(context)
+             input_paths = _snapshot_input_files(context, inputs)
+             assert report_path is not None and context_path is not None
+             _commit_inspection_context(context, context_path, input_paths)
+diff --git a/tests/hermes_cli/test_autopilot_cmd.py b/tests/hermes_cli/test_autopilot_cmd.py
+index 951216fc7..1d470e0c5 100644
+--- a/tests/hermes_cli/test_autopilot_cmd.py
++++ b/tests/hermes_cli/test_autopilot_cmd.py
+@@ -421,3 +421,34 @@ Contact the recipient. Resubmitting is not supported by the source.
+     )
+     assert "Contact the recipient" in cleaned
+     assert "not supported" in cleaned
++
++
++def test_inspection_shadow_strips_preexisting_gitlinks(
++    tmp_path: Path,
++    monkeypatch,
++) -> None:
++    outer = tmp_path / "outer"
++    outer.mkdir()
++    repo = init_repo(outer)
++    nested = repo / "embedded-repo"
++    nested.mkdir()
++    git(nested, "init", "-b", "main")
++    git(nested, "config", "user.name", "Test User")
++    git(nested, "config", "user.email", "test@example.com")
++    (nested / "child.txt").write_text("child\n", encoding="utf-8")
++    git(nested, "add", "child.txt")
++    git(nested, "commit", "-m", "child")
++    git(repo, "add", "embedded-repo")
++    git(repo, "commit", "-m", "track nested gitlink")
++    assert git(repo, "ls-files", "--stage", "embedded-repo").startswith("160000 ")
++
++    monkeypatch.setattr(ap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
++    context = ap._prepare_repository(repo)
++    context = ap._ensure_inspection_shadow(context)
++    try:
++        removed = ap._strip_inspection_gitlinks(context)
++        assert removed == ("embedded-repo",)
++        assert git(context.source_repo, "ls-files", "--stage", "embedded-repo") == ""
++        assert git(repo, "ls-files", "--stage", "embedded-repo").startswith("160000 ")
++    finally:
++        ap._cleanup_shadow(context)

@@ -1,0 +1,942 @@
+From dcf814ef024ec2725d403dfa31a8ca03fd14a3cf Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 18:01:23 -0700
+Subject: [PATCH] feat(autopilot): add mobile-first shortcuts
+
+---
+ hermes_cli/autopilot_cmd.py            | 417 +++++++++++++++++++++++--
+ hermes_cli/mission_service.py          |  19 +-
+ scripts/autopilot_mobile/hai           |  10 +
+ scripts/autopilot_mobile/ham           |   8 +
+ scripts/autopilot_mobile/hapaste       |  32 ++
+ scripts/autopilot_mobile/install.sh    |   8 +
+ tests/hermes_cli/test_autopilot_cmd.py | 172 +++++++++-
+ 7 files changed, 638 insertions(+), 28 deletions(-)
+ create mode 100755 scripts/autopilot_mobile/hai
+ create mode 100755 scripts/autopilot_mobile/ham
+ create mode 100755 scripts/autopilot_mobile/hapaste
+ create mode 100755 scripts/autopilot_mobile/install.sh
+
+diff --git a/hermes_cli/autopilot_cmd.py b/hermes_cli/autopilot_cmd.py
+index b6f1b6773..9cccb82da 100644
+--- a/hermes_cli/autopilot_cmd.py
++++ b/hermes_cli/autopilot_cmd.py
+@@ -11,11 +11,13 @@ from __future__ import annotations
+ 
+ import argparse
+ import contextlib
++import difflib
+ import hashlib
+ import json
+ import os
+ import re
+ import shlex
++import shutil
+ import subprocess
+ import sys
+ import time
+@@ -38,10 +40,52 @@ _MUTATION_INTENT = re.compile(
+     re.IGNORECASE,
+ )
+ _INSPECTION_INTENT = re.compile(
+-    r"\b(tell me|what (?:is|does|are)|explain|describe|summari[sz]e|analy[sz]e|"
+-    r"inspect|review|list|show me|report)\b",
++    r"\b(tell me|what (?:is|does|are)|what is this|explain|describe|"
++    r"summari[sz]e|analy[sz]e|inspect|review|read|open|view|look at|"
++    r"do you see|check|interpret|list|show me|report)\b",
+     re.IGNORECASE,
+ )
++_FILE_TOKEN_RE = re.compile(
++    r"(?<![A-Za-z0-9@])(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\."
++    r"(?:md|markdown|txt|json|csv|tsv|py|sh|yaml|yml|toml|ini|cfg|conf|"
++    r"html?|xml|sql|java|js|jsx|ts|tsx|c|cc|cpp|h|hpp|pdf|docx?)\b",
++    re.IGNORECASE,
++)
++_INPUT_CUE_RE = re.compile(
++    r"(?:from|using|based on|read|open|review|analy[sz]e|inspect|explain|"
++    r"summari[sz]e|check)\s+[`'\"]*$",
++    re.IGNORECASE,
++)
++_VAGUE_OBJECTIVES = {
++    "test",
++    "help",
++    "run",
++    "do it",
++    "fix it",
++    "try it",
++    "check",
++    "read",
++    "inspect",
++    "review",
++    "explain",
++}
++_PROTECTED_WORKTREE_PARTS = {".hermes-worktree", ".hermes-worktrees"}
++_HIGH_RISK_ACTION_TERMS = (
++    "re-send",
++    "resend",
++    "log in",
++    "login",
++    "cancel",
++    "submit",
++    "upload",
++    "download",
++    "pay",
++    "purchase",
++    "order again",
++    "call",
++    "email",
++    "visit",
++)
+ _REPORT_NAME = "AUTOPILOT_REPORT.md"
+ _CONTEXT_NAME = "AUTOPILOT_CONTEXT.json"
+ 
+@@ -62,6 +106,12 @@ class RepositoryContext:
+     baseline_commit: Optional[str] = None
+ 
+ 
++@dataclass(frozen=True)
++class InputFile:
++    requested: str
++    repo_path: str
++
++
+ @dataclass(frozen=True)
+ class ApplyResult:
+     applied: bool
+@@ -83,7 +133,11 @@ def build_parser(parent_subparsers) -> argparse.ArgumentParser:
+             "change back when it does not overlap local edits."
+         ),
+     )
+-    parser.add_argument("objective", help="Plain-English task to complete")
++    parser.add_argument(
++        "objective",
++        nargs="+",
++        help="Plain-English task to complete; quotation marks are optional",
++    )
+     parser.add_argument(
+         "--verify",
+         action="append",
+@@ -112,6 +166,16 @@ def build_parser(parent_subparsers) -> argparse.ArgumentParser:
+             "When omitted, the selected folder itself is the scope."
+         ),
+     )
++    parser.add_argument(
++        "--input-file",
++        action="append",
++        default=[],
++        help=(
++            "Repository file that must be available as source material. Repeat "
++            "as needed. Dirty or untracked inputs are copied into the isolated "
++            "mission baseline without being committed to the source repository."
++        ),
++    )
+     parser.add_argument(
+         "--mode",
+         choices=("auto", "change", "inspect"),
+@@ -161,6 +225,95 @@ def _safe_slug(value: str) -> str:
+     return slug[:48] or "task"
+ 
+ 
++def _validate_objective(objective: str) -> None:
++    value = " ".join(str(objective or "").split()).strip()
++    normalized = value.casefold().strip(" .!?;:")
++    words = re.findall(r"[A-Za-z0-9]+", value)
++    if normalized in _VAGUE_OBJECTIVES or (
++        len(words) < 2 and not _FILE_TOKEN_RE.search(value)
++    ):
++        raise AutopilotError(
++            "task is too vague; name the file, question, or result, for example "
++            "`hai README.md` or `ham create NOTES.md`"
++        )
++
++
++def _protected_worktree_path(path: Path) -> bool:
++    resolved = path.expanduser().resolve(strict=False)
++    shadow_root = Path.home() / ".hermes" / "autopilot" / "shadows"
++    return (
++        resolved == shadow_root
++        or shadow_root in resolved.parents
++        or any(part in _PROTECTED_WORKTREE_PARTS for part in resolved.parts)
++    )
++
++
++def _explicit_input_names(
++    objective: str,
++    mode: str,
++    explicit: Iterable[str],
++) -> list[str]:
++    values = [str(item).strip() for item in explicit if str(item).strip()]
++    for match in _FILE_TOKEN_RE.finditer(objective):
++        token = match.group(0).strip("`'\".,:;()[]{}")
++        if mode == "inspect":
++            values.append(token)
++            continue
++        prefix = objective[max(0, match.start() - 48) : match.start()]
++        if _INPUT_CUE_RE.search(prefix):
++            values.append(token)
++    return list(dict.fromkeys(values))
++
++
++def _input_candidates(invocation_dir: Path) -> list[str]:
++    values: list[str] = []
++    for path in invocation_dir.rglob("*"):
++        if len(values) >= 5000:
++            break
++        if not path.is_file():
++            continue
++        if any(
++            part == ".git" or part in _PROTECTED_WORKTREE_PARTS
++            for part in path.parts
++        ):
++            continue
++        values.append(path.relative_to(invocation_dir).as_posix())
++    return values
++
++
++def _resolve_input_files(
++    context: RepositoryContext,
++    requested: Iterable[str],
++) -> tuple[InputFile, ...]:
++    resolved: list[InputFile] = []
++    for raw in requested:
++        value = str(raw).strip().strip("`'\"")
++        candidate = Path(value).expanduser()
++        target = candidate if candidate.is_absolute() else context.invocation_dir / candidate
++        target = target.resolve(strict=False)
++        try:
++            target.relative_to(context.invocation_dir)
++            repo_relative = target.relative_to(context.original_root).as_posix()
++        except ValueError as exc:
++            raise AutopilotError(
++                f"input file must stay inside the selected folder: {value}"
++            ) from exc
++        if not target.is_file() or target.is_symlink():
++            candidates = _input_candidates(context.invocation_dir)
++            names = candidates + [Path(item).name for item in candidates]
++            suggestion = difflib.get_close_matches(
++                value,
++                names,
++                n=1,
++                cutoff=0.55,
++            )
++            hint = f" Did you mean: {suggestion[0]}?" if suggestion else ""
++            raise AutopilotError(f"source file not found: {value}.{hint}")
++        resolved.append(InputFile(requested=value, repo_path=repo_relative))
++    unique = {item.repo_path: item for item in resolved}
++    return tuple(unique.values())
++
++
+ def _detect_mode(objective: str, requested: str = "auto") -> str:
+     if requested in {"change", "inspect"}:
+         return requested
+@@ -180,14 +333,20 @@ def _context_path(prefix: str) -> str:
+     return f"{prefix}/{_CONTEXT_NAME}".strip("/") if prefix else _CONTEXT_NAME
+ 
+ 
+-def _inspection_context(context: RepositoryContext) -> dict:
++def _inspection_context(
++    context: RepositoryContext,
++    include_paths: Iterable[str] = (),
++) -> dict:
+     raw = _git(context.source_repo, "ls-files", "-z", binary=True).stdout
+     files: list[dict[str, object]] = []
++    selected = {str(item).strip("/") for item in include_paths if str(item).strip()}
+     prefix = context.scope_prefix.rstrip("/")
+     for item in raw.split(b"\0"):
+         if not item:
+             continue
+         repo_path = item.decode(errors="surrogateescape")
++        if selected and repo_path not in selected:
++            continue
+         if repo_path in {_REPORT_NAME, _CONTEXT_NAME}:
+             continue
+         if prefix:
+@@ -236,8 +395,12 @@ def _ensure_inspection_shadow(context: RepositoryContext) -> RepositoryContext:
+     )
+ 
+ 
+-def _commit_inspection_context(context: RepositoryContext, relative_path: str) -> None:
+-    payload = _inspection_context(context)
++def _commit_inspection_context(
++    context: RepositoryContext,
++    relative_path: str,
++    include_paths: Iterable[str] = (),
++) -> None:
++    payload = _inspection_context(context, include_paths)
+     target = context.source_repo / relative_path
+     target.parent.mkdir(parents=True, exist_ok=True)
+     target.write_text(
+@@ -263,6 +426,11 @@ def _resolve_repository(start: str | Path) -> tuple[Path, Path, str]:
+     invocation = Path(start).expanduser().resolve()
+     if invocation.is_file():
+         invocation = invocation.parent
++    if _protected_worktree_path(invocation):
++        raise AutopilotError(
++            "run this command from the original project folder, not from a "
++            "Hermes shadow or mission worktree"
++        )
+     if not invocation.is_dir():
+         raise AutopilotError(f"folder does not exist: {invocation}")
+     proc = _git(invocation, "rev-parse", "--show-toplevel", check=False)
+@@ -360,6 +528,155 @@ def _cleanup_shadow(context: RepositoryContext) -> None:
+         )
+ 
+ 
++def _git_identity_env() -> dict[str, str]:
++    env = os.environ.copy()
++    env.setdefault("GIT_AUTHOR_NAME", "Hermes Autopilot")
++    env.setdefault("GIT_AUTHOR_EMAIL", "autopilot@local")
++    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
++    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
++    return env
++
++
++def _snapshot_input_files(
++    context: RepositoryContext,
++    inputs: Iterable[InputFile],
++) -> tuple[str, ...]:
++    paths = tuple(item.repo_path for item in inputs)
++    if not paths or context.source_repo == context.original_root:
++        return paths
++    for repo_path in paths:
++        source = context.original_root / repo_path
++        target = context.source_repo / repo_path
++        target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(source, target)
++    env = _git_identity_env()
++    _git(context.source_repo, "add", "--", *paths, env=env)
++    changed = _git(
++        context.source_repo,
++        "status",
++        "--porcelain",
++        "--",
++        *paths,
++        env=env,
++    ).stdout.strip()
++    if changed:
++        _git(
++            context.source_repo,
++            "commit",
++            "-m",
++            "chore: snapshot Autopilot input files",
++            env=env,
++        )
++    return paths
++
++
++def _inspection_source_text(
++    original_root: Path,
++    inputs: Iterable[InputFile],
++) -> str:
++    parts: list[str] = []
++    for item in inputs:
++        try:
++            data = (original_root / item.repo_path).read_bytes()
++        except OSError:
++            continue
++        if len(data) <= 100000 and b"\0" not in data:
++            parts.append(data.decode("utf-8", errors="replace"))
++    return "\n".join(parts)
++
++
++def _ground_next_action_sections(value: str, source_text: str) -> str:
++    if not source_text.strip():
++        return value
++    source_lower = source_text.casefold()
++    sections = re.split(r"(?m)(?=^##+\s+)", value)
++    cleaned: list[str] = []
++    for section in sections:
++        heading = section.splitlines()[0].casefold() if section.splitlines() else ""
++        if "action" not in heading:
++            cleaned.append(section)
++            continue
++        paragraphs = re.split(r"(\n\s*\n)", section)
++        kept: list[str] = []
++        for paragraph in paragraphs:
++            if not paragraph.strip() or paragraph.startswith("\n"):
++                kept.append(paragraph)
++                continue
++            sentences = re.split(r"(?<=[.!?])\s+", paragraph)
++            valid: list[str] = []
++            for sentence in sentences:
++                lowered = sentence.casefold()
++                unsupported = [
++                    term
++                    for term in _HIGH_RISK_ACTION_TERMS
++                    if term in lowered and term not in source_lower
++                ]
++                negative = False
++                for term in unsupported:
++                    escaped = re.escape(term)
++                    directly_negated = re.search(
++                        rf"\b(?:no|not|do not|does not|cannot|can't)\s+"
++                        rf"(?:\w+\s+){{0,2}}{escaped}\b",
++                        lowered,
++                    )
++                    explicitly_unsupported = re.search(
++                        rf"{escaped}.{{0,60}}\b(?:not supported|unsupported|"
++                        rf"not present|not provided|requires information)\b",
++                        lowered,
++                    )
++                    if directly_negated or explicitly_unsupported:
++                        negative = True
++                        break
++                if unsupported and not negative:
++                    continue
++                valid.append(sentence)
++            if valid:
++                kept.append(" ".join(valid))
++        cleaned.append("".join(kept))
++    return "".join(cleaned)
++
++
++def _sanitize_inspection_answer(answer: str, source_text: str = "") -> str:
++    value = str(answer or "")
++    value = re.sub(
++        r"\b(?:repository|repo)\s+at\s+`?/workspace`?",
++        "selected repository",
++        value,
++        flags=re.IGNORECASE,
++    )
++    value = re.sub(
++        r"`?/workspace/([^`\s]+)`?",
++        lambda match: f"`{match.group(1).rstrip('.,:;')}`",
++        value,
++    )
++    value = value.replace("`/workspace`", "the selected repository")
++    value = value.replace("/workspace", "the selected repository")
++    value = re.sub(r"`?\.git`?", "Git metadata", value)
++    value = re.sub(r"\bmanifest\b", "source snapshot", value, flags=re.IGNORECASE)
++    value = _ground_next_action_sections(value, source_text)
++    return value.strip()
++
++
++def _save_inspection_answer(
++    answer: str,
++    *,
++    mission_id: str,
++    context: RepositoryContext,
++) -> Path:
++    root = Path.home() / ".hermes" / "autopilot" / "answers"
++    root.mkdir(parents=True, exist_ok=True)
++    stamp = time.strftime("%Y%m%d-%H%M%S")
++    path = root / f"{stamp}-{_safe_slug(context.original_root.name)}-{mission_id}.md"
++    path.write_text(
++        answer.rstrip()
++        + "\n\n---\n"
++        + f"Mission: `{mission_id}`\n"
++        + "Independent verification: passed\n",
++        encoding="utf-8",
++    )
++    return path
++
++
+ def _join_scope(prefix: str, value: str) -> str:
+     raw = str(value or "").strip().replace("\\", "/")
+     if not raw:
+@@ -378,6 +695,18 @@ def _allowed_paths(prefix: str, paths: Iterable[str]) -> list[str]:
+     return [prefix] if prefix else []
+ 
+ 
++def _change_allowed_paths(
++    prefix: str,
++    requested_paths: Iterable[str],
++    input_paths: Iterable[str],
++) -> list[str]:
++    requested = [str(item) for item in requested_paths]
++    base = _allowed_paths(prefix, requested)
++    if not requested:
++        return base
++    return list(dict.fromkeys(base + list(input_paths)))
++
++
+ def _scoped_command(prefix: str, command: str) -> str:
+     command = str(command or "").strip()
+     if not command:
+@@ -406,6 +735,7 @@ def _task_body(
+     mode: str = "change",
+     report_path: Optional[str] = None,
+     context_path: Optional[str] = None,
++    focused_files: Iterable[str] = (),
+ ) -> str:
+     target = f"/workspace/{prefix}" if prefix else "/workspace"
+     common = (
+@@ -418,18 +748,31 @@ def _task_body(
+     if mode == "inspect":
+         if not report_path or not context_path:
+             raise AutopilotError("inspection mode requires context and report paths")
++        selected = [str(item) for item in focused_files if str(item)]
++        focus_instruction = ""
++        if selected:
++            names = ", ".join(f"`{item}`" for item in selected)
++            focus_instruction = (
++                f"This is a focused inspection of only: {names}. Do not describe the "
++                "repository, file count, README, Git metadata, or any file not in that "
++                "list. Answer only from those selected files. "
++            )
+         return (
+             f"Answer this repository question: {objective.strip()}\n\n"
+             f"{common}\n"
+             f"Use only the sanitized repository manifest at `/workspace/{context_path}` "
+-            "as your source. Do not inspect any other filesystem path. Write a "
+-            "concise, factual answer to "
++            "as your source. Do not inspect any other filesystem path. "
++            f"{focus_instruction}Write a concise, factual answer to "
+             f"`/workspace/{report_path}`. Start with '# Autopilot Report'. Include "
+-            "what exists, what the repository currently does, and important "
+-            "limitations supported by the manifest. Do not mention the manifest, "
+-            "`.git`, Hermes, worktrees, mission branches, task IDs, or absolute host "
+-            "paths. Do not recommend deleting or changing files unless the question "
+-            "asks for a change. Do not invent functionality."
++            "the facts needed to answer the question and important limitations "
++            "supported by the source. Any recommended next action "
++            "must be directly supported by the source content. Do not invent logins, "
++            "resubmissions, cancellations, account access, deadlines, or contact steps "
++            "that the source does not state. When the source does not support a next "
++            "action, say that explicitly. Do not mention the manifest, `.git`, Hermes, "
++            "worktrees, mission branches, task IDs, or absolute host paths. Do not "
++            "recommend deleting or changing files unless the question asks for a "
++            "change. Do not invent functionality."
+         )
+     return (
+         f"Complete this objective: {objective.strip()}\n\n"
+@@ -645,11 +988,13 @@ def _result_payload(
+     *,
+     mode: str = "change",
+     answer: Optional[str] = None,
++    answer_path: Optional[Path] = None,
+ ) -> dict:
+     mission = report["mission"]
+     return {
+         "mode": mode,
+         "answer": answer,
++        "answer_path": str(answer_path) if answer_path else None,
+         "mission_id": mission["id"],
+         "status": mission["status"],
+         "blocked_reason": mission.get("blocked_reason"),
+@@ -669,7 +1014,11 @@ def _result_payload(
+ 
+ def autopilot_command(args: argparse.Namespace) -> int:
+     parser = getattr(args, "_autopilot_parser", None)
+-    objective = str(getattr(args, "objective", "") or "").strip()
++    raw_objective = getattr(args, "objective", "") or ""
++    if isinstance(raw_objective, (list, tuple)):
++        objective = " ".join(str(item) for item in raw_objective).strip()
++    else:
++        objective = str(raw_objective).strip()
+     if not objective:
+         if parser is not None:
+             parser.print_help()
+@@ -677,19 +1026,32 @@ def autopilot_command(args: argparse.Namespace) -> int:
+     board = args.board or kb.get_current_board()
+     context: Optional[RepositoryContext] = None
+     try:
++        _validate_objective(objective)
+         context = _prepare_repository(args.repo)
+         mode = _detect_mode(objective, args.mode)
++        input_names = _explicit_input_names(
++            objective,
++            mode,
++            getattr(args, "input_file", []),
++        )
++        inputs = _resolve_input_files(context, input_names)
+         report_path = _report_path(context.scope_prefix) if mode == "inspect" else None
+         context_path = _context_path(context.scope_prefix) if mode == "inspect" else None
+         if mode == "inspect":
+             context = _ensure_inspection_shadow(context)
++            input_paths = _snapshot_input_files(context, inputs)
+             assert report_path is not None and context_path is not None
+-            _commit_inspection_context(context, context_path)
++            _commit_inspection_context(context, context_path, input_paths)
+             allowed = [context_path, report_path]
+             verification = [f"test -s {shlex.quote(report_path)}"]
+             outcome = f"Write a factual answer to {report_path}"
+         else:
+-            allowed = _allowed_paths(context.scope_prefix, args.path)
++            input_paths = _snapshot_input_files(context, inputs)
++            allowed = _change_allowed_paths(
++                context.scope_prefix,
++                args.path,
++                input_paths,
++            )
+             verification = _verification_commands(context.scope_prefix, args.verify)
+             outcome = (args.outcome or objective).strip()
+         project_id = _ensure_project(context, board)
+@@ -731,6 +1093,7 @@ def autopilot_command(args: argparse.Namespace) -> int:
+                     mode=mode,
+                     report_path=report_path,
+                     context_path=context_path,
++                    focused_files=input_paths if mode == "inspect" else (),
+                 ),
+                 assignee=args.profile,
+                 parents=[],
+@@ -777,29 +1140,39 @@ def autopilot_command(args: argparse.Namespace) -> int:
+             raise AutopilotError("mission succeeded without a verifiable commit identity")
+         if mode == "inspect":
+             assert report_path is not None
+-            answer = _git(
+-                context.source_repo,
+-                "show",
+-                f"{verified}:{report_path}",
+-            ).stdout.strip()
++            answer = _sanitize_inspection_answer(
++                _git(
++                    context.source_repo,
++                    "show",
++                    f"{verified}:{report_path}",
++                ).stdout.strip(),
++                _inspection_source_text(context.original_root, inputs),
++            )
+             applied = ApplyResult(
+                 False,
+                 None,
+                 (),
+                 reason="inspection mode does not modify the source checkout",
+             )
++            answer_path = _save_inspection_answer(
++                answer,
++                mission_id=mission.id,
++                context=context,
++            )
+             payload = _result_payload(
+                 report,
+                 context,
+                 applied,
+                 mode=mode,
+                 answer=answer,
++                answer_path=answer_path,
+             )
+             if args.json:
+                 print(json.dumps(payload, indent=2, default=str))
+             else:
+                 print(answer)
+-                print(f"\nInspected and independently verified by mission {mission.id}.")
++                print(f"\nSaved: {answer_path}")
++                print(f"Inspected and independently verified by mission {mission.id}.")
+             return 0
+         applied = _apply_verified_change(
+             context,
+diff --git a/hermes_cli/mission_service.py b/hermes_cli/mission_service.py
+index eac8bc0b3..7fa4c32b6 100644
+--- a/hermes_cli/mission_service.py
++++ b/hermes_cli/mission_service.py
+@@ -525,7 +525,7 @@ def _accepted_executor_path_hints(conn, mission: mdb.Mission) -> list[str]:
+         for index, task in enumerate(tasks, start=1):
+             for raw in task.get("paths") or []:
+                 hints.add(_normalize_planned_path(mission, raw, task_index=index))
+-            for match in _PLAN_PATH_RE.findall(str(task.get("body") or "")):
++            for match in _plan_path_matches(str(task.get("body") or "")):
+                 hints.add(_normalize_planned_path(mission, match, task_index=index))
+     else:
+         rows = conn.execute(
+@@ -535,7 +535,7 @@ def _accepted_executor_path_hints(conn, mission: mdb.Mission) -> list[str]:
+             (mission.id,),
+         ).fetchall()
+         for index, row in enumerate(rows, start=1):
+-            for match in _PLAN_PATH_RE.findall(str(row["body"] or "")):
++            for match in _plan_path_matches(str(row["body"] or "")):
+                 hints.add(_normalize_planned_path(mission, match, task_index=index))
+     return sorted(hints, key=os.fsencode)
+ 
+@@ -798,6 +798,19 @@ _PLAN_PATH_RE = re.compile(
+ )
+ 
+ 
++_PLAN_URL_RE = re.compile(r"\b(?:https?|ftp)://[^\s<>()]+", re.IGNORECASE)
++_PLAN_DATE_RE = re.compile(
++    r"(?<![A-Za-z0-9])(?:\d{1,4}/\d{1,2}/\d{1,4})(?![A-Za-z0-9])"
++)
++
++
++def _plan_path_matches(value: str) -> list[str]:
++    """Extract repository paths without mistaking prose dates or URLs for paths."""
++    text = _PLAN_URL_RE.sub("", str(value or ""))
++    text = _PLAN_DATE_RE.sub("", text)
++    return _PLAN_PATH_RE.findall(text)
++
++
+ def _normalize_planned_path(mission: mdb.Mission, raw: str, *, task_index: int) -> str:
+     value = str(raw).strip().strip("`'\" ,:;()[]{}")
+     if not value or "://" in value:
+@@ -856,7 +869,7 @@ def _validate_plan_scope(mission: mdb.Mission, tasks: list[dict[str, Any]]) -> N
+             ]
+             if len(normalized) != len(set(normalized)):
+                 raise MissionError(f"planner task {index} contains duplicate paths")
+-        for match in _PLAN_PATH_RE.findall(str(task.get("body") or "")):
++        for match in _plan_path_matches(str(task.get("body") or "")):
+             _normalize_planned_path(mission, match, task_index=index)
+ 
+ 
+diff --git a/scripts/autopilot_mobile/hai b/scripts/autopilot_mobile/hai
+new file mode 100755
+index 000000000..16287c6c9
+--- /dev/null
++++ b/scripts/autopilot_mobile/hai
+@@ -0,0 +1,10 @@
++#!/usr/bin/env bash
++set -euo pipefail
++if [[ $# -lt 1 ]]; then
++  echo "usage: hai FILE [question]" >&2
++  exit 2
++fi
++file=$1
++shift
++question=${*:-"Explain $file in plain English and tell me only the next action supported by the file."}
++exec ha --mode inspect --input-file "$file" "$question"
+diff --git a/scripts/autopilot_mobile/ham b/scripts/autopilot_mobile/ham
+new file mode 100755
+index 000000000..dd44482e2
+--- /dev/null
++++ b/scripts/autopilot_mobile/ham
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++set -euo pipefail
++if [[ $# -lt 1 ]]; then
++  echo "usage: ham TASK" >&2
++  echo "example: ham create NOTES.md from README.md" >&2
++  exit 2
++fi
++exec ha --mode change "$@"
+diff --git a/scripts/autopilot_mobile/hapaste b/scripts/autopilot_mobile/hapaste
+new file mode 100755
+index 000000000..834c14165
+--- /dev/null
++++ b/scripts/autopilot_mobile/hapaste
+@@ -0,0 +1,32 @@
++#!/usr/bin/env bash
++set -euo pipefail
++scratch="$HOME/.hermes/autopilot/mobile-paste"
++input="$scratch/PASTE.md"
++mkdir -p "$scratch"
++if ! git -C "$scratch" rev-parse --git-dir >/dev/null 2>&1; then
++  git -C "$scratch" init -b main >/dev/null
++  git -C "$scratch" config user.name "Hermes Autopilot"
++  git -C "$scratch" config user.email "autopilot@local"
++  printf '# Mobile paste workspace\n' > "$scratch/README.md"
++  git -C "$scratch" add README.md
++  git -C "$scratch" commit -m "chore: initialize mobile paste workspace" >/dev/null
++fi
++cleanup() { rm -f "$input"; }
++trap cleanup EXIT INT TERM
++if [[ -t 0 ]]; then
++  echo "Paste the text. Finish with a line containing only: .done"
++  : > "$input"
++  while IFS= read -r line; do
++    [[ "$line" == ".done" ]] && break
++    printf '%s\n' "$line" >> "$input"
++  done
++else
++  cat > "$input"
++fi
++if [[ ! -s "$input" ]]; then
++  echo "hapaste: no text received" >&2
++  exit 2
++fi
++question=${*:-"Explain this in plain English and tell me what to do next."}
++cd "$scratch"
++ha --mode inspect --input-file PASTE.md "$question"
+diff --git a/scripts/autopilot_mobile/install.sh b/scripts/autopilot_mobile/install.sh
+new file mode 100755
+index 000000000..529d87a7d
+--- /dev/null
++++ b/scripts/autopilot_mobile/install.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++set -euo pipefail
++root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++mkdir -p "$HOME/.local/bin"
++for name in hai ham hapaste; do
++  install -m 0755 "$root/$name" "$HOME/.local/bin/$name"
++done
++printf 'Installed: hai, ham, hapaste\n'
+diff --git a/tests/hermes_cli/test_autopilot_cmd.py b/tests/hermes_cli/test_autopilot_cmd.py
+index 177c942cd..951216fc7 100644
+--- a/tests/hermes_cli/test_autopilot_cmd.py
++++ b/tests/hermes_cli/test_autopilot_cmd.py
+@@ -42,13 +42,11 @@ def test_parser_accepts_single_command_shape() -> None:
+         "autopilot",
+         "Create a file",
+     ])
+-    assert args.objective == "Create a file"
++    assert args.objective == ["Create a file"]
+     assert args.verify == []
+     assert args.repo == "."
+ 
+ 
+-
+-
+ def test_default_verification_requires_valid_nonempty_diff() -> None:
+     assert ap._verification_commands("", []) == [
+         'git diff --check && test -n "$(git status --porcelain)"'
+@@ -255,3 +253,171 @@ def test_inspection_context_excludes_git_and_internal_files(tmp_path: Path) -> N
+     assert "AUTOPILOT_CONTEXT.json" not in paths
+     assert "AUTOPILOT_REPORT.md" not in paths
+     assert not any(path.startswith(".git") for path in paths)
++
++
++def test_parser_accepts_unquoted_multiword_objective() -> None:
++    parser = argparse.ArgumentParser()
++    sub = parser.add_subparsers(dest="command")
++    ap.build_parser(sub)
++    args = parser.parse_args(["autopilot", "explain", "README.md"])
++    assert args.objective == ["explain", "README.md"]
++
++
++def test_detect_mode_recognizes_mobile_read_phrases() -> None:
++    assert ap._detect_mode("read csuf-email.md") == "inspect"
++    assert ap._detect_mode("do you see csuf-email.md") == "inspect"
++    assert ap._detect_mode("look at README.md") == "inspect"
++    assert ap._detect_mode("check README.md") == "inspect"
++
++
++def test_vague_objective_is_rejected() -> None:
++    with pytest.raises(ap.AutopilotError, match="too vague"):
++        ap._validate_objective("test")
++    ap._validate_objective("read README.md")
++
++
++def test_explicit_input_names_distinguish_source_from_output() -> None:
++    assert ap._explicit_input_names("read README.md", "inspect", []) == ["README.md"]
++    assert ap._explicit_input_names(
++        "create OUT.md from README.md", "change", []
++    ) == ["README.md"]
++
++
++def test_missing_input_file_offers_suggestion(tmp_path: Path) -> None:
++    repo = init_repo(tmp_path)
++    context = ap.RepositoryContext(
++        original_root=repo.resolve(),
++        invocation_dir=repo.resolve(),
++        scope_prefix="",
++        source_repo=repo.resolve(),
++        shadow_path=None,
++        dirty=False,
++    )
++    with pytest.raises(ap.AutopilotError, match="Did you mean: README.md"):
++        ap._resolve_input_files(context, ["READM.md"])
++
++
++def test_inspection_context_can_focus_on_named_file(tmp_path: Path) -> None:
++    repo = init_repo(tmp_path)
++    context = ap.RepositoryContext(
++        original_root=repo.resolve(),
++        invocation_dir=repo.resolve(),
++        scope_prefix="",
++        source_repo=repo.resolve(),
++        shadow_path=None,
++        dirty=False,
++    )
++    payload = ap._inspection_context(context, ["README.md"])
++    assert [item["path"] for item in payload["files"]] == ["README.md"]
++
++
++def test_snapshot_untracked_input_into_shadow(tmp_path: Path, monkeypatch) -> None:
++    repo = init_repo(tmp_path)
++    source = repo / "message.md"
++    source.write_text("current untracked content\n", encoding="utf-8")
++    monkeypatch.setattr(ap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
++    context = ap._prepare_repository(repo)
++    try:
++        inputs = ap._resolve_input_files(context, ["message.md"])
++        paths = ap._snapshot_input_files(context, inputs)
++        assert paths == ("message.md",)
++        assert git(context.source_repo, "show", "HEAD:message.md") == (
++            "current untracked content"
++        )
++        assert git(repo, "status", "--porcelain", "--", "message.md").startswith("??")
++    finally:
++        ap._cleanup_shadow(context)
++
++
++def test_protected_mission_worktree_path_is_rejected(tmp_path: Path, monkeypatch) -> None:
++    monkeypatch.setattr(ap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
++    path = tmp_path / "project" / ".hermes-worktrees" / "m_test"
++    path.mkdir(parents=True)
++    assert ap._protected_worktree_path(path) is True
++
++
++def test_plan_path_parser_ignores_dates_and_urls() -> None:
++    body = (
++        "Order date 07/31/2026. See "
++        "https://example.com/student/transcripts and write /workspace/result.md"
++    )
++    assert ap.mission_service._plan_path_matches(body) == ["/workspace/result.md"]
++
++
++def test_change_allowed_paths_keeps_default_root_scope_unrestricted() -> None:
++    assert ap._change_allowed_paths("", [], ["README.md"]) == []
++    assert ap._change_allowed_paths("nested", [], ["nested/README.md"]) == [
++        "nested"
++    ]
++    assert ap._change_allowed_paths("", ["docs"], ["README.md"]) == [
++        "docs",
++        "README.md",
++    ]
++
++
++def test_inspection_prompt_requires_source_supported_actions() -> None:
++    body = ap._task_body(
++        "explain message.md",
++        "",
++        mode="inspect",
++        report_path=ap._report_path(""),
++        context_path=ap._context_path(""),
++    )
++    assert "directly supported by the source content" in body
++    assert "Do not invent logins" in body
++
++
++def test_inspection_answer_sanitizes_internal_workspace_terms() -> None:
++    raw = (
++        "The repository at `/workspace` contains `/workspace/docs/README.md`. "
++        "The manifest lists one file."
++    )
++    cleaned = ap._sanitize_inspection_answer(raw)
++    assert "/workspace" not in cleaned
++    assert "manifest" not in cleaned.lower()
++    assert "`docs/README.md`" in cleaned
++    assert "source snapshot" in cleaned.lower()
++
++
++def test_focused_inspection_prompt_excludes_repository_inventory() -> None:
++    body = ap._task_body(
++        "explain message.md",
++        "",
++        mode="inspect",
++        report_path=ap._report_path(""),
++        context_path=ap._context_path(""),
++        focused_files=["message.md"],
++    )
++    assert "focused inspection of only" in body
++    assert "Do not describe the repository" in body
++    assert "`message.md`" in body
++
++
++def test_grounded_action_filter_removes_unsupported_resend() -> None:
++    answer = """# Autopilot Report
++
++## Next action
++
++Contact the recipient. If they do not respond, re-send the transcript.
++"""
++    cleaned = ap._sanitize_inspection_answer(
++        answer,
++        "Contact the recipient to confirm retrieval.",
++    )
++    assert "Contact the recipient" in cleaned
++    assert "re-send" not in cleaned
++
++
++def test_grounded_action_filter_keeps_negative_limitation() -> None:
++    answer = """# Autopilot Report
++
++## Next action
++
++Contact the recipient. Resubmitting is not supported by the source.
++"""
++    cleaned = ap._sanitize_inspection_answer(
++        answer,
++        "Contact the recipient.",
++    )
++    assert "Contact the recipient" in cleaned
++    assert "not supported" in cleaned
