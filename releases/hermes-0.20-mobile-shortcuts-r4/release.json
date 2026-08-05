@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "release_id": "hermes-0.20-mobile-shortcuts-r4-2026-08-04",
+  "status": "mobile-usability-delta",
+  "base_release": "releases/hermes-0.20-ha-one-command-r3",
+  "base_expected_tree": "43bd0f96f5b44398a70dc5485614f4a6d3b49712",
+  "source_base_commit": "d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4",
+  "source_head_commit": "b5053677363998180d9a6f8dd5fbe2c1b12bc0cf",
+  "active_equivalent_commit": "d8e82a0c3a8f4e2c907e9232ebffabf398db5b14",
+  "expected_final_tree": "f3ee17996dd69de2045a68e507438db1825c18e3",
+  "patch_count": 3,
+  "total_patch_count_from_upstream_base": 40,
+  "evidence_summary": "evidence/mobile-shortcuts-summary.json",
+  "replay_script": "scripts/replay_mobile_shortcuts_release.sh",
+  "notes": "Three-commit mobile usability delta adding hai, ham, and hapaste; unquoted objectives; named dirty-input snapshots; grounded saved inspection answers; date/URL-safe planning; protected-worktree and vague-task rejection; and inspection compatibility with pre-existing gitlinks.",
+  "replay_invariant": "ha one-command r3 final tree plus ordered mobile patches equals exact final Git tree"
+}

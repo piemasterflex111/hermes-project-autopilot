@@ -1,0 +1,65 @@
+{
+  "release_id": "hermes-0.20-mobile-shortcuts-r4-2026-08-04",
+  "base_expected_tree": "43bd0f96f5b44398a70dc5485614f4a6d3b49712",
+  "source_base_commit": "d362d5f834e9f5d3ce9c095b2bb2a47b8d4346b4",
+  "source_head_commit": "b5053677363998180d9a6f8dd5fbe2c1b12bc0cf",
+  "active_equivalent_commit": "d8e82a0c3a8f4e2c907e9232ebffabf398db5b14",
+  "expected_final_tree": "f3ee17996dd69de2045a68e507438db1825c18e3",
+  "focused_tests": {
+    "mobile_shortcuts_passed": 30,
+    "mission_and_containment_passed": 128,
+    "failed": 0
+  },
+  "capabilities": {
+    "hai_named_file_inspection": true,
+    "ham_unquoted_change_request": true,
+    "hapaste_interactive_and_stdin": true,
+    "unquoted_multiword_ha_objectives": true,
+    "dirty_and_untracked_input_snapshot": true,
+    "saved_verified_answers": true,
+    "read_open_look_check_inspect_detection": true,
+    "date_and_url_safe_path_parsing": true,
+    "missing_file_suggestion": true,
+    "vague_task_rejection": true,
+    "protected_worktree_rejection": true,
+    "grounded_action_filter": true,
+    "preexisting_gitlink_inspection_isolation": true
+  },
+  "acceptance": {
+    "real_repository_named_file_inspection": {
+      "status": "succeeded",
+      "preexisting_gitlinks": 3,
+      "source_status_unchanged": true,
+      "answer_archived": true
+    },
+    "mobile_paste_stdin": {
+      "status": "succeeded",
+      "temporary_input_removed": true,
+      "answer_archived": true
+    },
+    "unquoted_verified_change": {
+      "status": "succeeded",
+      "verified_change_applied": true
+    },
+    "unquoted_named_file_inspection": {
+      "status": "succeeded",
+      "source_modified": false
+    },
+    "date_and_url_prose": {
+      "status": "succeeded",
+      "false_path_rejection": false
+    },
+    "grounded_output": {
+      "status": "succeeded",
+      "unsupported_resend_login_cancel_removed": true,
+      "internal_workspace_terms_removed": true
+    }
+  },
+  "preflight_rejections": {
+    "missing_file_typo_suggestion": true,
+    "vague_task_without_traceback": true,
+    "nested_mission_worktree": true
+  },
+  "remote_side_effects": false,
+  "source_repository_cleanup_performed": false
+}

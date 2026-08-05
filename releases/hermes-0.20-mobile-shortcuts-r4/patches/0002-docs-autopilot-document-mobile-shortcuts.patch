@@ -1,0 +1,67 @@
+From 165549a9256ed66bd42a7c17f9d81f83f98fc368 Mon Sep 17 00:00:00 2001
+From: Payam Adloo <31391809+piemasterflex111@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 18:01:23 -0700
+Subject: [PATCH] docs(autopilot): document mobile shortcuts
+
+---
+ docs/mobile-shortcuts.md | 51 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 51 insertions(+)
+ create mode 100644 docs/mobile-shortcuts.md
+
+diff --git a/docs/mobile-shortcuts.md b/docs/mobile-shortcuts.md
+new file mode 100644
+index 000000000..86533bb3a
+--- /dev/null
++++ b/docs/mobile-shortcuts.md
+@@ -0,0 +1,51 @@
++# Mobile-first Autopilot shortcuts
++
++The mobile interface avoids long quoted prompts and manual mission commands.
++
++## Inspect one file
++
++```bash
++hai csuf-email.md
++```
++
++Add a short question without quotation marks:
++
++```bash
++hai csuf-email.md what do I do next
++```
++
++`hai` reads the current file, including an untracked or locally modified copy,
++runs independent verification, prints the answer, and archives it under
++`~/.hermes/autopilot/answers/`.
++
++## Make a change
++
++```bash
++ham create NOTES.md from README.md
++```
++
++Quotation marks are optional. Dirty repositories are handled through an
++isolated shadow and verified changes are applied only when they do not overlap
++existing local edits.
++
++## Paste long text
++
++```bash
++hapaste
++```
++
++Paste the content and finish with a line containing only `.done`. The pasted
++text is stored only in a temporary local scratch file, analyzed in an isolated
++mission, and removed after completion. Piped standard input is also supported:
++
++```bash
++cat message.txt | hapaste
++```
++
++## Safety behavior
++
++- Dates and web addresses in pasted prose are not treated as repository paths.
++- Missing source files fail before mission creation and include a close-name
++  suggestion when available.
++- Vague tasks such as `test` are rejected before spending model time.
++- Commands refuse to start from Hermes shadow and mission-worktree folders.

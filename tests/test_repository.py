@@ -86,6 +86,20 @@ class RepositoryIntegrityTests(unittest.TestCase):
         self.assertEqual("done", proof["verifier"])
         self.assertFalse(evidence["plan_auto_end_to_end_proven"])
 
+    def test_mobile_shortcuts_release_is_consistent(self):
+        release_dir = ROOT / "releases/hermes-0.20-mobile-shortcuts-r4"
+        release = json.loads((release_dir / "release.json").read_text())
+        evidence = json.loads((release_dir / "evidence/mobile-shortcuts-summary.json").read_text())
+        self.assertEqual(3, release["patch_count"])
+        self.assertEqual(40, release["total_patch_count_from_upstream_base"])
+        self.assertEqual(release["source_head_commit"], evidence["source_head_commit"])
+        self.assertEqual(release["expected_final_tree"], evidence["expected_final_tree"])
+        self.assertEqual(30, evidence["focused_tests"]["mobile_shortcuts_passed"])
+        self.assertEqual(128, evidence["focused_tests"]["mission_and_containment_passed"])
+        self.assertEqual(0, evidence["focused_tests"]["failed"])
+        self.assertTrue(all(evidence["capabilities"].values()))
+        self.assertFalse(evidence["remote_side_effects"])
+
     def test_containment_acceptance_is_complete(self):
         report = json.loads((ROOT / "releases/hermes-0.20-compat/evidence/containment-acceptance.json").read_text())
         self.assertTrue(report["release_ready"])
